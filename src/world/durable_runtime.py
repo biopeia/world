@@ -36,7 +36,11 @@ _JOURNAL_SCHEMA = "event-journal-v1"
 
 @dataclass(frozen=True, slots=True)
 class PresenceOwnerLink:
-    """Explicit genesis linkage from a World presence to a causal owner identity."""
+    """Validate an explicit World-genesis presence-to-owner association.
+
+    This association is currently a genesis input only; the durable manifest
+    does not preserve it for later lifecycle transitions or restoration.
+    """
 
     presence_id: PresenceId
     owner_id: str
