@@ -6,6 +6,8 @@ Incremental Biopeia World extraction. This repository currently contains a bound
 
 The journal/runtime coordinate World-scoped causal records without owning Organism-private state, Embodiment somatic state, or Environment state. Event types are opaque here: this package does not define which authority owns their semantics. IDs and tick numbering are deterministic; there is no RNG or host-clock dependency.
 
-`RECOVERY_REQUIRED` and journal contents are in-memory only. This prototype is not durable and does not establish compliance with AD-0019.
+`WorldCausalManifestStore` adds a durable, versioned manifest for exact owner checkpoint references, World causal tick, inclusive durable journal boundary, and publication status. It persists `RECOVERY_REQUIRED` before a transition is allowed to proceed; ordinary execution remains blocked until a complete causal cut with verified checkpoint dependencies is published.
+
+This is a storage primitive, not yet wired into `WorldRuntime` or owner checkpoint writers. It does not atomically capture owner state, prove process-crash consistency across arbitrary filesystems, or implement recovery. A caller must ensure referenced owner checkpoints and journal prefix are already durable before publishing `COMPLETE`. Do not infer full AD-0019 compliance from manifest round-trip tests.
 
 See [`MIGRATION.md`](MIGRATION.md) for exact source provenance, dispositions, validation scope, and deferred responsibilities.
