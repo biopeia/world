@@ -1,8 +1,8 @@
-name: Add new issues to Biopeia Project #1
+name: Add new issues to Biopeia Project 1
 
 on:
   issues:
-    types: [opened, reopened]
+    types: [opened]
 
 permissions:
   contents: read
