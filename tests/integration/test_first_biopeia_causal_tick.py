@@ -18,7 +18,6 @@ from embodiment.metabolism import MetabolicLedger
 from embodiment.observation import BodyPoseSample
 from embodiment.physiology import LivingBodyState
 from embodiment.physics3d.actuation_projection import project_motor_command
-from modality.transduction import TransductionKind, apply_transduction
 from observation.projection import runtime_tick_events
 from organism.actuation import (
     ActionCommitment,
@@ -188,15 +187,7 @@ def _run_three_ticks() -> tuple[OrganismIdentity, tuple[TickSnapshot, ...]]:
             )
 
             environmental_signal = 0.5  # Explicit deterministic fixture input; no Environment law is under test.
-            opaque_signal, _, _ = apply_transduction(
-                TransductionKind.IDENTITY,
-                [environmental_signal],
-                gain=1.0,
-                decay=0.0,
-                threshold=0.0,
-                previous=None,
-                integrator=0.0,
-            )
+            opaque_signal = environmental_signal
             candidate_cognition, frame = advance_cognition(
                 cognitive_state,
                 graph,
