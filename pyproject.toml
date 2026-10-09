@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "world"
+version = "0.1.0"
+description = "World causal coordination primitives for Biopeia"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["world*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
