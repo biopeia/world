@@ -194,31 +194,34 @@ split is fixed; file-level disposition does not reopen that split.
 
 ### Source test-file inventory and disposition
 
-All listed source tests were checked at the pinned commit. Test disposition is
-`DEFER` while an independently justified target behavior remains uncontracted;
-then rewrite a focused test against that owner or close it as `DROP` when the
-legacy-only behavior is not retained. Historical tests are not copied as a
-migration shortcut.
+All listed source tests were checked at source commit
+`80d372a186513035f85a769db886e505cabba52d` (tree
+`915146b807a2f3b4b362b485d0fd4010bb4c7cde`). `SPLIT` means that only
+independently justified semantics are assigned to their Biopeia owners; it
+does not migrate the source test implementation. `DROP` means the historical
+test is not a TARGET test. Tests remain preserved in the read-only source
+repository, and any future TARGET tests must be written against owner-specific
+Biopeia contracts rather than ported for compatibility.
 
-| Pinned source test file | Candidate disposition | What it historically checks / target caveat |
+| Pinned source test file | Disposition | What it historically checks / target caveat |
 |---|---|---|
 | `environment/tests/test_self_contained.py` | `SPLIT` | Its standalone-install/domain-isolation check may be replaced by target package-boundary validation; historical fixture-recipe and `derive_world_rng` assertions do not transfer. No source test implementation or old API is retained. |
-| `environment/tests/unit/world/test_checkpoint.py` | `DEFER` | Hex occupancy/body snapshot and RNG restore; owner-specific checkpoints and World manifest are distinct. |
-| `environment/tests/unit/world/test_constitution.py` | `DEFER` | Deterministic constitution fingerprint; target WorldGenesisSpec and EnvironmentGenesisSpec require separate semantics. |
-| `environment/tests/unit/world/test_contracts.py` | `DEFER` | Frozen action/observation/contact/emission records; no target wire/API/schema is implied. |
+| `environment/tests/unit/world/test_checkpoint.py` | `SPLIT` | Historical aggregate hex/body/RNG snapshot is not a target checkpoint; World cut references and Environment/Embodiment owner checkpoints are separate contracts. |
+| `environment/tests/unit/world/test_constitution.py` | `SPLIT` | Historical fingerprint bundled fixed Environment configuration with World identity; target WorldGenesisSpec and EnvironmentGenesisSpec have separate semantics. |
+| `environment/tests/unit/world/test_contracts.py` | `SPLIT` | Historical action, observation and contact records combine authorities; use independently specified owner contracts, not the old shapes. |
 | `environment/tests/unit/world/test_deferred.py` | `DROP` | Tests only the historical actor-addressed bounded queue, which is not a ratified generic target capability. Any future delayed-effect contract needs fresh owner-specific tests. |
 | `environment/tests/unit/world/test_events.py` | `SPLIT` | Historical WorldEvent taxonomy plus EventJournal behavior; journal behavior is already covered by target `tests/test_journal.py`, but event-kind taxonomy is not a target commitment. |
-| `environment/tests/unit/world/test_genesis.py` | `DEFER` | Fixed hex external fields/resources/hazards; Environment-owned genesis/law contracts require fresh target tests. |
+| `environment/tests/unit/world/test_genesis.py` | `SPLIT` | Fixed hex Environment fields/resources/hazards are not World genesis; World roster genesis and any justified Environment genesis require separate contracts and tests. |
 | `environment/tests/unit/world/test_genesis_regional.py` | `DROP` | Specific v1 hex regional overrides and legacy fallback behavior; no target compatibility obligation. |
-| `environment/tests/unit/world/test_laws.py` | `DEFER` | Formula/bounds/determinism of historical laws; new Environment law contracts need independent justification. |
+| `environment/tests/unit/world/test_laws.py` | `SPLIT` | External laws/dynamics are Environment-owned, not World behavior; no historical formula or numeric bound transfers without independent justification. |
 | `environment/tests/unit/world/test_movement.py` | `DROP` | Hex move/competition/rollback behavior is not the target 3D physical step. |
 | `environment/tests/unit/world/test_observation.py` | `SPLIT` | Historical Environment queries and occupancy observations; Environment truth vs passive Observation claims must be tested separately. |
-| `environment/tests/unit/world/test_rng.py` | `DEFER` | Seed+namespace stream reproducibility; no universal target RNG derivation schema exists yet. |
+| `environment/tests/unit/world/test_rng.py` | `DROP` | Tests the historical World seed-derivation implementation only. No universal TARGET RNG derivation contract is established; a future owner-specific randomness contract needs fresh tests. |
 | `environment/tests/unit/world/test_state.py` | `DROP` | In-memory aggregate WorldState rollback semantics conflict with owner-owned state and durable cut contract; target World tests are separate. |
 | `environment/tests/unit/world/test_topology.py` | `DROP` | Hex topology, occupancy and hex body placement. Do not translate assertions mechanically to 3D. |
 | `environment/tests/unit/lab/world/test_genesis_v1.py` | `DROP` | Historical fixed preset counts, labels/IDs and fingerprint. Retain historical experiment evidence only. |
 | `environment/tests/unit/lab/world/test_genesis_v2.py` | `DROP` | Specific regional preset and v1 identity/fallback semantics. |
-| `environment/tests/integration/test_world_checkpoint_continuation.py` | `DEFER` | Repeated deterministic trajectory after restoring the historical aggregate; target recovery/continuity tests must use real owner checkpoints and World cuts. |
+| `environment/tests/integration/test_world_checkpoint_continuation.py` | `SPLIT` | Historical aggregate restore/trajectory behavior is not retained. Target continuity must be tested through owner checkpoints and World causal cuts, without preserving this aggregate format. |
 | `lab/tests/unit/lab/world/test_actuation_adapter.py` | `SPLIT` | Lab composition of action/Embodiment/World adapter; revalidate per target owner contracts. |
 | `lab/tests/unit/lab/world/test_actuation_end_to_end.py` | `SPLIT` | Historical Organism→actuation→hex World loop; not evidence of target 3D physical causal step. |
 | `lab/tests/unit/lab/world/test_adapter.py` | `SPLIT` | Cross-domain signal and action adapter; no monolithic adapter survives by default. |
@@ -252,7 +255,7 @@ included in the provenance appendix below.
 | Lab domain integration and studies: `lab/src/lab/integration/world/adapter.py`; `lab/src/lab/studies/world/genesis_viability.py`; `lab/src/lab/studies/embodiment/integrity_gates.py`; `lab/src/lab/studies/embodiment/label_invariance.py` | `SPLIT` | Integrations and protocols remain Lab; state semantics and environmental truth belong to their authorities. Preserve experiment definitions/results/provenance; do not move Lab controls into World. |
 | Lab Observation/projection: `lab/src/lab/observation/environment_resource.py`; `lab/src/lab/observation/world_scene.py`; downstream consumers `lab/src/lab/observation/bus.py`, `lab/src/lab/observation/physics3d.py` | `SPLIT` | Environment state projection vs Observation transport/presentation/evidence admission; the bus and Physics3D bridge consume passive `world_scene` projections and are not World authorities. No causal writeback from observer. |
 | Lab test callers: `lab/tests/experiments/protocols/test_visual_acquisition_protocol.py`; `lab/tests/integration/test_physics3d_effective_model_audit.py`; `lab/tests/integration/test_physics3d_vision.py`; `lab/tests/unit/lab/observation/test_remaining_semantic_families.py`; `lab/tests/unit/lab/physics3d/test_effective_model_audit.py`; `lab/tests/unit/lab/physics3d/test_resource.py`; `tests/experimental_integrity/test_embodiment_inheritance_integrity.py` | `DEFER` | Tests are protocol/solver/Observation/Embodiment consumers, not World unit tests. Reassess against the target owner contract and scientific protocol; do not relabel them World tests solely because Environment imports appear. |
-| Historical benchmark: `scripts/bench_world_journal_index.py` | `DEFER` | Performance evidence is tied to source EventJournal/index semantics. Retain provenance in source; only repeat if the target journal workload justifies it. |
+| Historical benchmark: `scripts/bench_world_journal_index.py` | `DROP` | Source-specific benchmark implementation is not a TARGET artifact. Its provenance remains in the source repository; benchmark the target journal anew only if an explicit workload/performance requirement warrants it. |
 
 ### Source provenance appendix
 
