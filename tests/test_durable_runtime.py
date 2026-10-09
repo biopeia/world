@@ -107,7 +107,7 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
     assert runtime.records == (record,)
     assert runtime.manifest.journal_last_sequence == 0
     assert len(runtime.manifest.checkpoint_references) == 2
-    assert manifest_store.require_active() == runtime.manifest
+    assert manifest_store._require_active() == runtime.manifest
 
 
 def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
@@ -238,7 +238,7 @@ def test_new_owner_cannot_register_without_owner_checkpoint_contract(tmp_path):
             register_owners=(("embodiment", "embodiment-identity"),),
         )
     assert not called
-    assert store.require_active().causal_tick == 0
+    assert store._require_active().causal_tick == 0
 
 
 def test_lifecycle_registration_and_step_participants_are_explicit_and_exact(tmp_path):
@@ -406,10 +406,10 @@ def test_restore_and_recovery_reject_publicly_published_cuts_without_owner_state
         commit_id="genesis:world-journal-only",
     )
 
-    # The lower-level publication API rejects this cut. Also exercise restore
+    # The internal persistence operation rejects this cut. Also exercise restore
     # fail-closed against an invalid/legacy on-disk manifest that bypasses it.
     with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
-        manifest_store.initialize(journal_only)
+        manifest_store._initialize(journal_only)
     manifest_store.path.parent.mkdir(parents=True, exist_ok=True)
     manifest_store.path.write_text(
         json.dumps(manifest_module._manifest_to_data(journal_only)), encoding="utf-8"
@@ -534,7 +534,7 @@ def test_restore_refuses_runtime_if_owner_restore_changes_checkpoint_dependency(
 
     # Refusal is local to restore; this does not claim the manifest itself
     # provides cross-owner recovery or a crash-consistency protocol.
-    assert manifest_store.require_active().causal_tick == 0
+    assert manifest_store._require_active().causal_tick == 0
 
 
 def test_unverifiable_owner_checkpoint_keeps_durable_manifest_pending(tmp_path):
@@ -621,7 +621,7 @@ def test_explicit_recovery_restores_prior_cut_through_owner_and_records_receipt(
     assert recovered.status is ManifestStatus.COMMITTED
     assert recovered.causal_tick == 0
     assert recovered.records == ()
-    assert manifest_store.require_active() == recovered.manifest
+    assert manifest_store._require_active() == recovered.manifest
 
     receipt_files = tuple((tmp_path / "recoveries").glob("*.json"))
     assert len(receipt_files) == 1
@@ -667,7 +667,7 @@ def test_failed_owner_recovery_keeps_recovery_required_manifest(tmp_path):
 
     assert manifest_store.read() == pending
     with pytest.raises(ManifestRecoveryRequiredError):
-        manifest_store.require_active()
+        manifest_store._require_active()
 
 
 def test_retry_after_recovery_publication_interruption_fsyncs_existing_receipt_directory(
