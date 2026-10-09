@@ -18,6 +18,16 @@
 | `tests/test_journal.py` | Focused tests adapted from `environment/tests/unit/world/test_events.py` plus journal API edge coverage | SPLIT | Covers selected behavior, not the full source World runtime or cross-authority causal commit. |
 | `pyproject.toml`, `.github/workflows/ci.yml` | New repository packaging/CI | REWRITE | Minimal standard-library runtime; pytest and build are CI-only tools. |
 
+## Incremental causal coordinator slice
+
+| Target path | Source provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/runtime.py` | New minimal implementation derived from accepted Biopeia TARGET decisions AD-0005, AD-0006, AD-0009, AD-0019 and the first-tick integration task; no CURRENT runtime code copied | REWRITE | Owns the prototype World ID, one active presence identifier, committed integer tick, synchronous callback/record publication order, and in-memory `RECOVERY_REQUIRED` latch. It imports only the local journal. |
+| `tests/test_runtime.py` | New tests for the bounded target-runtime contract | REWRITE | Checks deterministic tick numbering, publish-after-callback ordering, and failure latch/no-retry behavior. |
+| `src/world/__init__.py`, `README.md` | Updated local public exports and scope documentation | REWRITE | Exposes the prototype coordinator without claiming persistence or participant-state ownership. |
+
+This coordinator deliberately runs the opaque participant callback before journal publication. A callback failure can leave participant mutations in place; a journal append failure can occur after the callback has succeeded. Either failure latches `RECOVERY_REQUIRED`, and no later tick is allowed. No rollback or recovery operation is implemented. Both the latch and journal are in-memory only, so this prototype is not durable and does not satisfy AD-0019's durable post-failure contract.
+
 ## Excluded and deferred source responsibilities
 
 | Source path/family | Disposition | Reason |

@@ -1,5 +1,13 @@
-"""Bounded World causal journal primitives."""
+"""Bounded World causal coordination primitives."""
 
 from .journal import CausalRecord, EventJournal
+from .runtime import RecoveryRequiredError, RuntimeStatus, WorldId, WorldRuntime
 
-__all__ = ["CausalRecord", "EventJournal"]
+__all__ = [
+    "CausalRecord",
+    "EventJournal",
+    "RecoveryRequiredError",
+    "RuntimeStatus",
+    "WorldId",
+    "WorldRuntime",
+]
