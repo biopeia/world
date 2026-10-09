@@ -15,13 +15,18 @@ from world import (
 
 
 def manifest(*, tick=0, refs=None, last_sequence=None, digest="", **overrides):
+    references = (checkpoint(),) if refs is None else tuple(refs)
     values = {
         "world_id": "world-a",
         "causal_tick": tick,
         "presence_ids": (),
-        "checkpoint_references": (checkpoint(),) if refs is None else tuple(refs),
+        "checkpoint_references": references,
         "journal_last_sequence": last_sequence,
         "journal_prefix_sha256": digest,
+        "commit_id": f"transition-{tick}" if tick else "genesis:world-a",
+        "registered_owner_ids": tuple(sorted(
+            (ref.owner, ref.owner_identity) for ref in references if ref.owner != "world-journal"
+        )),
     }
     values.update(overrides)
     return WorldCausalManifest(**values)
@@ -64,12 +69,33 @@ def test_durable_pending_transition_blocks_ordinary_execution(tmp_path):
 
     pending = store.begin_transition("transition-1")
 
-    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.status is ManifestStatus.PREPARING
     assert pending.causal_tick == 0
     assert pending.pending_tick == 1
     assert store.read() == pending
     with pytest.raises(ManifestRecoveryRequiredError, match="transition-1"):
         store.require_active()
+    assert store.read().status is ManifestStatus.RECOVERY_REQUIRED
+
+
+def test_only_one_cross_process_transition_can_prepare_at_a_time(tmp_path):
+    store = WorldCausalManifestStore(tmp_path / "world.json")
+    store.initialize(manifest())
+    barrier = Barrier(2)
+
+    def begin(transition_id):
+        barrier.wait()
+        try:
+            store.begin_transition(transition_id)
+            return "prepared"
+        except ManifestRecoveryRequiredError:
+            return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(begin, ("transition-a", "transition-b")))
+
+    assert sorted(outcomes) == ["blocked", "prepared"]
+    assert store.read().status is ManifestStatus.PREPARING
 
 
 def test_successful_causal_cut_publication_verifies_dependency_closure(tmp_path):
@@ -77,14 +103,16 @@ def test_successful_causal_cut_publication_verifies_dependency_closure(tmp_path)
     store.initialize(manifest())
     store.begin_transition("transition-1")
     ref = checkpoint()
-    committed = manifest(tick=1, refs=(ref,), last_sequence=0, digest="b" * 64)
+    committed = manifest(
+        tick=1, refs=(ref,), last_sequence=0, digest="b" * 64, commit_id="transition-1"
+    )
 
     result = store.commit_transition(
         committed,
         dependency_verifier=lambda refs: refs == (ref,),
     )
 
-    assert result.status is ManifestStatus.COMPLETE
+    assert result.status is ManifestStatus.COMMITTED
     assert store.read() == committed
     assert store.require_active() == committed
 
@@ -136,7 +164,7 @@ def test_manifest_store_rejects_owner_membership_change_on_commit(tmp_path, cand
     pending = store.begin_transition("transition-1")
     candidate = manifest(tick=1, refs=candidate_refs, last_sequence=0, digest="e" * 64)
 
-    with pytest.raises(ManifestError, match="identities must match"):
+    with pytest.raises(ManifestError, match="participant roster differs"):
         store.commit_transition(candidate, dependency_verifier=lambda _refs: True)
 
     assert store.read() == pending

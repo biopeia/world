@@ -41,7 +41,7 @@ The payload is optional opaque data, not a new domain event taxonomy or a cross-
 
 | Target path | Provenance | Disposition | Notes |
 | --- | --- | --- | --- |
-| `src/world/manifest.py` | New target contract implementation from MIG-003 and accepted AD-0006, AD-0009, AD-0018, AD-0019, AD-0032 | REWRITE | Stores World ID, committed causal tick, exact opaque owner checkpoint references and hashes, inclusive durable journal `last_sequence`/prefix digest, schema version, and `COMPLETE`/`RECOVERY_REQUIRED` status. It never decodes owner-private state. |
+| `src/world/manifest.py` | New target contract implementation from MIG-003 and accepted AD-0006, AD-0009, AD-0018, AD-0019, AD-0032 | REWRITE | Stores World ID, committed causal tick, exact opaque owner checkpoint references and hashes, inclusive durable journal `last_sequence`/prefix digest, schema version, and `COMMITTED`/`RECOVERY_REQUIRED` status. It never decodes owner-private state. |
 | `tests/test_manifest.py` | New bounded tests for MIG-003 | REWRITE | Covers schema validation, inclusive empty/non-empty journal boundary, persisted pending status, dependency-verification rejection, and successful manifest publication. These are API-level tests, not crash experiments. |
 
 ## Exclusive tick-zero manifest initialization follow-up
@@ -51,14 +51,14 @@ The payload is optional opaque data, not a new domain event taxonomy or a cross-
 | `src/world/manifest.py` | Target-only hardening of the tick-zero manifest initializer, constrained by AD-0010's single-writer/explicit-coordination invariant; no CURRENT code copied | REWRITE | Replaces check-then-replace initialization with same-directory temporary serialization and atomic no-overwrite hard-link publication. This prevents competing initializers from silently replacing the first tick-zero manifest on filesystems supporting same-filesystem hard links. |
 | `tests/test_manifest.py` | New concurrent initializer test | REWRITE | Two threads race to initialize one path; verifies one succeeds and the other receives `FileExistsError`, leaving one valid manifest. This is a process-local concurrency test, not multi-process or crash-durability evidence. |
 
-The increment is intentionally limited to first initialization. It does **not** coordinate later manifest updates across processes, implement a lock/lease, establish a deployment multiplicity contract, or resolve the outstanding identity/checkpoint-retention/zero-presence/tick-ordering questions tracked by MIG-003. Hard-link support and durability behavior are platform/filesystem dependent and were not broadly validated. No source-monorepo code was changed.
+At the time of this historical increment, only initialization was serialized. The later schema-v3 follow-up below adds POSIX advisory locking for store operations; this still does not provide distributed locking, consensus, or general platform durability proof. No source-monorepo code was changed.
 
 ## Integrated durable tick publication slice
 
 | Target path | Provenance | Disposition | Notes |
 | --- | --- | --- | --- |
-| `src/world/durable_runtime.py` | New composition over local `runtime.py`, `journal.py`, and `manifest.py`; implements accepted AD-0006, AD-0009, AD-0018, AD-0019, AD-0012 | REWRITE | Writes a durable `RECOVERY_REQUIRED` marker before invoking owner checkpoint writers, persists an immutable journal prefix, verifies the opaque owner dependency closure, and publishes a `COMPLETE` manifest only after those references are available. World does not decode owner checkpoints. |
-| `src/world/manifest.py` | Schema v2 amendment in this migration slice | REWRITE | Persists the active presence IDs for the causal cut and rejects restore through a caller-supplied presence absent from that cut. Schema v2 is new, with no historical-format compatibility obligation. |
+| `src/world/durable_runtime.py` | New composition over local `runtime.py`, `journal.py`, and `manifest.py`; implements accepted AD-0006, AD-0009, AD-0018, AD-0019, AD-0012 | REWRITE | Writes a durable `RECOVERY_REQUIRED` marker before invoking owner checkpoint writers, persists an immutable journal prefix, verifies the opaque owner dependency closure, and publishes a `COMMITTED` manifest only after those references are available. World does not decode owner checkpoints. |
+| `src/world/manifest.py` | Schema v3 amendment in this migration slice | REWRITE | Persists the active presence IDs for the causal cut and rejects restore through a caller-supplied presence absent from that cut. Schema v3 is new, with no historical-format compatibility obligation. |
 | `tests/test_durable_runtime.py` | New bounded synthetic filesystem fixtures | REWRITE | Verifies successful publication, validated restore delegation, and refusal to publish a cut with an unavailable owner reference. These are contract tests, not fault injection or filesystem crash-consistency evidence. |
 | `src/world/__init__.py` | Updated package exports | REWRITE | Exposes the durable coordinator and journal snapshot store. |
 
@@ -80,11 +80,11 @@ The increment is intentionally limited to first initialization. It does **not** 
 
 The additional check narrows a validation gap between pre-restore verification and returning a usable runtime. It does not establish that an owner restorer is permitted to write checkpoint storage, set the manifest to `RECOVERY_REQUIRED`, or provide a general recovery response when references change. A failed restore returns no runtime; callers must handle that failure explicitly. No claim is made about filesystem races after the final verification.
 
-This slice integrates World tick publication with owner-specific checkpoint references and durable journal snapshots. The manifest binds the active presence ID(s) for the cut; the current coordinator still supports only the single presence supplied to its runtime instance and does not provide presence registration/termination orchestration. The owner callback is responsible for persisting each authority's checkpoint through that authority's own contract and returning the exact dependency closure for the proposed cut. `owner_checkpoint_verifier` is the boundary that verifies availability/integrity; it does not prove semantic completeness of the callback's roster. The initial slice had no explicit recovery operation; the bounded follow-up below permits explicit restoration only to the last committed cut. It does not resolve ambiguous publication outcomes, implement roll-forward, provide concurrent-process writer coordination, or prove power-loss/platform guarantees. No fault injection was run.
+Historical pre-schema-v3 state: World bound the active presence ID(s), but had no presence lifecycle or owner roster API. The owner callback supplied the dependency closure and an aggregate verifier checked availability/integrity only. The initial slice had no explicit recovery operation; the bounded follow-up below added restoration of the prior committed cut. Those earlier limitations are superseded in part by the schema-v3 follow-up below; cross-owner semantics, roll-forward, distributed writer coordination, and crash/power-loss proof remain out of scope.
 
-The store uses same-directory temporary files, file `fsync`, atomic replacement and directory `fsync` on the local filesystem. `begin_transition` must return successfully before causal mutation starts; it publishes durable `RECOVERY_REQUIRED` first. A candidate `COMPLETE` manifest is accepted only for the pending next tick and only after a caller-supplied dependency verifier accepts the owner checkpoint references. If verification fails, the pending recovery record remains.
+The store uses same-directory temporary files, file `fsync`, atomic replacement and directory `fsync` on the local filesystem. `begin_transition` must return successfully before causal mutation starts; it publishes durable `PREPARING` first while retaining the previous committed cut. Runtime failure or startup finding a stranded prepare yields `RECOVERY_REQUIRED`. Historically, a candidate manifest was accepted after a caller-supplied dependency verifier accepted the references. Schema v3 adds exact pending commit/participant validation and typed receipts from registered owner contracts; if validation fails, the pending recovery record remains.
 
-This slice still does not prove that all references describe a semantically complete cross-owner causal cut or guarantee cross-file/process crash consistency. It delegates owner restoration and does not inspect or interpret private Organism state. The explicit recovery operation is limited to restoring the exact previous committed cut; it does not roll forward an interrupted transition or resolve an ambiguous commit outcome. Owner restoration must be retry-safe if it partially restores state and leaves `RECOVERY_REQUIRED` in place. Filesystem/platform durability behavior has not been experimentally validated; no process/power-loss fault injection was run. The earlier in-memory runtime's transition callback ordering remains unchanged and is not covered by this store's guarantees.
+This historical slice did not prove that all references describe a semantically complete cross-owner causal cut or guarantee cross-file/process crash consistency. Schema v3 adds an explicit registered-owner receipt protocol, but does not claim adversarial validation or empirical crash consistency. It delegates owner restoration and does not inspect or interpret private Organism state. The explicit recovery operation is limited to restoring the exact previous committed cut; it does not roll forward an interrupted transition or resolve an ambiguous commit outcome. Owner restoration must be retry-safe if it partially restores state and leaves `RECOVERY_REQUIRED` in place. Filesystem/platform durability behavior has not been experimentally validated; no process/power-loss fault injection was run. The earlier in-memory runtime's transition callback ordering remains unchanged and is not covered by this store's guarantees.
 
 ## Excluded and deferred source responsibilities
 
@@ -111,20 +111,13 @@ CI builds a wheel, installs it without dependencies, and runs the focused unit t
 
 # Durable cut participant closure
 
-`DurableWorldRuntime` refuses to initialize a `COMPLETE` cut without at least
-one owner checkpoint. Each ordinary tick must supply the same set of
-`(owner, owner_identity)` pairs as the previous cut; checkpoints may advance,
-but a participant cannot silently disappear or be replaced while the cut is
-published. These owner identities identify semantic resources and are not
-inferred from, or equated with, World presence IDs. Membership changes are
-outside the current API and require a future explicit World transition. This
-requirement is enforced at durable manifest publication (`initialize`,
-`commit_transition`, and recovery publication) and when validating/restoring a
-runtime. Direct store callers cannot omit, add, or substitute declared owner
-identities during a committed transition; a journal-only manifest cannot be
-written through the supported store APIs or used to restore an active runtime
-or publish later ticks. This still does not establish that a caller listed
-every real participant: the
-caller is responsible for declaring the initial owner closure accurately, and
-this API has no authoritative roster from which World can independently
-derive that set.
+The following historical limitation was addressed in part by schema v3: owner roster changes are now explicit World transitions; the initial roster remains externally declared, so omissions before registration are not discoverable.
+
+
+## Ratified participant and commit identity follow-up
+
+The current manifest schema v3 records `world_id`, `causal_tick`, `commit_id`, active `presence_ids`, registered owner identities, step-only participants, opaque checkpoint references, journal sequence/digest, and `PREPARING` / `COMMITTED` / `RECOVERY_REQUIRED` status. `begin_transition` durably publishes `PREPARING`; startup changes an interrupted prepare to `RECOVERY_REQUIRED`, preserving the previous committed cut and proposed roster. A committed transition is accepted only for the pending transition ID/tick and exact World-prepared presence and owner rosters. The store serializes operations with a POSIX advisory lock; this is single-logical-writer coordination on supported local filesystems, not distributed locking or consensus.
+
+The runtime exposes explicit presence and owner register/unregister inputs and step-only participants. This records World's prepared roster; it does not discover external owners by introspection. Each registered owner must supply a trusted in-process `OwnerCheckpointContract`; the contract returns a typed `OwnerRecoveryReceipt` bound to the exact owner, owner identity, checkpoint ID, schema version, locator, and hash, and verifies the reference after restore. Missing or mismatched receipts fail closed. The initial registered owner roster is explicitly supplied by the initializer, so omission of a real authority before registration remains outside what this repository can detect.
+
+**Trust boundary and unproven evidence:** `OwnerCheckpointContract` is the explicit owner registration interface and typed receipt gate. Its implementation is trusted in-process owner code; a receipt is not signed or independently verifiable against a malicious adapter. Thus World enforces declared-roster closure and fail-closed typed owner receipts, but cannot discover omitted authorities from outside the supplied initial roster or prove storage survival through actual power/process loss. No adversarial sandbox claim or empirical crash-durability claim is made. The PR remains a bounded migration candidate, not proof of full operational durability.
