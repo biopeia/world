@@ -1,6 +1,14 @@
+from threading import Event, Thread
+
 import pytest
 
-from world import RecoveryRequiredError, RuntimeStatus, WorldId, WorldRuntime
+from world import (
+    RecoveryRequiredError,
+    RuntimeStatus,
+    TickInProgressError,
+    WorldId,
+    WorldRuntime,
+)
 
 
 def test_successful_ticks_publish_one_record_after_transition_in_tick_order():
@@ -50,3 +58,57 @@ def test_invalid_world_and_presence_ids_are_rejected():
         WorldId(" ")
     with pytest.raises(ValueError):
         WorldRuntime(WorldId("world-test"), presence_id="")
+
+
+def test_concurrent_tick_fails_fast_without_starting_or_poisoning_runtime():
+    runtime = WorldRuntime(WorldId("world-test"), presence_id="presence-a")
+    callback_entered = Event()
+    release_callback = Event()
+    worker_errors = []
+
+    def blocking_transition(tick):
+        assert tick == 1
+        callback_entered.set()
+        assert release_callback.wait(timeout=2)
+
+    def run_first_tick():
+        try:
+            runtime.tick(blocking_transition)
+        except Exception as exc:  # surfaced in the main test thread below
+            worker_errors.append(exc)
+
+    worker = Thread(target=run_first_tick)
+    worker.start()
+    assert callback_entered.wait(timeout=2)
+
+    rejected_callback_calls = []
+    with pytest.raises(TickInProgressError):
+        runtime.tick(rejected_callback_calls.append)
+
+    assert runtime.status is RuntimeStatus.ACTIVE
+    assert runtime.causal_tick == 0
+    assert rejected_callback_calls == []
+    release_callback.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert worker_errors == []
+    assert runtime.causal_tick == 1
+    assert [record.causal_tick for record in runtime.records] == [1]
+
+
+def test_reentrant_tick_fails_fast_without_preventing_outer_commit():
+    runtime = WorldRuntime(WorldId("world-test"), presence_id="presence-a")
+    nested_calls = []
+
+    def outer_transition(tick):
+        assert tick == 1
+        with pytest.raises(TickInProgressError):
+            runtime.tick(nested_calls.append)
+
+    runtime.tick(outer_transition)
+
+    assert nested_calls == []
+    assert runtime.status is RuntimeStatus.ACTIVE
+    assert runtime.causal_tick == 1
+    assert [record.causal_tick for record in runtime.records] == [1]

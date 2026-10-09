@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from threading import Lock
 from typing import Callable
 
 from .journal import CausalRecord, EventJournal
@@ -35,6 +36,10 @@ class RecoveryRequiredError(RuntimeError):
     """Raised when a failed causal transition prevents further ticks."""
 
 
+class TickInProgressError(RuntimeError):
+    """Raised when a tick is invoked while another tick is executing."""
+
+
 Transition = Callable[[int], None]
 
 
@@ -45,7 +50,10 @@ class WorldRuntime:
     zero. The callback receives the proposed, one-based tick. It is opaque to
     World: the callback's state ownership and rollback semantics are outside
     this package. If it or journal publication raises, the runtime enters
-    ``RECOVERY_REQUIRED`` and refuses later transitions.
+    ``RECOVERY_REQUIRED`` and refuses later transitions. Calls made while a
+    transition is already executing fail fast before invoking their callback;
+    this applies to both concurrent and reentrant calls and does not itself
+    alter runtime status.
     """
 
     def __init__(self, world_id: WorldId, presence_id: str) -> None:
@@ -58,6 +66,7 @@ class WorldRuntime:
         self._failed_tick: int | None = None
         self._failure: str | None = None
         self._journal = EventJournal()
+        self._tick_guard = Lock()
 
     @property
     def causal_tick(self) -> int:
@@ -84,28 +93,34 @@ class WorldRuntime:
     def tick(self, transition: Transition) -> CausalRecord:
         """Run a transition and publish its causal record on success only."""
 
-        if self._status is RuntimeStatus.RECOVERY_REQUIRED:
-            raise RecoveryRequiredError(
-                f"World runtime requires recovery after failed tick {self._failed_tick}"
-            )
+        if not self._tick_guard.acquire(blocking=False):
+            raise TickInProgressError("a World causal tick is already in progress")
 
-        proposed_tick = self._causal_tick + 1
         try:
-            transition(proposed_tick)
-            record = CausalRecord(
-                record_id=f"{self.world_id.value}:tick:{proposed_tick}",
-                world_id=self.world_id.value,
-                causal_tick=proposed_tick,
-                record_type="world.causal_tick.committed",
-                actor_id=self.presence_id,
-                payload={"presence_id": self.presence_id},
-            )
-            self._journal.append(record)
-        except Exception as exc:
-            self._status = RuntimeStatus.RECOVERY_REQUIRED
-            self._failed_tick = proposed_tick
-            self._failure = f"{type(exc).__name__}: {exc}"
-            raise
+            if self._status is RuntimeStatus.RECOVERY_REQUIRED:
+                raise RecoveryRequiredError(
+                    f"World runtime requires recovery after failed tick {self._failed_tick}"
+                )
 
-        self._causal_tick = proposed_tick
-        return record
+            proposed_tick = self._causal_tick + 1
+            try:
+                transition(proposed_tick)
+                record = CausalRecord(
+                    record_id=f"{self.world_id.value}:tick:{proposed_tick}",
+                    world_id=self.world_id.value,
+                    causal_tick=proposed_tick,
+                    record_type="world.causal_tick.committed",
+                    actor_id=self.presence_id,
+                    payload={"presence_id": self.presence_id},
+                )
+                self._journal.append(record)
+            except Exception as exc:
+                self._status = RuntimeStatus.RECOVERY_REQUIRED
+                self._failed_tick = proposed_tick
+                self._failure = f"{type(exc).__name__}: {exc}"
+                raise
+
+            self._causal_tick = proposed_tick
+            return record
+        finally:
+            self._tick_guard.release()
