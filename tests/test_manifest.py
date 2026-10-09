@@ -14,12 +14,12 @@ from world import (
 )
 
 
-def manifest(*, tick=0, refs=(), last_sequence=None, digest="", **overrides):
+def manifest(*, tick=0, refs=None, last_sequence=None, digest="", **overrides):
     values = {
         "world_id": "world-a",
         "causal_tick": tick,
         "presence_ids": (),
-        "checkpoint_references": tuple(refs),
+        "checkpoint_references": (checkpoint(),) if refs is None else tuple(refs),
         "journal_last_sequence": last_sequence,
         "journal_prefix_sha256": digest,
     }
@@ -87,6 +87,28 @@ def test_successful_causal_cut_publication_verifies_dependency_closure(tmp_path)
     assert result.status is ManifestStatus.COMPLETE
     assert store.read() == committed
     assert store.require_active() == committed
+
+
+def test_manifest_store_rejects_journal_only_initial_cut_and_commit(tmp_path):
+    store = WorldCausalManifestStore(tmp_path / "world.json")
+    journal = checkpoint(owner="world-journal", identity="world-a")
+    journal_only_initial = manifest(refs=(journal,))
+
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        store.initialize(journal_only_initial)
+    assert not store.path.exists()
+
+    store.initialize(manifest())
+    pending = store.begin_transition("transition-1")
+    journal_only_candidate = manifest(
+        tick=1,
+        refs=(journal,),
+        last_sequence=0,
+        digest="d" * 64,
+    )
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        store.commit_transition(journal_only_candidate, dependency_verifier=lambda _refs: True)
+    assert store.read() == pending
 
 
 def test_unverified_checkpoint_dependency_leaves_durable_recovery_required(tmp_path):

@@ -19,6 +19,7 @@ from typing import Callable
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SCHEMA_VERSION = 2
+_JOURNAL_OWNER = "world-journal"
 
 
 class ManifestStatus(str, Enum):
@@ -120,6 +121,7 @@ class WorldCausalManifestStore:
     def initialize(self, manifest: WorldCausalManifest) -> None:
         if manifest.status is not ManifestStatus.COMPLETE or manifest.causal_tick != 0:
             raise ValueError("initial manifest must be a complete tick-zero causal cut")
+        _require_owner_state(manifest)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         encoded = _canonical_bytes(_manifest_to_data(manifest))
         fd, temp_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
@@ -207,6 +209,7 @@ class WorldCausalManifestStore:
             raise ValueError("committed causal cut must have COMPLETE status")
         if (manifest.world_id, manifest.causal_tick) != (pending.world_id, pending.pending_tick):
             raise ValueError("committed causal cut does not match the pending World transition")
+        _require_owner_state(manifest)
         if not dependency_verifier(manifest.checkpoint_references):
             raise ManifestError("causal cut checkpoint dependency closure is not verified")
         self._write(manifest)
@@ -259,6 +262,8 @@ class WorldCausalManifestStore:
         return recovered
 
     def _write(self, manifest: WorldCausalManifest) -> None:
+        if manifest.status is ManifestStatus.COMPLETE:
+            _require_owner_state(manifest)
         encoded = _canonical_bytes(_manifest_to_data(manifest))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
@@ -278,6 +283,12 @@ class WorldCausalManifestStore:
 
 def _canonical_bytes(data: dict) -> bytes:
     return (json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def _require_owner_state(manifest: WorldCausalManifest) -> None:
+    """A COMPLETE World cut needs semantic-owner state as well as its journal."""
+    if not any(reference.owner != _JOURNAL_OWNER for reference in manifest.checkpoint_references):
+        raise ManifestError("complete causal cut must identify at least one durable owner checkpoint")
 
 
 def _manifest_to_data(manifest: WorldCausalManifest) -> dict:

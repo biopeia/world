@@ -124,10 +124,14 @@ def test_restore_and_recovery_reject_publicly_published_cuts_without_owner_state
         journal_prefix_sha256="",
     )
 
-    # The lower-level manifest store is public and can serialize a structurally
-    # valid manifest; the durable runtime must not mistake the World journal
-    # for an owner-owned checkpoint when restoring that cut.
-    manifest_store.initialize(journal_only)
+    # The lower-level publication API rejects this cut. Also exercise restore
+    # fail-closed against an invalid/legacy on-disk manifest that bypasses it.
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        manifest_store.initialize(journal_only)
+    manifest_store.path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_store.path.write_text(
+        json.dumps(manifest_module._manifest_to_data(journal_only)), encoding="utf-8"
+    )
     with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
         DurableWorldRuntime.restore(
             world_id,
