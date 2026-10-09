@@ -6,6 +6,7 @@ causal cut without decoding or taking semantic ownership of referenced state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -196,6 +197,49 @@ class WorldCausalManifestStore:
         self._write(manifest)
         return manifest
 
+    def _complete_recovery(self, transition_id: str) -> WorldCausalManifest:
+        """Publish the prior coherent cut after caller-validated restoration.
+
+        The runtime calls this only after restoring every non-World checkpoint
+        through its semantic owner's recovery contract and verifying references.
+        This method records a durable receipt before clearing
+        ``RECOVERY_REQUIRED`` so an interrupted publication can be retried
+        without losing which transition was recovered.
+        """
+        if not transition_id or not transition_id.strip():
+            raise ValueError("transition_id must not be empty")
+        pending = self.read()
+        if pending.status is not ManifestStatus.RECOVERY_REQUIRED:
+            raise ValueError("recovery requires a durable pending transition")
+        if pending.pending_transition_id != transition_id:
+            raise ValueError("recovery transition_id does not match pending transition")
+
+        recovered = WorldCausalManifest(
+            world_id=pending.world_id,
+            causal_tick=pending.causal_tick,
+            presence_ids=pending.presence_ids,
+            checkpoint_references=pending.checkpoint_references,
+            journal_last_sequence=pending.journal_last_sequence,
+            journal_prefix_sha256=pending.journal_prefix_sha256,
+        )
+        pending_bytes = _canonical_bytes(_manifest_to_data(pending))
+        recovered_bytes = _canonical_bytes(_manifest_to_data(recovered))
+        receipt = _canonical_bytes(
+            {
+                "world_id": pending.world_id,
+                "transition_id": transition_id,
+                "restored_causal_tick": pending.causal_tick,
+                "pending_manifest_sha256": hashlib.sha256(pending_bytes).hexdigest(),
+                "recovered_manifest_sha256": hashlib.sha256(recovered_bytes).hexdigest(),
+            }
+        )
+        receipt_dir = self.path.parent / "recoveries"
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        receipt_name = hashlib.sha256(transition_id.encode("utf-8")).hexdigest() + ".json"
+        _write_immutable(receipt_dir / receipt_name, receipt)
+        self._write(recovered)
+        return recovered
+
     def _write(self, manifest: WorldCausalManifest) -> None:
         encoded = _canonical_bytes(_manifest_to_data(manifest))
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -282,3 +326,28 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _write_immutable(path: Path, encoded: bytes) -> None:
+    """Durably create a content-checked immutable receipt without overwrite."""
+    if path.exists():
+        if path.read_bytes() != encoded:
+            raise ManifestError("existing recovery receipt differs from candidate")
+        return
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temp_name, path)
+        except FileExistsError:
+            if path.read_bytes() != encoded:
+                raise ManifestError("recovery receipt path collision")
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass

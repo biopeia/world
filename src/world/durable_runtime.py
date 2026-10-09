@@ -214,6 +214,61 @@ class DurableWorldRuntime:
             owner_checkpoint_verifier=owner_checkpoint_verifier,
         )
 
+    @classmethod
+    def recover_previous_cut(
+        cls,
+        world_id: WorldId,
+        presence_id: str,
+        manifest_store: WorldCausalManifestStore,
+        journal_store: DurableJournalSnapshotStore,
+        *,
+        owner_checkpoint_verifier: OwnerCheckpointVerifier,
+        owner_checkpoint_restorer: OwnerCheckpointRestorer,
+    ) -> DurableWorldRuntime:
+        """Explicitly restore the last committed cut after an interrupted tick.
+
+        Recovery delegates private-state restoration to each semantic owner.
+        The prior durable references must verify before and after restoration;
+        only then is an immutable recovery receipt written and the previous
+        cut republished as COMPLETE. This is not crash-consistency proof or a
+        multi-process recovery protocol. The owner restorer must be safe to
+        retry: a partial restoration may leave the manifest RECOVERY_REQUIRED.
+        """
+        pending = manifest_store.read()
+        if pending.status is not ManifestStatus.RECOVERY_REQUIRED:
+            raise ManifestError("explicit recovery requires RECOVERY_REQUIRED state")
+        if pending.world_id != world_id.value:
+            raise ManifestError("pending World identity does not match requested World")
+        if not pending.pending_transition_id or pending.pending_tick != pending.causal_tick + 1:
+            raise ManifestError("pending transition metadata is incomplete or inconsistent")
+        if presence_id not in pending.presence_ids:
+            raise ManifestError("requested presence is not part of the pending World cut")
+
+        references = pending.checkpoint_references
+        journal_refs = tuple(ref for ref in references if ref.owner == _JOURNAL_OWNER)
+        if len(journal_refs) != 1 or journal_refs[0].owner_identity != world_id.value:
+            raise ManifestError("pending causal cut must reference exactly one World journal snapshot")
+        if not cls._verify_references(references, owner_checkpoint_verifier):
+            raise ManifestError("previous causal cut dependency closure is not verified")
+        journal = journal_store.read(journal_refs[0])
+        cls._validate_cut(pending, journal)
+
+        owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
+        owner_checkpoint_restorer(owner_references)
+        if not cls._verify_references(references, owner_checkpoint_verifier):
+            raise ManifestError("previous causal cut dependency closure changed during recovery")
+
+        recovered = manifest_store._complete_recovery(pending.pending_transition_id)
+        return cls(
+            world_id,
+            presence_id,
+            manifest_store,
+            journal_store,
+            recovered,
+            journal,
+            owner_checkpoint_verifier=owner_checkpoint_verifier,
+        )
+
     @property
     def causal_tick(self) -> int:
         return self._manifest.causal_tick
