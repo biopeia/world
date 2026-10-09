@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
 
 import mujoco
 import pytest
-
+from embodiment.observation import BodyPoseSample
 from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
 from embodiment.physics3d.mechanics import SegmentSpec
 from embodiment.physics3d.physical_projection import project_body_physical_input
@@ -26,22 +26,36 @@ from embodiment.physics3d.physical_transition import (
     PhysicalStepCorrelation,
     SolverBodyCandidate,
 )
-from embodiment.observation import BodyPoseSample
 from environment import (
     GENERATOR_ID,
     GENERATOR_REVISION,
     EnvironmentGenesisConfig,
     EnvironmentGenesisSpec,
     FrameDescriptor,
-    PhysicalStepCorrelation as EnvironmentStepCorrelation,
     StaticEnvironmentOwner,
     StaticGroundPlane,
     StaticPhysicalScene,
     StaticSceneCandidate,
-    StaticSphere,
     generate_procedural_environment,
     project_static_scene,
 )
+from environment import (
+    PhysicalStepCorrelation as EnvironmentStepCorrelation,
+)
+from observation.semantic import (
+    AcquisitionBasis,
+    ActorRef,
+    AuthorityDomain,
+    DomainTimeRef,
+    IdentityAssertion,
+    IdentityRef,
+    SemanticClaim,
+    SemanticContractRef,
+    SemanticFamily,
+    SemanticObservation,
+    SubjectScope,
+)
+
 from world.durable_runtime import (
     DurableJournalSnapshotStore,
     DurableWorldRuntime,
@@ -54,7 +68,6 @@ from world.manifest import (
     WorldCausalManifestStore,
 )
 from world.runtime import PresenceId, WorldId
-
 
 WORLD_ID = "world.procedural-sphere-e2e"
 PRESENCE_ID = "presence.procedural-sphere-e2e"
@@ -750,3 +763,226 @@ def test_stale_morphology_candidate_cannot_commit_sphere_step(tmp_path: Path) ->
     assert fixture.environment.scene == scene_before
     assert fixture.environment.last_adopted_tick == -1
     assert adopted == []
+
+
+def _committed_cut_observations(fixture: _Fixture) -> tuple[tuple[object, ...], tuple[SemanticObservation[object], ...]]:
+    """Build fixture-local semantic projections from an already committed cut.
+
+    This intentionally consumes only approved in-memory Observation concepts.
+    The family names/contracts below are integration-fixture identifiers, not
+    production semantic-family approval, a record schema, or a transport API.
+    """
+    manifest_before = fixture.runtime.manifest
+    assert manifest_before.status is ManifestStatus.COMMITTED
+    assert manifest_before.causal_tick == 1
+    references = manifest_before.checkpoint_references
+    live_body_before = fixture.body
+    live_environment_before = fixture.environment.scene
+    environment_adoption_tick_before = fixture.environment.last_adopted_tick
+    owner_bytes_before = tuple(
+        (reference.owner, hashlib.sha256(Path(reference.locator).read_bytes()).hexdigest())
+        for reference in references
+        if reference.owner != "world-journal"
+    )
+
+    restored: dict[str, object] = {}
+    for reference in references:
+        if reference.owner == "embodiment":
+            restored[reference.owner] = EmbodimentPhysicalState.restore_checkpoint(
+                Path(reference.locator).read_bytes()
+            )
+        elif reference.owner == "environment":
+            restored[reference.owner] = StaticEnvironmentOwner.from_checkpoint_bytes(
+                Path(reference.locator).read_bytes()
+            )
+    body = restored.get("embodiment")
+    environment = restored.get("environment")
+    assert isinstance(body, EmbodimentPhysicalState)
+    assert isinstance(environment, StaticEnvironmentOwner)
+
+    embodiment = ActorRef("domain", "embodiment")
+    environment_actor = ActorRef("domain", "environment")
+    world_actor = ActorRef("domain", "world")
+    adapter = ActorRef("component", "fixture-observation-projection")
+    body_identity = IdentityAssertion(
+        IdentityRef("body_id", BODY_ID, embodiment, scope=EPISODE_ID),
+        ActorRef("boundary", "embodiment-owner"),
+    )
+    environment_identity = IdentityAssertion(
+        IdentityRef("environment_id", ENVIRONMENT_ID, environment_actor),
+        ActorRef("boundary", "environment-owner"),
+    )
+    world_identity = IdentityAssertion(
+        IdentityRef("world_id", WORLD_ID, world_actor),
+        ActorRef("boundary", "world-owner"),
+    )
+
+    body_observation = SemanticObservation(
+        claim=SemanticClaim(
+            family=SemanticFamily(
+                AuthorityDomain.EMBODIMENT,
+                ("body_pose",),
+                SemanticContractRef("integration_fixture_body_pose", "v1"),
+            ),
+            subject=SubjectScope("body", identities=(body_identity,)),
+            epistemic_kind="authoritative_state",
+            value={
+                "position_m": body.pose.position_m,
+                "orientation_xyzw": body.pose.orientation_xyzw,
+                "linear_velocity_m_per_s": body.linear_velocity_m_per_s,
+                "angular_velocity_rad_per_s": body.angular_velocity_rad_per_s,
+                "reference_frame": body.pose.reference_frame,
+                "body_frame": body.pose.body_frame,
+            },
+        ),
+        acquisition=AcquisitionBasis("authoritative_state"),
+        asserter=ActorRef("boundary", "embodiment-owner"),
+        producer=adapter,
+        domain_time=(
+            DomainTimeRef(
+                AuthorityDomain.EMBODIMENT,
+                "morphology_revision",
+                body.morphology_revision,
+            ),
+        ),
+        context_time=(
+            DomainTimeRef(
+                AuthorityDomain.WORLD, "causal_tick", manifest_before.causal_tick
+            ),
+        ),
+    )
+    scene = environment.scene
+    environment_observation = SemanticObservation(
+        claim=SemanticClaim(
+            family=SemanticFamily(
+                AuthorityDomain.ENVIRONMENT,
+                ("static_scene",),
+                SemanticContractRef("integration_fixture_static_scene", "v1"),
+            ),
+            subject=SubjectScope("environment", identities=(environment_identity,)),
+            epistemic_kind="authoritative_state",
+            value={
+                "environment_revision": scene.environment_revision,
+                "frame_id": scene.frame.frame_id,
+                "gravity_m_s2": scene.gravity_m_s2,
+                "sphere_geometry": tuple(
+                    (sphere.object_id, sphere.center_m, sphere.radius_m, sphere.frame_id)
+                    for sphere in sorted(scene.spheres, key=lambda item: item.object_id)
+                ),
+                "genesis_seed": scene.genesis.environment_seed if scene.genesis else None,
+                "generator_id": scene.genesis.generator_id if scene.genesis else None,
+                "generator_revision": scene.genesis.generator_revision
+                if scene.genesis
+                else None,
+            },
+        ),
+        acquisition=AcquisitionBasis("authoritative_state"),
+        asserter=ActorRef("boundary", "environment-owner"),
+        producer=adapter,
+        domain_time=(
+            DomainTimeRef(
+                AuthorityDomain.ENVIRONMENT,
+                "environment_revision",
+                scene.environment_revision,
+            ),
+        ),
+        context_time=(
+            DomainTimeRef(
+                AuthorityDomain.WORLD, "causal_tick", manifest_before.causal_tick
+            ),
+        ),
+    )
+    world_observation = SemanticObservation(
+        claim=SemanticClaim(
+            family=SemanticFamily(
+                AuthorityDomain.WORLD,
+                ("causal_cut",),
+                SemanticContractRef("integration_fixture_causal_cut", "v1"),
+            ),
+            subject=SubjectScope("world", identities=(world_identity,)),
+            epistemic_kind="authoritative_state",
+            value={
+                "commit_id": manifest_before.commit_id,
+                "causal_tick": manifest_before.causal_tick,
+                "journal_prefix_sha256": manifest_before.journal_prefix_sha256,
+                "owner_checkpoint_sha256": tuple(
+                    (reference.owner, reference.owner_identity, reference.sha256)
+                    for reference in references
+                    if reference.owner != "world-journal"
+                ),
+            },
+        ),
+        acquisition=AcquisitionBasis("authoritative_state"),
+        asserter=ActorRef("boundary", "world-owner"),
+        producer=adapter,
+        domain_time=(
+            DomainTimeRef(
+                AuthorityDomain.WORLD, "causal_tick", manifest_before.causal_tick
+            ),
+        ),
+    )
+
+    # The projection reads adopted owner checkpoints after publication and
+    # cannot write back to either owners or World.
+    assert fixture.runtime.manifest is manifest_before
+    assert fixture.body is live_body_before
+    assert fixture.environment.scene is live_environment_before
+    assert fixture.environment.last_adopted_tick == environment_adoption_tick_before
+    assert tuple(
+        (reference.owner, hashlib.sha256(Path(reference.locator).read_bytes()).hexdigest())
+        for reference in references
+        if reference.owner != "world-journal"
+    ) == owner_bytes_before
+    normalized_cut = (
+        manifest_before.world_id,
+        manifest_before.causal_tick,
+        manifest_before.commit_id,
+        manifest_before.status,
+        manifest_before.presence_ids,
+        manifest_before.registered_owner_ids,
+        manifest_before.journal_prefix_sha256,
+        tuple(
+            (
+                ref.owner,
+                ref.owner_identity,
+                ref.checkpoint_id,
+                ref.schema_version,
+                ref.sha256,
+            )
+            for ref in references
+        ),
+    )
+    return normalized_cut, (
+        world_observation,
+        body_observation,
+        environment_observation,
+    )
+
+
+def test_identical_runs_have_equal_adopted_cut_and_passive_semantic_claims(
+    tmp_path: Path,
+) -> None:
+    runs: list[
+        tuple[
+            tuple[object, ...],
+            tuple[SemanticObservation[object], ...],
+            tuple[object, ...],
+        ]
+    ] = []
+    for name in ("run-a", "run-b"):
+        fixture = _fixture(tmp_path / name)
+        _advance_and_commit(fixture, world_tick=1)
+        assert fixture.runtime.manifest.status is ManifestStatus.COMMITTED
+
+        before = fixture.runtime.manifest
+        normalized_cut, observations = _committed_cut_observations(fixture)
+        after = fixture.runtime.manifest
+        assert after is before
+        owner_hashes = tuple(
+            (reference.owner, reference.sha256)
+            for reference in after.checkpoint_references
+            if reference.owner != "world-journal"
+        )
+        runs.append((normalized_cut, observations, owner_hashes))
+
+    assert runs[0] == runs[1]
