@@ -31,7 +31,7 @@ jobs:
           app-id: ${{ vars.CI_READ_APP_ID }}
           private-key: ${{ secrets.CI_READ_APP_PRIVATE_KEY }}
           owner: biopeia
-          repositories: organism,embodiment,environment,modality,observation
+          repositories: organism,embodiment,environment,observation
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

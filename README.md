@@ -21,7 +21,7 @@ See [`MIGRATION.md`](MIGRATION.md) for exact source provenance, dispositions, va
 
 ## Cross-repository integration tests
 
-`tests/integration` holds the versioned evidence that World coordinates the other authorities in one causal step: the first causal tick, publication and restore of an owner-checkpoint closure, and the first end-to-end physical causal step (`tests/integration/physical_step`). They import `organism`, `embodiment`, `environment`, `modality` and `observation`; the World package itself depends on none of them.
+`tests/integration` holds the versioned evidence that World coordinates the other authorities in one causal step: the first causal tick, publication and restore of an owner-checkpoint closure, and the first end-to-end physical causal step (`tests/integration/physical_step`). They import `organism`, `embodiment`, `environment` and `observation`; the World package itself depends on none of them.
 
 ```sh
 python -m pip install -e '.[integration]'   # pinned revisions of the other repositories
