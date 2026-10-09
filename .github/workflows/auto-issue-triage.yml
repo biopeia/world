@@ -10,4 +10,4 @@ permissions:
 
 jobs:
   triage:
-    uses: biopeia/.github-private/.github/workflows/auto-issue-triage.yml@99d0746e170fe3fb0c1b5140047ca8986e3d8be5
+    uses: biopeia/.github-private/.github/workflows/auto-issue-triage.yml@9e9e0edf2efc6d8f8b148497ec05b20faf9e20e9
