@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   add-to-project:
-    uses: biopeia/.github-private/.github/workflows/project-1-auto-add-issue.yml@51ae154bcea012fc325c44f01b1df131f58c1799
+    uses: biopeia/.github-private/.github/workflows/project-1-auto-add-issue.yml@31ff6878d9a6b7361a332a2dff815f38da3c013c
     with:
       app_id: ${{ vars.PROJECT_1_INTAKE_APP_ID }}
       project_id: ${{ vars.PROJECT_1_NODE_ID }}
