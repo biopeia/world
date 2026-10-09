@@ -235,6 +235,9 @@ class WorldCausalManifestStore:
         )
         receipt_dir = self.path.parent / "recoveries"
         receipt_dir.mkdir(parents=True, exist_ok=True)
+        # Persist the new directory entry before making a receipt inside it
+        # eligible for manifest publication.
+        _fsync_directory(receipt_dir.parent)
         receipt_name = hashlib.sha256(transition_id.encode("utf-8")).hexdigest() + ".json"
         _write_immutable(receipt_dir / receipt_name, receipt)
         self._write(recovered)
@@ -333,21 +336,24 @@ def _write_immutable(path: Path, encoded: bytes) -> None:
     if path.exists():
         if path.read_bytes() != encoded:
             raise ManifestError("existing recovery receipt differs from candidate")
-        return
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
+    else:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
-            os.link(temp_name, path)
-        except FileExistsError:
-            if path.read_bytes() != encoded:
-                raise ManifestError("recovery receipt path collision")
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temp_name, path)
+            except FileExistsError:
+                if path.read_bytes() != encoded:
+                    raise ManifestError("recovery receipt path collision")
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+    # This must also run for an identical preexisting receipt: recovery may
+    # have been interrupted after receipt creation but before manifest publish.
+    _fsync_directory(path.parent)
