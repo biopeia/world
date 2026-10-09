@@ -28,6 +28,17 @@
 
 This coordinator deliberately runs the opaque participant callback before journal publication. A callback failure can leave participant mutations in place; a journal append failure can occur after the callback has succeeded. Either failure latches `RECOVERY_REQUIRED`, and no later tick is allowed. Concurrent or reentrant calls fail fast with `TickInProgressError` before invoking their callbacks; this rejection does not itself latch recovery. No rollback or recovery operation is implemented. Both the latch and journal are in-memory only, so this prototype is not durable and does not satisfy AD-0019's durable post-failure contract.
 
+## Durable causal-cut manifest slice
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/manifest.py` | New target contract implementation from MIG-003 and accepted AD-0006, AD-0009, AD-0018, AD-0019, AD-0032 | REWRITE | Stores World ID, committed causal tick, exact opaque owner checkpoint references and hashes, inclusive durable journal `last_sequence`/prefix digest, schema version, and `COMPLETE`/`RECOVERY_REQUIRED` status. It never decodes owner-private state. |
+| `tests/test_manifest.py` | New bounded tests for MIG-003 | REWRITE | Covers schema validation, inclusive empty/non-empty journal boundary, persisted pending status, dependency-verification rejection, and successful manifest publication. These are API-level tests, not crash experiments. |
+
+The store uses same-directory temporary files, file `fsync`, atomic replacement and directory `fsync` on the local filesystem. `begin_transition` must return successfully before causal mutation starts; it publishes durable `RECOVERY_REQUIRED` first. A candidate `COMPLETE` manifest is accepted only for the pending next tick and only after a caller-supplied dependency verifier accepts the owner checkpoint references. If verification fails, the pending recovery record remains.
+
+This slice does not yet connect the store to `WorldRuntime`, owner checkpoint writers, or durable journal publication. Therefore it cannot itself prove that all references describe one coherent causal cut, guarantee cross-file/process crash consistency, restore private Organism state, or implement recovery. Filesystem/platform durability behavior has not been experimentally validated; no fault injection was run. The earlier in-memory runtime's transition callback ordering remains unchanged and is not covered by this store's guarantees.
+
 ## Excluded and deferred source responsibilities
 
 | Source path/family | Disposition | Reason |
