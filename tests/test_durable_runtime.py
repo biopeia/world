@@ -9,10 +9,12 @@ from world import (
     CheckpointReference,
     DurableJournalSnapshotStore,
     DurableWorldRuntime,
+    EventJournal,
     ManifestError,
     ManifestRecoveryRequiredError,
     ManifestStatus,
     RecoveryRequiredError,
+    WorldCausalManifest,
     WorldCausalManifestStore,
     WorldId,
 )
@@ -106,6 +108,57 @@ def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
     assert pending.status is ManifestStatus.RECOVERY_REQUIRED
     assert pending.causal_tick == 0
     assert pending.checkpoint_references[0].owner_identity == "organism-identity"
+
+
+def test_restore_and_recovery_reject_publicly_published_cuts_without_owner_state(tmp_path):
+    world_id = WorldId("world-journal-only")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    journal_reference = journal_store.write(EventJournal(), causal_tick=0)
+    journal_only = WorldCausalManifest(
+        world_id=world_id.value,
+        causal_tick=0,
+        presence_ids=("presence-a",),
+        checkpoint_references=(journal_reference,),
+        journal_last_sequence=None,
+        journal_prefix_sha256="",
+    )
+
+    # The lower-level manifest store is public and can serialize a structurally
+    # valid manifest; the durable runtime must not mistake the World journal
+    # for an owner-owned checkpoint when restoring that cut.
+    manifest_store.initialize(journal_only)
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        DurableWorldRuntime.restore(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=lambda references: not references,
+            owner_checkpoint_restorer=lambda _references: None,
+        )
+
+    pending_journal_only = WorldCausalManifest(
+        world_id=world_id.value,
+        causal_tick=0,
+        presence_ids=("presence-a",),
+        checkpoint_references=(journal_reference,),
+        journal_last_sequence=None,
+        journal_prefix_sha256="",
+        status=ManifestStatus.RECOVERY_REQUIRED,
+        pending_transition_id="transition-pending",
+        pending_tick=1,
+    )
+    manifest_store._write(pending_journal_only)
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        DurableWorldRuntime.recover_previous_cut(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=lambda references: not references,
+            owner_checkpoint_restorer=lambda _references: None,
+        )
 
 
 def test_restore_validates_world_cut_then_delegates_owner_restore(tmp_path):

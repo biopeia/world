@@ -163,8 +163,7 @@ class DurableWorldRuntime:
     ) -> DurableWorldRuntime:
         journal = EventJournal()
         owner_references = tuple(initial_owner_references)
-        if not owner_references:
-            raise ManifestError("initial causal cut must identify at least one durable owner checkpoint")
+        cls._require_owner_references(owner_references, "initial causal cut")
         journal_reference = journal_store.write(journal, causal_tick=0)
         references = (*owner_references, journal_reference)
         if not cls._verify_references(references, owner_checkpoint_verifier):
@@ -205,13 +204,14 @@ class DurableWorldRuntime:
         if presence_id not in manifest.presence_ids:
             raise ManifestError("requested presence is not part of the stored World cut")
         references = manifest.checkpoint_references
+        cls._require_owner_references(references, "stored causal cut")
         journal_refs = tuple(ref for ref in references if ref.owner == _JOURNAL_OWNER)
         if len(journal_refs) != 1 or journal_refs[0].owner_identity != world_id.value:
             raise ManifestError("causal cut must reference exactly one World journal snapshot")
-        if not cls._verify_references(references, owner_checkpoint_verifier):
-            raise ManifestError("causal cut checkpoint dependency closure is not verified")
         journal = journal_store.read(journal_refs[0])
         cls._validate_cut(manifest, journal)
+        if not cls._verify_references(references, owner_checkpoint_verifier):
+            raise ManifestError("causal cut checkpoint dependency closure is not verified")
         owner_checkpoint_restorer(tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER))
         if not cls._verify_references(references, owner_checkpoint_verifier):
             raise ManifestError("causal cut checkpoint dependency closure changed during restore")
@@ -256,13 +256,14 @@ class DurableWorldRuntime:
             raise ManifestError("requested presence is not part of the pending World cut")
 
         references = pending.checkpoint_references
+        cls._require_owner_references(references, "pending causal cut")
         journal_refs = tuple(ref for ref in references if ref.owner == _JOURNAL_OWNER)
         if len(journal_refs) != 1 or journal_refs[0].owner_identity != world_id.value:
             raise ManifestError("pending causal cut must reference exactly one World journal snapshot")
-        if not cls._verify_references(references, owner_checkpoint_verifier):
-            raise ManifestError("previous causal cut dependency closure is not verified")
         journal = journal_store.read(journal_refs[0])
         cls._validate_cut(pending, journal)
+        if not cls._verify_references(references, owner_checkpoint_verifier):
+            raise ManifestError("previous causal cut dependency closure is not verified")
 
         owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
         owner_checkpoint_restorer(owner_references)
@@ -379,6 +380,7 @@ class DurableWorldRuntime:
 
     @staticmethod
     def _validate_cut(manifest: WorldCausalManifest, journal: EventJournal) -> None:
+        DurableWorldRuntime._require_owner_references(manifest.checkpoint_references, "causal cut")
         records = journal.replay()
         if any(record.world_id != manifest.world_id for record in records):
             raise ManifestError("journal contains a record for another World")
@@ -389,6 +391,16 @@ class DurableWorldRuntime:
             raise ManifestError("manifest journal sequence does not match persisted record prefix")
         if manifest.journal_prefix_sha256 != journal.prefix_digest():
             raise ManifestError("manifest journal digest does not match persisted record prefix")
+
+    @staticmethod
+    def _require_owner_references(
+        references: tuple[CheckpointReference, ...], cut_description: str
+    ) -> tuple[CheckpointReference, ...]:
+        """Reject cuts that contain only World journal data, not owner state."""
+        owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
+        if not owner_references:
+            raise ManifestError(f"{cut_description} must identify at least one durable owner checkpoint")
+        return owner_references
 
 
 def _fsync_directory(path: Path) -> None:

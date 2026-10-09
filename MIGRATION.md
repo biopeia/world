@@ -118,5 +118,9 @@ but a participant cannot silently disappear or be replaced while the cut is
 published. These owner identities identify semantic resources and are not
 inferred from, or equated with, World presence IDs. Membership changes are
 outside the current API and require a future explicit World transition. This
-does not establish that a caller listed every real participant: the caller is
-still responsible for declaring the initial owner closure accurately.
+requirement is enforced when initializing, validating/restoring, and recovering
+a runtime, so a journal-only manifest cannot be used to restore an active
+runtime or publish later ticks. This still does not establish that a caller
+listed every real participant: the caller is responsible for declaring the
+initial owner closure accurately, and this API has no authoritative roster
+from which World can independently derive that set.
