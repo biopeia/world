@@ -86,16 +86,13 @@ The store uses same-directory temporary files, file `fsync`, atomic replacement 
 
 This historical slice did not prove that all references describe a semantically complete cross-owner causal cut or guarantee cross-file/process crash consistency. Schema v3 adds an explicit registered-owner receipt protocol, but does not claim adversarial validation or empirical crash consistency. It delegates owner restoration and does not inspect or interpret private Organism state. The explicit recovery operation is limited to restoring the exact previous committed cut; it does not roll forward an interrupted transition or resolve an ambiguous commit outcome. Owner restoration must be retry-safe if it partially restores state and leaves `RECOVERY_REQUIRED` in place. Filesystem/platform durability behavior has not been experimentally validated; no process/power-loss fault injection was run. The earlier in-memory runtime's transition callback ordering remains unchanged and is not covered by this store's guarantees.
 
-## Excluded and deferred source responsibilities
+## Superseded preliminary source-family inventory
 
-| Source path/family | Disposition | Reason |
-| --- | --- | --- |
-| `environment/src/environment/state.py`, `topology.py`, `movement.py`, `checkpoint.py`, `deferred.py` | DEFER | This is a source-era mixed-file inventory, not TARGET authority. Under the ratified split, external environmental state/laws/dynamics/genesis belong to Environment; World retains identity, causal time, presence/participant coordination, lifecycle, causal cuts, commit, and recovery coordination. Split symbols by owner before any extraction; do not copy these mixed files wholesale or preserve legacy behavior for compatibility. |
-| `environment/src/environment/contracts.py`, `observation.py` | DEFER | Mixed World-facing contracts and passive projection. Observation remains a separate passive capability; only the journal record envelope is included here. |
-| `environment/src/environment/genesis*.py`, `constitution.py`, `rng.py` | DEFER | Provisional source inventory only. Environment genesis, environmental laws/state, and deterministic environment-generation inputs belong to Environment; World genesis/roster and causal composition belong to World. Audit each symbol and dependency before extraction; do not treat the older unresolved World/Environment boundary as current TARGET authority or copy the mixed source family wholesale. |
-| `lab/src/lab/world/{runtime,population,persistence,transaction,cli_view}.py` | DEFER | These compose Environment, Organism, Embodiment, Observation, Lab storage, and application concerns. No wholesale `lab/world` copy was made. |
-| `lab/src/lab/integration/world/adapter.py` | DEFER | Adapter composes Organism and Embodiment state, somatic/interoceptive signals, and experimental-clean routes. It crosses several ratified boundaries. |
-| Observation, UI, launcher and study callers | DEFER | Transport/presentation, operator control, and experimental apparatus do not belong in this causal journal package. |
+The coarse source-family `DEFER` table formerly recorded in this section has
+been superseded by the pinned, symbol-level source, test and consumer inventory
+below. It is not a second active disposition list. Use that later inventory for
+current source dispositions; `DEFER` there remains provisional only where its
+row says so.
 
 ## Known rewrites and limits
 
@@ -140,11 +137,13 @@ compatibility, or historical behavior is being migrated by this record.
 
 - Source repository: `https://github.com/alessbarb/symbiont-lab`
 - Pinned source commit: `80d372a186513035f85a769db886e505cabba52d`
-- Pinned source tree: `5ebec1bfb665fe3d5d23d4a47d1ea6900d4f7471`
+- Pinned source tree: `915146b807a2f3b4b362b485d0fd4010bb4c7cde`
 - Inventory scope: every Python module under `environment/src/environment/`;
   source World composition under `lab/src/lab/world/` and
-  `lab/src/lab/integration/world/`; directly related Environment/World tests;
-  and Lab callers that directly import Environment or Lab World symbols.
+  `lab/src/lab/integration/world/`; Environment package metadata; directly
+  related Environment/World tests; and Lab callers that directly import
+  Environment or Lab World symbols or depend on the listed passive
+  World/Environment projections.
 - Pin verification: source paths, blobs and path-changing commits were resolved
   against the pinned commit in a read-only source checkout. The source checkout
   was not modified. The same source pin underlies the earlier bounded journal
@@ -163,11 +162,12 @@ split is fixed; file-level disposition does not reopen that split.
 
 | Source file: material top-level symbols | Candidate disposition | Target responsibility / reason and target evidence | Source tests, consumers and caveats |
 |---|---|---|---|
+| `environment/pyproject.toml`: package name/version/description/build metadata | `REWRITE` | Environment owns its independent package metadata and build configuration. Recreate metadata from the target repository's package contract; historical version and description are not compatibility requirements. | No runtime behavior; source blob and path provenance are in the appendix. |
 | `environment/__init__.py`: `__version__`, `__all__`, all package re-exports | `REWRITE` | Keep explicit domain-owned public surfaces; do not recreate an omnibus Environment/World facade. World's target public surface is local to `world`; environmental public surface belongs to `environment`; passive projections belong to Observation. | Consumers import many re-exports; see consumer inventory below. No compatibility re-export is required. |
 | `checkpoint.py`: `WorldCheckpoint`, `take_checkpoint`, `restore` | `SPLIT` | World owns its causal manifest/commit references; Environment owns its private environment state/checkpoint; Embodiment owns body state. The source's combined snapshot of `WorldState`, `BodyPlacement`, `HexCoord` and `OccupancyGrid` is not a target owner checkpoint. Target World `src/world/manifest.py` and durable runtime are owner-reference coordination only; they do not replace owner codecs. | `environment/tests/unit/world/test_checkpoint.py`, `environment/tests/integration/test_world_checkpoint_continuation.py`. Preserve no combined source snapshot format or API. |
 | `constitution.py`: `CONSTITUTION_SCHEMA_VERSION`, `WorldConstitution` | `SPLIT` | Split World identity/genesis/causal-roster assertions from Environment genesis parameters/laws. The new World genesis input is authoritative only for its declared initial World roster; it does not own Environment truth. | `test_constitution.py`, Lab `test_genesis_v1.py`. Historical fingerprint/schema and fixed map config are not TARGET semantics. |
 | `contracts.py`: `ContactEvidence`, `ReceivedEmission`, `WorldObservation`, `WorldAction` | `SPLIT` | Separate Environment-facing physical/causal inputs, Organism/Modality-owned action semantics, and passive Observation projection. World coordinates a causal step but must not own participant-private action or environment state. | `test_contracts.py`, Lab actuation/adapter/observation tests. Source records contain mixed authority and implicit hex-world coupling; no old data shape is guaranteed. |
-| `deferred.py`: `MAX_QUEUE_SIZE`, `DeferredEffect`, `DeferredEffectQueue` | `DEFER` | The actor-addressed due-effect queue could conflate World scheduling with Environment resource changes and Organism-specific effects. No generic target queue contract is established by this source. **Closure trigger:** an integrated Biopeia causal-step contract identifies a required delayed effect, its owning authority and failure/commit semantics; otherwise `DROP`. | `test_deferred.py`, `lab.world.population` and transaction paths. Bounded queue behavior alone does not establish semantic ownership or durable scheduling. |
+| `deferred.py`: `MAX_QUEUE_SIZE`, `DeferredEffect`, `DeferredEffectQueue` | `DROP` | No generic actor-addressed delayed-effect capability is established by the ratified World contract or the minimal physical-step direction. The source queue's owner, durability and failure semantics are unresolved, and no historical behavior is retained for compatibility. A future need requires a fresh owner-specific contract, not migration of this queue. | `test_deferred.py`, `lab.world.population` and transaction paths. This closes the historical queue artifact only; it does not forbid a separately justified future capability. |
 | `events.py`: `EVENT_KINDS`, `WorldEvent`, `EventJournal` | `SPLIT` | `EventJournal` has already been extracted as target `src/world/journal.py` with opaque record types. World may own causal journal ordering; domain event meaning belongs to the relevant authority and passive delivery to Observation. Historical event-kind taxonomy is not to be copied. | `test_events.py`, consumers include Lab population/runtime/transaction and viewer paths. The journal slice is bounded and in-memory unless using separate durable World contract; it does not prove a domain event taxonomy. |
 | `genesis.py`: `FieldId`, `ResourceId`, `HazardId`, `RegionId`, `_freeze_nested`, `GroundTruth`, `WorldEnvironment` | `SPLIT` | Environment owns `GroundTruth`, environmental identity/value and Environment genesis. World owns distinct World identity and accepts a `WorldGenesisSpec` for initial presence/owner roster and causal setup. No generic `WorldEnvironment` aggregate should cross-own those states. | `test_genesis.py`, `test_genesis_regional.py`; Lab World population/runtime, integration adapter, observation and studies. Opaque identifier technique may be independently useful, but names/types here are not target contracts. |
 | `genesis_v1.py`: fixed `SCHEMA`, `WIDTH`, `HEIGHT`, `SEED`, `FOUNDERS`, `CAPACITY`, `CHECKPOINT_INTERVAL`; `_FIELD_LABELS`, `_RESOURCE_LABELS`, `_HAZARD_LABELS`; `FIELD_IDS`, `RESOURCE_IDS`, `HAZARD_IDS`, `GENESIS_V1_METADATA`; `_fields`, `_resources`, `_hazards`, `_hazard_region`, `_regional_hazards`, `build_ground_truth`, `_laws_hash`, `SMOKE_WIDTH`, `SMOKE_HEIGHT`, `build_constitution`, `GenesisV1`, `build_genesis_v1`, `build_genesis_smoke_v1` | `DROP` | This is a historical fixed hex genesis/preset plus human-readable fixture labels and a fixed population. Target Environment may support explicit and deterministic procedural genesis, but must define its own input contract and generator revision; World GenesisSpec must separately define its roster. No fixed historical map or founder count is canonical. | Lab `test_genesis_v1.py`, source genesis and viability experiments. Preserve provenance/results in historical source; do not transplant the preset, constants, hashes or labels as target truth. |
@@ -202,10 +202,11 @@ migration shortcut.
 
 | Pinned source test file | Candidate disposition | What it historically checks / target caveat |
 |---|---|---|
+| `environment/tests/test_self_contained.py` | `SPLIT` | Its standalone-install/domain-isolation check may be replaced by target package-boundary validation; historical fixture-recipe and `derive_world_rng` assertions do not transfer. No source test implementation or old API is retained. |
 | `environment/tests/unit/world/test_checkpoint.py` | `DEFER` | Hex occupancy/body snapshot and RNG restore; owner-specific checkpoints and World manifest are distinct. |
 | `environment/tests/unit/world/test_constitution.py` | `DEFER` | Deterministic constitution fingerprint; target WorldGenesisSpec and EnvironmentGenesisSpec require separate semantics. |
 | `environment/tests/unit/world/test_contracts.py` | `DEFER` | Frozen action/observation/contact/emission records; no target wire/API/schema is implied. |
-| `environment/tests/unit/world/test_deferred.py` | `DEFER` | Actor-addressed delayed effects and bounded queue; closure depends on owner-specific delayed-effect requirement. |
+| `environment/tests/unit/world/test_deferred.py` | `DROP` | Tests only the historical actor-addressed bounded queue, which is not a ratified generic target capability. Any future delayed-effect contract needs fresh owner-specific tests. |
 | `environment/tests/unit/world/test_events.py` | `SPLIT` | Historical WorldEvent taxonomy plus EventJournal behavior; journal behavior is already covered by target `tests/test_journal.py`, but event-kind taxonomy is not a target commitment. |
 | `environment/tests/unit/world/test_genesis.py` | `DEFER` | Fixed hex external fields/resources/hazards; Environment-owned genesis/law contracts require fresh target tests. |
 | `environment/tests/unit/world/test_genesis_regional.py` | `DROP` | Specific v1 hex regional overrides and legacy fallback behavior; no target compatibility obligation. |
@@ -231,6 +232,7 @@ migration shortcut.
 | `lab/tests/unit/lab/observation/test_physics_world_observer.py` | `SPLIT` | Physics/Environment observation; owner claims and passive projection must be separately tested. |
 | `lab/tests/unit/lab/observation/test_world_environments.py` | `SPLIT` | Legacy Environment recipes and Lab/world query integration; no target API equivalence. |
 | `lab/tests/unit/lab/observation/test_world_scene.py` | `SPLIT` | Passive world scene projection and presentation event application; no transport/schema authority. |
+| `lab/tests/unit/lab/observation/test_observability_integrity.py` | `SPLIT` | This broad Observation/Lab test file includes a `world_scene` overflow/rebase assertion; that passive transport behavior is not World authority and must be tested at the owning Observation/Lab boundary if retained. The rest of the file is outside this World inventory. |
 | `lab/tests/unit/observatory/test_world_integration.py` | `SPLIT` | Observatory visualization integration; Observation/Lab presentation not causal World. |
 
 ### Pinned source consumers and cross-domain boundaries
@@ -248,7 +250,7 @@ included in the provenance appendix below.
 | Lab runtime/CLI/API: `lab/src/lab/cli/world.py`; `lab/src/lab/app/physics3d/runs.py`; `lab/src/lab/physics3d/cli.py`; `lab/src/lab/physics3d/runtime.py`; `lab/src/lab/server/api.py` | `SPLIT` | Lab application/run orchestration, Environment projection and World causal orchestration are mixed. Keep app/run controls and scientific apparatus in Lab; route authoritative changes through target owners. |
 | Lab physics/model auditing: `lab/src/lab/physics3d/effective_model_audit.py`; `lab/src/lab/physics3d/effective_model_audit_cli.py`; `lab/src/lab/physics3d/world_observation.py` | `SPLIT` | Solver execution/audit and passive physical projection are capabilities/Observation; Environment/Embodiment adopt authoritative results; World coordinates/commits. |
 | Lab domain integration and studies: `lab/src/lab/integration/world/adapter.py`; `lab/src/lab/studies/world/genesis_viability.py`; `lab/src/lab/studies/embodiment/integrity_gates.py`; `lab/src/lab/studies/embodiment/label_invariance.py` | `SPLIT` | Integrations and protocols remain Lab; state semantics and environmental truth belong to their authorities. Preserve experiment definitions/results/provenance; do not move Lab controls into World. |
-| Lab Observation/projection: `lab/src/lab/observation/environment_resource.py`; `lab/src/lab/observation/world_scene.py` | `SPLIT` | Environment state projection vs Observation transport/presentation/evidence admission; no causal writeback from observer. |
+| Lab Observation/projection: `lab/src/lab/observation/environment_resource.py`; `lab/src/lab/observation/world_scene.py`; downstream consumers `lab/src/lab/observation/bus.py`, `lab/src/lab/observation/physics3d.py` | `SPLIT` | Environment state projection vs Observation transport/presentation/evidence admission; the bus and Physics3D bridge consume passive `world_scene` projections and are not World authorities. No causal writeback from observer. |
 | Lab test callers: `lab/tests/experiments/protocols/test_visual_acquisition_protocol.py`; `lab/tests/integration/test_physics3d_effective_model_audit.py`; `lab/tests/integration/test_physics3d_vision.py`; `lab/tests/unit/lab/observation/test_remaining_semantic_families.py`; `lab/tests/unit/lab/physics3d/test_effective_model_audit.py`; `lab/tests/unit/lab/physics3d/test_resource.py`; `tests/experimental_integrity/test_embodiment_inheritance_integrity.py` | `DEFER` | Tests are protocol/solver/Observation/Embodiment consumers, not World unit tests. Reassess against the target owner contract and scientific protocol; do not relabel them World tests solely because Environment imports appear. |
 | Historical benchmark: `scripts/bench_world_journal_index.py` | `DEFER` | Performance evidence is tied to source EventJournal/index semantics. Retain provenance in source; only repeat if the target journal workload justifies it. |
 
@@ -261,6 +263,7 @@ characters in this table; source SHA above pins unambiguous resolution.
 
 | Source path | Blob | Last path-changing commit |
 |---|---|---|
+| `environment/pyproject.toml` | `74c8e12d6bac767014c32bb8558e840d95b31bee` | `792d2dbd3` |
 | `environment/src/environment/__init__.py` | `61b117880cd104aa90bffaad39ed2a16ca238911` | `7d090d58e214` |
 | `environment/src/environment/checkpoint.py` | `3d586a6df303bf5dfdff49860bbde19b8fd1e556` | `13720935595f` |
 | `environment/src/environment/constitution.py` | `288733dbd05c697f6f538b39d99c5a9399c7dacf` | `13720935595f` |
@@ -288,8 +291,11 @@ characters in this table; source SHA above pins unambiguous resolution.
 | `lab/src/lab/world/transaction.py` | `0229a2b970246163e3ead08b5a8026ffd2066dc7` | `fa7178685aca` |
 | `lab/src/lab/integration/world/__init__.py` | `366e8f126df46bb6eda3cf0bff057c9d06c671cc` | `9891c6a02871` |
 | `lab/src/lab/integration/world/adapter.py` | `1e8c7b50d658ac2fc06db98868c713a517bc27b7` | `06f33acca0b0` |
+| `lab/src/lab/observation/bus.py` | `f270ded3e9963456eea3d18c94ba0b1d2bfb3e81` | `2981f219c` |
+| `lab/src/lab/observation/physics3d.py` | `116d19599724ddfb785e7e8ea4eaacfeb0c27a4a` | `966c32db1` |
 | `lab/src/lab/observation/world_scene.py` | `fdf54be9b1dce8c0347c0ea4c40abf2cb6299699` | `13720935595f` |
 | `lab/src/lab/physics3d/world_observation.py` | `76b380080757ad1a9819b5eb2664539d3febe818` | `40adf60c4232` |
+| `environment/tests/test_self_contained.py` | `f21847b3c9e5d2e18e7624b5326771a9dc47ce54` | `792d2dbd3` |
 | `environment/tests/unit/world/test_checkpoint.py` | `12e8a8be6953271b522c4bb26f90482aeb551294` | `282c44eea894` |
 | `environment/tests/unit/world/test_constitution.py` | `7d9ad3ae334084808fccef0a897fdc13e47168a2` | `282c44eea894` |
 | `environment/tests/unit/world/test_contracts.py` | `6474069260fa072f999c471390af750b5a92ad6b` | `282c44eea894` |
