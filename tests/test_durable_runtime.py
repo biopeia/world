@@ -19,7 +19,27 @@ from world import (
     WorldCausalManifest,
     WorldCausalManifestStore,
     WorldId,
+    WorldGenesisSpec,
 )
+
+
+
+def _initialize(
+    world_id, presence_id, manifest_store, journal_store, *,
+    initial_owner_references, registered_owner_ids, owner_checkpoint_verifier,
+    owner_checkpoint_contracts,
+):
+    genesis = WorldGenesisSpec(
+        world_id=world_id,
+        initial_presence_ids=(presence_id,),
+        registered_owner_ids=tuple(registered_owner_ids),
+        initial_owner_references=tuple(initial_owner_references),
+        owner_checkpoint_contracts=owner_checkpoint_contracts,
+    )
+    return DurableWorldRuntime.initialize(
+        genesis, presence_id, manifest_store, journal_store,
+        owner_checkpoint_verifier=owner_checkpoint_verifier,
+    )
 
 
 def _checkpoint(path: Path, *, owner: str = "organism") -> CheckpointReference:
@@ -75,7 +95,7 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     initial_owner = tmp_path / "organism-0.json"
     initial_owner.write_bytes(b"organism at tick zero")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id,
         "presence-a",
         manifest_store,
@@ -108,7 +128,7 @@ def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
 
     with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
-        DurableWorldRuntime.initialize(
+        _initialize(
             world_id,
             "presence-a",
             manifest_store,
@@ -121,7 +141,7 @@ def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
 
     initial_owner = tmp_path / "organism-0.json"
     initial_owner.write_bytes(b"owner at tick zero")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id,
         "presence-a",
         manifest_store,
@@ -145,13 +165,46 @@ def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
     assert pending.checkpoint_references[0].owner_identity == "organism-identity"
 
 
+def test_genesis_spec_is_authoritative_input_for_tick_zero_roster(tmp_path):
+    world_id = WorldId("world-genesis-spec")
+    store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    organism = tmp_path / "organism.json"
+    embodiment = tmp_path / "embodiment.json"
+    organism.write_bytes(b"organism")
+    embodiment.write_bytes(b"embodiment")
+    references = (_checkpoint(organism), _checkpoint(embodiment, owner="embodiment"))
+    owners = tuple(sorted((("organism", "organism-identity"), ("embodiment", "embodiment-identity"))))
+    spec = WorldGenesisSpec(
+        world_id=world_id,
+        initial_presence_ids=("presence-a", "presence-b"),
+        registered_owner_ids=owners,
+        initial_owner_references=references,
+        owner_checkpoint_contracts=_contracts(*owners),
+    )
+
+    runtime = DurableWorldRuntime.initialize(
+        spec, "presence-a", store, journal, owner_checkpoint_verifier=_verifier,
+    )
+
+    assert runtime.manifest.presence_ids == ("presence-a", "presence-b")
+    assert runtime.manifest.registered_owner_ids == owners
+    assert frozenset((ref.owner, ref.owner_identity) for ref in runtime.manifest.checkpoint_references if ref.owner != "world-journal") == frozenset(owners)
+
+    with pytest.raises(ManifestError, match="accepted World genesis spec"):
+        DurableWorldRuntime.initialize(
+            spec, "presence-outside-genesis", store, journal,
+            owner_checkpoint_verifier=_verifier,
+        )
+
+
 def test_world_owner_registry_changes_only_through_explicit_lifecycle_tick(tmp_path):
     world_id = WorldId("world-owner-lifecycle")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     organism = tmp_path / "organism-0.json"
     organism.write_bytes(b"organism")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id, "presence-a", manifest_store, journal_store,
         initial_owner_references=(_checkpoint(organism),),
         registered_owner_ids=(("organism", "organism-identity"),),
@@ -173,7 +226,7 @@ def test_new_owner_cannot_register_without_owner_checkpoint_contract(tmp_path):
     journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner = tmp_path / "organism.json"
     owner.write_bytes(b"organism")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id, "presence-a", store, journal,
         initial_owner_references=(_checkpoint(owner),),
         registered_owner_ids=(("organism", "organism-identity"),),
@@ -202,7 +255,7 @@ def test_lifecycle_registration_and_step_participants_are_explicit_and_exact(tmp
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     organism = tmp_path / "organism.json"
     organism.write_bytes(b"organism")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id, "presence-a", manifest_store, journal_store,
         initial_owner_references=(_checkpoint(organism),),
         registered_owner_ids=(("organism", "organism-identity"),),
@@ -251,7 +304,7 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
     journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner = tmp_path / "owner.json"
     owner.write_bytes(b"owner")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id, "presence-a", store, journal,
         initial_owner_references=(_checkpoint(owner),),
         registered_owner_ids=(("organism", "organism-identity"),),
@@ -280,7 +333,7 @@ def test_failed_registration_keeps_prior_cut_and_pending_roster_for_recovery(tmp
     journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner = tmp_path / "owner.json"
     owner.write_bytes(b"owner")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id, "presence-a", store, journal,
         initial_owner_references=(_checkpoint(owner),),
         registered_owner_ids=(("organism", "organism-identity"),),
@@ -319,7 +372,7 @@ def test_owner_recoverability_receipt_is_required_and_bound_to_exact_reference(t
     owner = tmp_path / "owner.json"
     owner.write_bytes(b"owner")
     contract = _OwnerContract()
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id, "presence-a", store, journal,
         initial_owner_references=(_checkpoint(owner),),
         registered_owner_ids=(("organism", "organism-identity"),),
@@ -410,7 +463,7 @@ def test_restore_validates_world_cut_then_delegates_owner_restore(tmp_path):
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner_state = tmp_path / "organism.json"
     owner_state.write_bytes(b"durable owner state")
-    initial = DurableWorldRuntime.initialize(
+    initial = _initialize(
         world_id,
         "presence-a",
         manifest_store,
@@ -461,7 +514,7 @@ def test_restore_refuses_runtime_if_owner_restore_changes_checkpoint_dependency(
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner_state = tmp_path / "organism.json"
     owner_state.write_bytes(b"durable owner state")
-    DurableWorldRuntime.initialize(
+    _initialize(
         world_id,
         "presence-a",
         manifest_store,
@@ -497,7 +550,7 @@ def test_unverifiable_owner_checkpoint_keeps_durable_manifest_pending(tmp_path):
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     initial_owner = tmp_path / "organism-0.json"
     initial_owner.write_bytes(b"initial")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id,
         "presence-a",
         manifest_store,
@@ -530,7 +583,7 @@ def test_explicit_recovery_restores_prior_cut_through_owner_and_records_receipt(
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner_state = tmp_path / "organism-0.json"
     owner_state.write_bytes(b"organism at committed tick zero")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id,
         "presence-a",
         manifest_store,
@@ -591,7 +644,7 @@ def test_failed_owner_recovery_keeps_recovery_required_manifest(tmp_path):
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner_state = tmp_path / "organism.json"
     owner_state.write_bytes(b"durable")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id,
         "presence-a",
         manifest_store,
@@ -632,7 +685,7 @@ def test_retry_after_recovery_publication_interruption_fsyncs_existing_receipt_d
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner_state = tmp_path / "organism.json"
     owner_state.write_bytes(b"durable")
-    runtime = DurableWorldRuntime.initialize(
+    runtime = _initialize(
         world_id,
         "presence-a",
         manifest_store,

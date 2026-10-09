@@ -11,7 +11,9 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from threading import Lock
 from typing import Callable, Iterable, Mapping, Protocol
 
@@ -30,6 +32,37 @@ from .runtime import RecoveryRequiredError, TickInProgressError, WorldId
 
 _JOURNAL_OWNER = "world-journal"
 _JOURNAL_SCHEMA = "event-journal-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class WorldGenesisSpec:
+    """Authoritative creation input against which tick-zero closure is checked.
+
+    This is an explicit declaration by the World creator, not a discovery
+    mechanism for authorities external to the accepted specification.
+    """
+
+    world_id: WorldId
+    initial_presence_ids: tuple[str, ...]
+    registered_owner_ids: tuple[tuple[str, str], ...]
+    initial_owner_references: tuple[CheckpointReference, ...]
+    owner_checkpoint_contracts: Mapping[tuple[str, str], OwnerCheckpointContract]
+
+    def __post_init__(self) -> None:
+        presences = tuple(self.initial_presence_ids)
+        if not presences or any(not item or not item.strip() for item in presences):
+            raise ValueError("World genesis requires at least one non-empty initial presence")
+        if len(set(presences)) != len(presences):
+            raise ValueError("World genesis cannot contain duplicate presences")
+        owners = tuple(tuple(item) for item in self.registered_owner_ids)
+        if any(len(item) != 2 or any(not value or not value.strip() for value in item) for item in owners):
+            raise ValueError("World genesis owner identities must be non-empty pairs")
+        if len(set(owners)) != len(owners):
+            raise ValueError("World genesis cannot contain duplicate owner identities")
+        object.__setattr__(self, "initial_presence_ids", presences)
+        object.__setattr__(self, "registered_owner_ids", tuple(sorted(owners)))
+        object.__setattr__(self, "initial_owner_references", tuple(self.initial_owner_references))
+        object.__setattr__(self, "owner_checkpoint_contracts", MappingProxyType(dict(self.owner_checkpoint_contracts)))
 
 
 class DurableJournalSnapshotStore:
@@ -163,20 +196,21 @@ class DurableWorldRuntime:
     @classmethod
     def initialize(
         cls,
-        world_id: WorldId,
-        presence_id: str,
+        genesis: WorldGenesisSpec,
+        active_presence_id: str,
         manifest_store: WorldCausalManifestStore,
         journal_store: DurableJournalSnapshotStore,
         *,
-        initial_owner_references: Iterable[CheckpointReference],
-        registered_owner_ids: Iterable[tuple[str, str]],
         owner_checkpoint_verifier: OwnerCheckpointVerifier,
-        owner_checkpoint_contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
     ) -> DurableWorldRuntime:
+        world_id = genesis.world_id
+        presence_id = active_presence_id
         journal = EventJournal()
-        owner_references = tuple(initial_owner_references)
-        registered_owner_ids = tuple(sorted(tuple(item) for item in registered_owner_ids))
-        contracts = dict(owner_checkpoint_contracts)
+        if presence_id not in genesis.initial_presence_ids:
+            raise ManifestError("active presence must be included in the accepted World genesis spec")
+        owner_references = genesis.initial_owner_references
+        registered_owner_ids = genesis.registered_owner_ids
+        contracts = dict(genesis.owner_checkpoint_contracts)
         if set(contracts) != set(registered_owner_ids):
             raise ManifestError("initial owner roster requires one registered recoverability contract per owner")
         cls._require_owner_references(owner_references, "initial causal cut")
@@ -189,7 +223,7 @@ class DurableWorldRuntime:
         manifest = WorldCausalManifest(
             world_id=world_id.value,
             causal_tick=0,
-            presence_ids=(presence_id,),
+            presence_ids=genesis.initial_presence_ids,
             checkpoint_references=references,
             journal_last_sequence=None,
             journal_prefix_sha256="",
