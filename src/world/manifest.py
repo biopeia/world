@@ -120,10 +120,25 @@ class WorldCausalManifestStore:
     def initialize(self, manifest: WorldCausalManifest) -> None:
         if manifest.status is not ManifestStatus.COMPLETE or manifest.causal_tick != 0:
             raise ValueError("initial manifest must be a complete tick-zero causal cut")
-        if self.path.exists():
-            raise FileExistsError(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._write(manifest)
+        encoded = _canonical_bytes(_manifest_to_data(manifest))
+        fd, temp_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # A preflight exists() check followed by os.replace() could let two
+            # initializers overwrite one another. A same-directory hard link
+            # is an atomic no-overwrite publication: exactly one initializer
+            # can create the tick-zero manifest.
+            os.link(temp_name, self.path)
+            _fsync_directory(self.path.parent)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
     def read(self) -> WorldCausalManifest:
         try:
