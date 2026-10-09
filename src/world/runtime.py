@@ -28,6 +28,17 @@ class WorldId:
             raise ValueError("world id must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class PresenceId:
+    """Identity of one World presence; distinct from any semantic owner identity."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, str) or not self.value.strip():
+            raise ValueError("presence id must not be empty")
+
+
 class RuntimeStatus(str, Enum):
     ACTIVE = "ACTIVE"
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"

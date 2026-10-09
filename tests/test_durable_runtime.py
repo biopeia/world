@@ -1,6 +1,5 @@
 import hashlib
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +13,8 @@ from world import (
     ManifestError,
     ManifestRecoveryRequiredError,
     ManifestStatus,
-    OwnerRecoveryReceipt,
+    PresenceId,
+    PresenceOwnerLink,
     RecoveryRequiredError,
     WorldCausalManifest,
     WorldCausalManifestStore,
@@ -62,27 +62,15 @@ def _verifier(references: tuple[CheckpointReference, ...]) -> bool:
     )
 
 
-def _receipt(reference):
-    return OwnerRecoveryReceipt(
-        owner=reference.owner,
-        owner_identity=reference.owner_identity,
-        checkpoint_id=reference.checkpoint_id,
-        schema_version=reference.schema_version,
-        locator=reference.locator,
-        sha256=reference.sha256,
-        recoverable=True,
-    )
-
-
 class _OwnerContract:
-    def __init__(self, receipt_factory=None):
-        self.receipt_factory = receipt_factory or _receipt
+    def __init__(self, valid=True):
+        self.valid = valid
 
-    def validate_recoverability(self, reference):
-        return self.receipt_factory(reference)
+    def validate_checkpoint(self, encoded, owner_identity, schema_version):
+        return self.valid and bool(encoded) and bool(owner_identity) and bool(schema_version)
 
-    def verify_restoration(self, reference):
-        return _receipt(reference)
+    def verify_restoration(self, encoded, owner_identity, schema_version):
+        return self.validate_checkpoint(encoded, owner_identity, schema_version)
 
 
 def _contracts(*keys):
@@ -181,6 +169,10 @@ def test_genesis_spec_is_authoritative_input_for_tick_zero_roster(tmp_path):
         registered_owner_ids=owners,
         initial_owner_references=references,
         owner_checkpoint_contracts=_contracts(*owners),
+        presence_owner_links=(
+            PresenceOwnerLink(PresenceId("presence-a"), "organism", "organism-identity"),
+            PresenceOwnerLink(PresenceId("presence-b"), "embodiment", "embodiment-identity"),
+        ),
     )
 
     runtime = DurableWorldRuntime.initialize(
@@ -364,9 +356,9 @@ def test_failed_registration_keeps_prior_cut_and_pending_roster_for_recovery(tmp
     )
 
 
-@pytest.mark.parametrize("receipt_error", ["missing", "owner", "checkpoint", "hash"])
-def test_owner_recoverability_receipt_is_required_and_bound_to_exact_reference(tmp_path, receipt_error):
-    world_id = WorldId(f"world-receipt-{receipt_error}")
+@pytest.mark.parametrize("validation_error", ["owner-rejects", "owner-returns-receipt"])
+def test_world_issues_receipt_only_after_owner_checkpoint_validation(tmp_path, validation_error):
+    world_id = WorldId(f"world-validation-{validation_error}")
     store = WorldCausalManifestStore(tmp_path / "manifest.json")
     journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner = tmp_path / "owner.json"
@@ -382,17 +374,18 @@ def test_owner_recoverability_receipt_is_required_and_bound_to_exact_reference(t
     next_owner = tmp_path / "next-owner.json"
     next_owner.write_bytes(b"next")
     reference = _checkpoint(next_owner)
-    if receipt_error == "missing":
-        contract.receipt_factory = lambda _ref: None
-    elif receipt_error == "owner":
-        contract.receipt_factory = lambda ref: replace(_receipt(ref), owner="other")
-    elif receipt_error == "checkpoint":
-        original_receipt = _receipt(_checkpoint(owner))
-        contract.receipt_factory = lambda _ref: original_receipt
+    if validation_error == "owner-rejects":
+        contract.valid = False
     else:
-        contract.receipt_factory = lambda ref: replace(_receipt(ref), sha256="0" * 64)
+        # A contract cannot self-issue a World receipt in the new interface.
+        from world import OwnerRecoveryReceipt
 
-    with pytest.raises(ManifestError, match="receipts"):
+        contract.validate_checkpoint = lambda *_args: OwnerRecoveryReceipt(
+            owner="organism", owner_identity="organism-identity", checkpoint_id="x",
+            schema_version="v1", locator="x", sha256="0" * 64, recoverable=True,
+        )
+
+    with pytest.raises(ManifestError, match="owner checkpoint validation"):
         runtime.tick("receipt-transition", lambda _tick: (reference,))
     assert store.read().status is ManifestStatus.RECOVERY_REQUIRED
     assert store.read().causal_tick == 0
@@ -528,7 +521,7 @@ def test_restore_refuses_runtime_if_owner_restore_changes_checkpoint_dependency(
     def mutating_restore(_references):
         owner_state.write_bytes(b"changed while restoring")
 
-    with pytest.raises(ManifestError, match="dependency closure changed during restore"):
+    with pytest.raises(ManifestError, match="owner restoration validation"):
         DurableWorldRuntime.restore(
             world_id,
             "presence-a",
@@ -569,7 +562,7 @@ def test_unverifiable_owner_checkpoint_keeps_durable_manifest_pending(tmp_path):
         locator=str(tmp_path / "missing.json"),
         sha256="0" * 64,
     )
-    with pytest.raises(ManifestError, match="dependency closure"):
+    with pytest.raises(ManifestError, match="owner checkpoint validation"):
         runtime.tick("transition-1", lambda _tick: (missing,))
 
     assert manifest_store.read().status is ManifestStatus.RECOVERY_REQUIRED
@@ -604,7 +597,7 @@ def test_explicit_recovery_restores_prior_cut_through_owner_and_records_receipt(
         locator=str(tmp_path / "missing.json"),
         sha256="0" * 64,
     )
-    with pytest.raises(ManifestError, match="dependency closure"):
+    with pytest.raises(ManifestError, match="owner checkpoint validation"):
         runtime.tick("transition-failed", lambda _tick: (missing,))
 
     restored = []
