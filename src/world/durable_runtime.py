@@ -27,11 +27,30 @@ from .manifest import (
     WorldCausalManifest,
     WorldCausalManifestStore,
 )
-from .runtime import RecoveryRequiredError, TickInProgressError, WorldId
+from .runtime import PresenceId, RecoveryRequiredError, TickInProgressError, WorldId
 
 
 _JOURNAL_OWNER = "world-journal"
 _JOURNAL_SCHEMA = "event-journal-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class PresenceOwnerLink:
+    """Validate an explicit World-genesis presence-to-owner association.
+
+    This association is currently a genesis input only; the durable manifest
+    does not preserve it for later lifecycle transitions or restoration.
+    """
+
+    presence_id: PresenceId
+    owner_id: str
+    owner_identity: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.presence_id, PresenceId):
+            raise ValueError("presence linkage requires a typed PresenceId")
+        if not self.owner_id or not self.owner_id.strip() or not self.owner_identity or not self.owner_identity.strip():
+            raise ValueError("presence linkage owner identity must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +66,7 @@ class WorldGenesisSpec:
     registered_owner_ids: tuple[tuple[str, str], ...]
     initial_owner_references: tuple[CheckpointReference, ...]
     owner_checkpoint_contracts: Mapping[tuple[str, str], OwnerCheckpointContract]
+    presence_owner_links: tuple[PresenceOwnerLink, ...] = ()
 
     def __post_init__(self) -> None:
         presences = tuple(self.initial_presence_ids)
@@ -63,6 +83,15 @@ class WorldGenesisSpec:
         object.__setattr__(self, "registered_owner_ids", tuple(sorted(owners)))
         object.__setattr__(self, "initial_owner_references", tuple(self.initial_owner_references))
         object.__setattr__(self, "owner_checkpoint_contracts", MappingProxyType(dict(self.owner_checkpoint_contracts)))
+        links = tuple(self.presence_owner_links)
+        link_presence_values = tuple(link.presence_id.value for link in links)
+        if links:
+            if set(link_presence_values) != set(presences) or len(link_presence_values) != len(set(link_presence_values)):
+                raise ValueError("presence owner links must cover each genesis presence exactly once")
+            owner_keys = set(owners)
+            if any((link.owner_id, link.owner_identity) not in owner_keys for link in links):
+                raise ValueError("presence owner link must target a registered genesis owner")
+        object.__setattr__(self, "presence_owner_links", links)
 
 
 class DurableJournalSnapshotStore:
@@ -136,10 +165,11 @@ OwnerCheckpointRestorer = Callable[[tuple[CheckpointReference, ...]], None]
 
 
 class OwnerCheckpointContract(Protocol):
-    """Trusted owner component that validates and verifies restoration of its ref."""
+    """Owner codec capability; World, not the owner adapter, issues receipts."""
 
-    def validate_recoverability(self, reference: CheckpointReference) -> OwnerRecoveryReceipt: ...
-    def verify_restoration(self, reference: CheckpointReference) -> OwnerRecoveryReceipt: ...
+    def validate_checkpoint(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool: ...
+
+    def verify_restoration(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool: ...
 
 
 class DurableWorldRuntime:
@@ -277,7 +307,7 @@ class DurableWorldRuntime:
             contracts,
             method="verify_restoration",
         ):
-            raise ManifestError("owner restore verification receipts are missing or do not match checkpoint references")
+            raise ManifestError("owner restoration validation failed for one or more checkpoint references")
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("causal cut checkpoint dependency closure changed during restore")
         return cls(
@@ -338,7 +368,7 @@ class DurableWorldRuntime:
         owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
         owner_checkpoint_restorer(owner_references)
         if not cls._verify_owner_receipts(owner_references, contracts, method="verify_restoration"):
-            raise ManifestError("owner restore verification receipts are missing or do not match checkpoint references")
+            raise ManifestError("owner restoration validation failed for one or more checkpoint references")
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("previous causal cut dependency closure changed during recovery")
 
@@ -452,7 +482,7 @@ class DurableWorldRuntime:
                 if not self._contracts_cover_keys(expected_owners, proposed_contracts):
                     raise ManifestError("transition lacks an owner recoverability contract for every participant")
                 if not self._verify_owner_receipts(owner_references, proposed_contracts):
-                    raise ManifestError("owner recoverability receipts are missing or do not match checkpoint references")
+                    raise ManifestError("owner checkpoint validation failed for one or more checkpoint references")
                 record = CausalRecord(
                     record_id=f"{self.world_id.value}:tick:{proposed_tick}",
                     world_id=self.world_id.value,
@@ -521,7 +551,7 @@ class DurableWorldRuntime:
         references: tuple[CheckpointReference, ...],
         contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
         *,
-        method: str = "validate_recoverability",
+        method: str = "validate_checkpoint",
     ) -> bool:
         for reference in references:
             if reference.owner == _JOURNAL_OWNER:
@@ -530,10 +560,28 @@ class DurableWorldRuntime:
             if contract is None:
                 return False
             try:
-                receipt = getattr(contract, method)(reference)
+                encoded = Path(reference.locator).read_bytes()
+                if hashlib.sha256(encoded).hexdigest() != reference.sha256:
+                    return False
+                validated = getattr(contract, method)(
+                    encoded, reference.owner_identity, reference.schema_version
+                )
             except Exception:
                 return False
-            if not isinstance(receipt, OwnerRecoveryReceipt) or not receipt.matches(reference):
+            if validated is not True:
+                return False
+            # Only World constructs the receipt after verifying the exact bytes
+            # and receiving a positive validation result from the owner codec.
+            receipt = OwnerRecoveryReceipt(
+                owner=reference.owner,
+                owner_identity=reference.owner_identity,
+                checkpoint_id=reference.checkpoint_id,
+                schema_version=reference.schema_version,
+                locator=reference.locator,
+                sha256=reference.sha256,
+                recoverable=True,
+            )
+            if not receipt.matches(reference):
                 return False
         return True
 

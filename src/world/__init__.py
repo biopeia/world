@@ -1,7 +1,13 @@
 """Bounded World causal coordination primitives."""
 
 from .journal import CausalRecord, EventJournal
-from .durable_runtime import DurableJournalSnapshotStore, DurableWorldRuntime, OwnerCheckpointContract, WorldGenesisSpec
+from .durable_runtime import (
+    DurableJournalSnapshotStore,
+    DurableWorldRuntime,
+    OwnerCheckpointContract,
+    PresenceOwnerLink,
+    WorldGenesisSpec,
+)
 from .manifest import (
     CheckpointReference,
     ManifestError,
@@ -16,6 +22,7 @@ from .runtime import (
     RuntimeStatus,
     TickInProgressError,
     WorldId,
+    PresenceId,
     WorldRuntime,
 )
 
@@ -30,6 +37,8 @@ __all__ = [
     "ManifestStatus",
     "OwnerCheckpointContract",
     "OwnerRecoveryReceipt",
+    "PresenceId",
+    "PresenceOwnerLink",
     "RecoveryRequiredError",
     "RuntimeStatus",
     "TickInProgressError",
