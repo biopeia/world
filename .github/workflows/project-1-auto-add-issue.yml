@@ -1,0 +1,17 @@
+name: Add new issues to Biopeia Project #1
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  add-to-project:
+    uses: biopeia/.github-private/.github/workflows/project-1-auto-add-issue.yml@61260827d98dad05007f50f0c7aad7cdef1d7533
+    with:
+      app_id: ${{ vars.BIOPEIA_PROJECT_APP_ID }}
+      project_id: ${{ vars.BIOPEIA_PROJECT_1_NODE_ID }}
+    secrets:
+      app_private_key: ${{ secrets.BIOPEIA_PROJECT_APP_PRIVATE_KEY }}
