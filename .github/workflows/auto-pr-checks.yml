@@ -1,0 +1,12 @@
+name: Auto PR checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: biopeia/.github-private/.github/workflows/auto-pr-checks.yml@9e9e0edf2efc6d8f8b148497ec05b20faf9e20e9
