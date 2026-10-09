@@ -17,7 +17,7 @@ from typing import Callable
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class ManifestStatus(str, Enum):
@@ -59,6 +59,7 @@ class WorldCausalManifest:
 
     world_id: str
     causal_tick: int
+    presence_ids: tuple[str, ...]
     checkpoint_references: tuple[CheckpointReference, ...]
     journal_last_sequence: int | None
     journal_prefix_sha256: str
@@ -73,6 +74,11 @@ class WorldCausalManifest:
             raise ValueError("world_id must not be empty")
         if self.causal_tick < 0:
             raise ValueError("causal_tick must be non-negative")
+        presence_ids = tuple(self.presence_ids)
+        if any(not presence_id or not presence_id.strip() for presence_id in presence_ids):
+            raise ValueError("presence ids must not be empty")
+        if len(presence_ids) != len(set(presence_ids)):
+            raise ValueError("World manifest cannot contain duplicate presence ids")
         if self.schema_version != _SCHEMA_VERSION:
             raise ValueError(f"unsupported manifest schema version: {self.schema_version}")
         if self.journal_last_sequence is not None and self.journal_last_sequence < 0:
@@ -93,6 +99,7 @@ class WorldCausalManifest:
         if len(keys) != len(set(keys)):
             raise ValueError("manifest cannot contain duplicate owner identity references")
         object.__setattr__(self, "checkpoint_references", refs)
+        object.__setattr__(self, "presence_ids", presence_ids)
 
 
 DependencyVerifier = Callable[[tuple[CheckpointReference, ...]], bool]
@@ -139,6 +146,7 @@ class WorldCausalManifestStore:
         pending = WorldCausalManifest(
             world_id=current.world_id,
             causal_tick=current.causal_tick,
+            presence_ids=current.presence_ids,
             checkpoint_references=current.checkpoint_references,
             journal_last_sequence=current.journal_last_sequence,
             journal_prefix_sha256=current.journal_prefix_sha256,
@@ -158,6 +166,7 @@ class WorldCausalManifestStore:
         failed = WorldCausalManifest(
             world_id=pending.world_id,
             causal_tick=pending.causal_tick,
+            presence_ids=pending.presence_ids,
             checkpoint_references=pending.checkpoint_references,
             journal_last_sequence=pending.journal_last_sequence,
             journal_prefix_sha256=pending.journal_prefix_sha256,
@@ -214,6 +223,7 @@ def _manifest_to_data(manifest: WorldCausalManifest) -> dict:
         "schema_version": manifest.schema_version,
         "world_id": manifest.world_id,
         "causal_tick": manifest.causal_tick,
+        "presence_ids": list(manifest.presence_ids),
         "checkpoint_references": [
             {
                 "owner": ref.owner,
@@ -236,7 +246,7 @@ def _manifest_to_data(manifest: WorldCausalManifest) -> dict:
 
 def _manifest_from_data(data: dict) -> WorldCausalManifest:
     expected = {
-        "schema_version", "world_id", "causal_tick", "checkpoint_references",
+        "schema_version", "world_id", "causal_tick", "presence_ids", "checkpoint_references",
         "journal_last_sequence", "journal_prefix_sha256", "status",
         "pending_transition_id", "pending_tick", "failure",
     }
@@ -254,6 +264,7 @@ def _manifest_from_data(data: dict) -> WorldCausalManifest:
     return WorldCausalManifest(
         world_id=data["world_id"],
         causal_tick=data["causal_tick"],
+        presence_ids=tuple(data["presence_ids"]),
         checkpoint_references=tuple(refs),
         journal_last_sequence=data["journal_last_sequence"],
         journal_prefix_sha256=data["journal_prefix_sha256"],

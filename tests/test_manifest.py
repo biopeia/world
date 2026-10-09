@@ -16,6 +16,7 @@ def manifest(*, tick=0, refs=(), last_sequence=None, digest="", **overrides):
     values = {
         "world_id": "world-a",
         "causal_tick": tick,
+        "presence_ids": (),
         "checkpoint_references": tuple(refs),
         "journal_last_sequence": last_sequence,
         "journal_prefix_sha256": digest,
@@ -48,6 +49,11 @@ def test_manifest_rejects_duplicate_owner_identity_reference():
     ref = checkpoint()
     with pytest.raises(ValueError, match="duplicate owner identity"):
         manifest(refs=(ref, ref))
+
+
+def test_manifest_rejects_duplicate_active_presence_ids():
+    with pytest.raises(ValueError, match="duplicate presence ids"):
+        manifest(presence_ids=("organism-a", "organism-a"))
 
 
 def test_durable_pending_transition_blocks_ordinary_execution(tmp_path):

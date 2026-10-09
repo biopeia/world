@@ -102,6 +102,16 @@ def test_restore_validates_world_cut_then_delegates_owner_restore(tmp_path):
     assert len(restored_owners) == 1
     assert restored_owners[0][0].owner == "organism"
 
+    with pytest.raises(ManifestError, match="not part of the stored World cut"):
+        DurableWorldRuntime.restore(
+            world_id,
+            "different-presence",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=_verifier,
+            owner_checkpoint_restorer=lambda _refs: None,
+        )
+
 
 def test_unverifiable_owner_checkpoint_keeps_durable_manifest_pending(tmp_path):
     world_id = WorldId("world-incomplete")
