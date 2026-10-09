@@ -27,6 +27,32 @@ def test_successful_ticks_publish_one_record_after_transition_in_tick_order():
         "world-test:tick:2",
     ]
     assert first.actor_id == second.actor_id == "presence-a"
+    assert first.payload == {"presence_id": "presence-a"}
+
+
+def test_transition_json_payload_is_included_opaquely_in_committed_record():
+    runtime = WorldRuntime(WorldId("world-test"), presence_id="presence-a")
+    supplied = {"opaque": {"quantity": 1.25}, "labels": ["x", True, None]}
+
+    record = runtime.tick(lambda tick: supplied)
+
+    assert record.payload["presence_id"] == "presence-a"
+    assert record.payload["event_payload"]["opaque"]["quantity"] == 1.25
+    assert record.payload["event_payload"]["labels"] == ("x", True, None)
+    assert runtime.records == (record,)
+
+
+@pytest.mark.parametrize("payload", [[], "not-an-object", {"value": float("nan")}])
+def test_invalid_transition_payload_fails_closed_without_publishing_record(payload):
+    runtime = WorldRuntime(WorldId("world-test"), presence_id="presence-a")
+
+    with pytest.raises((TypeError, ValueError)):
+        runtime.tick(lambda tick: payload)
+
+    assert runtime.status is RuntimeStatus.RECOVERY_REQUIRED
+    assert runtime.failed_tick == 1
+    assert runtime.causal_tick == 0
+    assert runtime.records == ()
 
 
 def test_transition_failure_requires_recovery_and_publishes_no_failed_record():

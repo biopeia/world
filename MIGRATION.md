@@ -28,6 +28,15 @@
 
 This coordinator deliberately runs the opaque participant callback before journal publication. A callback failure can leave participant mutations in place; a journal append failure can occur after the callback has succeeded. Either failure latches `RECOVERY_REQUIRED`, and no later tick is allowed. Concurrent or reentrant calls fail fast with `TickInProgressError` before invoking their callbacks; this rejection does not itself latch recovery. No rollback or recovery operation is implemented. Both the latch and journal are in-memory only, so this prototype is not durable and does not satisfy AD-0019's durable post-failure contract.
 
+### Opaque callback event payload follow-up
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/runtime.py` | Target-only extension of the coordinator above, retaining accepted AD-0005/AD-0006/AD-0009/AD-0019 boundaries; no source implementation copied | REWRITE | A transition callback may return `None` (unchanged behavior) or a JSON object. A returned object is included under `event_payload` in the committed `CausalRecord`; World does not interpret its keys or values. Strict JSON serialization rejects unsupported values and non-finite numbers before record publication. |
+| `tests/test_runtime.py` | New target contract tests | REWRITE | Covers payload inclusion, invalid-payload failure/no record, and `None` compatibility. These tests do not establish rollback of callback-owned mutations. |
+
+The payload is optional opaque data, not a new domain event taxonomy or a cross-owner transaction contract. A callback may already have mutated participant state before returning an invalid payload; as with callback or journal failure, World latches `RECOVERY_REQUIRED` and publishes no failed record, but does not roll back those mutations. The payload is in-memory journal data and inherits the durability/recovery limits below. This is a target-only additive rewrite; it does not change or copy the source monorepo.
+
 ## Durable causal-cut manifest slice
 
 | Target path | Provenance | Disposition | Notes |
