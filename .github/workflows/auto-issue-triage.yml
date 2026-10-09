@@ -1,0 +1,13 @@
+name: Auto issue triage
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  triage:
+    uses: biopeia/.github-private/.github/workflows/auto-issue-triage.yml@99d0746e170fe3fb0c1b5140047ca8986e3d8be5
