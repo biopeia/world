@@ -63,30 +63,45 @@ def test_manifest_rejects_duplicate_active_presence_ids():
         manifest(presence_ids=("organism-a", "organism-a"))
 
 
+def test_manifest_store_has_no_supported_public_mutation_api():
+    store = WorldCausalManifestStore("unused.json")
+
+    assert callable(store.read)
+    for method in (
+        "initialize",
+        "require_active",
+        "begin_transition",
+        "record_failure",
+        "commit_transition",
+        "complete_recovery",
+    ):
+        assert not hasattr(store, method), f"{method} must not be a supported public store API"
+
+
 def test_durable_pending_transition_blocks_ordinary_execution(tmp_path):
     store = WorldCausalManifestStore(tmp_path / "world.json")
-    store.initialize(manifest())
+    store._initialize(manifest())
 
-    pending = store.begin_transition("transition-1")
+    pending = store._begin_transition("transition-1")
 
     assert pending.status is ManifestStatus.PREPARING
     assert pending.causal_tick == 0
     assert pending.pending_tick == 1
     assert store.read() == pending
     with pytest.raises(ManifestRecoveryRequiredError, match="transition-1"):
-        store.require_active()
+        store._require_active()
     assert store.read().status is ManifestStatus.RECOVERY_REQUIRED
 
 
 def test_only_one_cross_process_transition_can_prepare_at_a_time(tmp_path):
     store = WorldCausalManifestStore(tmp_path / "world.json")
-    store.initialize(manifest())
+    store._initialize(manifest())
     barrier = Barrier(2)
 
     def begin(transition_id):
         barrier.wait()
         try:
-            store.begin_transition(transition_id)
+            store._begin_transition(transition_id)
             return "prepared"
         except ManifestRecoveryRequiredError:
             return "blocked"
@@ -100,21 +115,21 @@ def test_only_one_cross_process_transition_can_prepare_at_a_time(tmp_path):
 
 def test_successful_causal_cut_publication_verifies_dependency_closure(tmp_path):
     store = WorldCausalManifestStore(tmp_path / "world.json")
-    store.initialize(manifest())
-    store.begin_transition("transition-1")
+    store._initialize(manifest())
+    store._begin_transition("transition-1")
     ref = checkpoint()
     committed = manifest(
         tick=1, refs=(ref,), last_sequence=0, digest="b" * 64, commit_id="transition-1"
     )
 
-    result = store.commit_transition(
+    result = store._commit_transition(
         committed,
         dependency_verifier=lambda refs: refs == (ref,),
     )
 
     assert result.status is ManifestStatus.COMMITTED
     assert store.read() == committed
-    assert store.require_active() == committed
+    assert store._require_active() == committed
 
 
 def test_manifest_store_rejects_journal_only_initial_cut_and_commit(tmp_path):
@@ -123,11 +138,11 @@ def test_manifest_store_rejects_journal_only_initial_cut_and_commit(tmp_path):
     journal_only_initial = manifest(refs=(journal,))
 
     with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
-        store.initialize(journal_only_initial)
+        store._initialize(journal_only_initial)
     assert not store.path.exists()
 
-    store.initialize(manifest())
-    pending = store.begin_transition("transition-1")
+    store._initialize(manifest())
+    pending = store._begin_transition("transition-1")
     journal_only_candidate = manifest(
         tick=1,
         refs=(journal,),
@@ -135,7 +150,7 @@ def test_manifest_store_rejects_journal_only_initial_cut_and_commit(tmp_path):
         digest="d" * 64,
     )
     with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
-        store.commit_transition(journal_only_candidate, dependency_verifier=lambda _refs: True)
+        store._commit_transition(journal_only_candidate, dependency_verifier=lambda _refs: True)
     assert store.read() == pending
 
 
@@ -160,51 +175,51 @@ def test_manifest_store_rejects_owner_membership_change_on_commit(tmp_path, cand
         checkpoint(owner="organism", identity="organism-a"),
         checkpoint(owner="embodiment", identity="body-a"),
     )
-    store.initialize(manifest(refs=initial_refs))
-    pending = store.begin_transition("transition-1")
+    store._initialize(manifest(refs=initial_refs))
+    pending = store._begin_transition("transition-1")
     candidate = manifest(tick=1, refs=candidate_refs, last_sequence=0, digest="e" * 64)
 
     with pytest.raises(ManifestError, match="participant roster differs"):
-        store.commit_transition(candidate, dependency_verifier=lambda _refs: True)
+        store._commit_transition(candidate, dependency_verifier=lambda _refs: True)
 
     assert store.read() == pending
 
 
 def test_unverified_checkpoint_dependency_leaves_durable_recovery_required(tmp_path):
     store = WorldCausalManifestStore(tmp_path / "world.json")
-    store.initialize(manifest())
-    pending = store.begin_transition("transition-1")
+    store._initialize(manifest())
+    pending = store._begin_transition("transition-1")
     ref = checkpoint()
     candidate = manifest(tick=1, refs=(ref,), last_sequence=0, digest="c" * 64)
 
     with pytest.raises(ManifestError, match="dependency closure"):
-        store.commit_transition(candidate, dependency_verifier=lambda _: False)
+        store._commit_transition(candidate, dependency_verifier=lambda _: False)
 
     assert store.read() == pending
     with pytest.raises(ManifestRecoveryRequiredError):
-        store.require_active()
+        store._require_active()
 
 
 def test_failure_detail_is_durable_and_does_not_clear_recovery_state(tmp_path):
     store = WorldCausalManifestStore(tmp_path / "world.json")
-    store.initialize(manifest())
-    store.begin_transition("transition-1")
+    store._initialize(manifest())
+    store._begin_transition("transition-1")
 
-    failed = store.record_failure("transition-1", "synthetic pre-publication failure")
+    failed = store._record_failure("transition-1", "synthetic pre-publication failure")
 
     assert failed.failure == "synthetic pre-publication failure"
     assert store.read() == failed
     with pytest.raises(ManifestRecoveryRequiredError):
-        store.require_active()
+        store._require_active()
 
 
 def test_cannot_initialize_existing_manifest_or_commit_without_pending_transition(tmp_path):
     store = WorldCausalManifestStore(tmp_path / "world.json")
-    store.initialize(manifest())
+    store._initialize(manifest())
     with pytest.raises(FileExistsError):
-        store.initialize(manifest())
+        store._initialize(manifest())
     with pytest.raises(ValueError, match="pending transition"):
-        store.commit_transition(manifest(tick=1), dependency_verifier=lambda _: True)
+        store._commit_transition(manifest(tick=1), dependency_verifier=lambda _: True)
 
 
 def test_initialize_is_atomic_no_overwrite_for_competing_initializers(tmp_path):
@@ -214,7 +229,7 @@ def test_initialize_is_atomic_no_overwrite_for_competing_initializers(tmp_path):
     def initialize(world_id):
         barrier.wait()
         try:
-            store.initialize(manifest(world_id=world_id))
+            store._initialize(manifest(world_id=world_id))
             return "created"
         except FileExistsError:
             return "exists"

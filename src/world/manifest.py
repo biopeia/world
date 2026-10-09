@@ -167,17 +167,18 @@ DependencyVerifier = Callable[[tuple[CheckpointReference, ...]], bool]
 
 
 class WorldCausalManifestStore:
-    """Publish manifests using same-directory atomic replacement and fsync.
+    """Internal persistence backend for :class:`DurableWorldRuntime`.
 
-    Call ``begin_transition`` and wait for it to return before mutating causal
-    state. It durably records RECOVERY_REQUIRED first. A successful
-    ``commit_transition`` is the only operation that clears that state.
+    Public API is intentionally read-only. The underscored mutation methods
+    are implementation details and do not provide an independent commit
+    authority. They are not a security boundary against arbitrary trusted
+    in-process code or direct filesystem access.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def initialize(self, manifest: WorldCausalManifest) -> None:
+    def _initialize(self, manifest: WorldCausalManifest) -> None:
         if manifest.status is not ManifestStatus.COMMITTED or manifest.causal_tick != 0:
             raise ValueError("initial manifest must be a committed tick-zero causal cut")
         _require_owner_state(manifest)
@@ -205,7 +206,7 @@ class WorldCausalManifestStore:
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise ManifestError(f"cannot read valid World causal manifest at {self.path}") from exc
 
-    def require_active(self) -> WorldCausalManifest:
+    def _require_active(self) -> WorldCausalManifest:
         with self._writer_lock():
             manifest = self.read()
             if manifest.status is ManifestStatus.PREPARING:
@@ -234,7 +235,7 @@ class WorldCausalManifestStore:
                 )
             return manifest
 
-    def begin_transition(
+    def _begin_transition(
         self,
         transition_id: str,
         *,
@@ -274,7 +275,7 @@ class WorldCausalManifestStore:
             self._write(pending)
             return pending
 
-    def record_failure(self, transition_id: str, failure: str) -> WorldCausalManifest:
+    def _record_failure(self, transition_id: str, failure: str) -> WorldCausalManifest:
         with self._writer_lock():
             pending = self.read()
             if pending.status not in (ManifestStatus.PREPARING, ManifestStatus.RECOVERY_REQUIRED):
@@ -302,7 +303,7 @@ class WorldCausalManifestStore:
             self._write(failed)
             return failed
 
-    def commit_transition(
+    def _commit_transition(
         self,
         manifest: WorldCausalManifest,
         *,

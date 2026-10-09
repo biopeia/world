@@ -260,7 +260,7 @@ class DurableWorldRuntime:
             commit_id=f"genesis:{world_id.value}",
             registered_owner_ids=registered_owner_ids,
         )
-        manifest_store.initialize(manifest)
+        manifest_store._initialize(manifest)
         return cls(
             world_id,
             presence_id,
@@ -284,7 +284,7 @@ class DurableWorldRuntime:
         owner_checkpoint_contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
         owner_checkpoint_restorer: OwnerCheckpointRestorer,
     ) -> DurableWorldRuntime:
-        manifest = manifest_store.require_active()
+        manifest = manifest_store._require_active()
         if manifest.world_id != world_id.value:
             raise ManifestError("stored World identity does not match requested World")
         if presence_id not in manifest.presence_ids:
@@ -419,7 +419,7 @@ class DurableWorldRuntime:
         try:
             if self._latched_failure is not None:
                 raise RecoveryRequiredError("World runtime requires explicit recovery")
-            current = self._manifest_store.require_active()
+            current = self._manifest_store._require_active()
             if current != self._manifest:
                 self._latched_failure = "durable manifest changed outside this runtime"
                 raise RecoveryRequiredError(self._latched_failure)
@@ -466,7 +466,7 @@ class DurableWorldRuntime:
             proposed_contracts.update(new_contracts)
             for key in removals:
                 proposed_contracts.pop(key, None)
-            pending = self._manifest_store.begin_transition(
+            pending = self._manifest_store._begin_transition(
                 transition_id,
                 registered_owner_ids=registered_tuple,
                 step_participant_ids=step_tuple,
@@ -506,7 +506,7 @@ class DurableWorldRuntime:
                     registered_owner_ids=registered_tuple,
                     step_participant_ids=step_tuple,
                 )
-                self._manifest_store.commit_transition(
+                self._manifest_store._commit_transition(
                     candidate,
                     dependency_verifier=lambda refs: self._verify_references(
                         refs,
@@ -523,7 +523,7 @@ class DurableWorldRuntime:
             except Exception as exc:
                 self._latched_failure = f"{type(exc).__name__}: {exc}"
                 try:
-                    self._manifest = self._manifest_store.record_failure(transition_id, self._latched_failure)
+                    self._manifest = self._manifest_store._record_failure(transition_id, self._latched_failure)
                 except Exception:
                     # Publication outcome can be ambiguous after an OS-level write error.
                     # Keep execution latched even if the marker cannot be re-written.
