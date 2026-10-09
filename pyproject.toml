@@ -9,9 +9,26 @@ description = "World causal coordination primitives for Biopeia"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.optional-dependencies]
+# Cross-repository integration tests only. The package itself has no runtime
+# dependency on any other Biopeia repository. Each pin is the exact revision
+# the tests under tests/integration were verified against.
+integration = [
+    "pytest>=8",
+    "mujoco==3.14.0",
+    "organism @ git+https://github.com/biopeia/organism.git@f15c4c57212466c807ab198d2022e72730e21b23",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@3fe3cda64516dd5a8148ec49b826c025925396c0",
+    "environment @ git+https://github.com/biopeia/environment.git@f2ef8c277a42695efe69adfe05f82176fd9ead39",
+    "modality @ git+https://github.com/biopeia/modality.git@9a0656ab37ed5ff1ed8082dcaac1ae989c17ca40",
+    "observation @ git+https://github.com/biopeia/observation.git@cb07ace206058719a9aa9df65e2eb1f837130ee9",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["world*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/integration needs the other Biopeia packages; run it explicitly with
+# `python -m pytest tests/integration` after installing the integration extra.
+norecursedirs = ["integration"]

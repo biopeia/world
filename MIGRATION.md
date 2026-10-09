@@ -355,3 +355,17 @@ characters in this table; source SHA above pins unambiguous resolution.
 | `lab/tests/unit/lab/physics3d/test_resource.py` | `69cb74a1b790b109bbc5fd69d93ef23e6da07929` | `55fafbb1488e` |
 | `tests/experimental_integrity/test_embodiment_inheritance_integrity.py` | `a708ab8021d4962d773c379009fb7eb7406bc7b1` | `c077496ba8bb` |
 | `scripts/bench_world_journal_index.py` | `47e66ac469626339ee156d4ea00a4dcdc8330f4a` | `13720935595f` |
+
+## Integration tests moved from the integration workspace
+
+Three cross-repository tests were copied unchanged from the unversioned local integration workspace, where they had no history, by Architecture Owner decision of 2026-10-09: the versioned source of evidence for ordinary causal integration belongs with World, the causal runtime and composition authority.
+
+| Workspace path | Target path |
+|---|---|
+| `tests/integration/test_first_biopeia_causal_tick.py` | `tests/integration/test_first_biopeia_causal_tick.py` |
+| `tests/integration/test_durable_checkpoint_restore_slice.py` | `tests/integration/test_durable_checkpoint_restore_slice.py` |
+| `tests/integration/test_first_biopeia_physical_causal_step.py` | `tests/integration/physical_step/test_first_biopeia_physical_causal_step.py` |
+
+They are new Biopeia tests, not migrated source tests; no path of the historical source repository corresponds to them. The fourth workspace test, the operator material transfer, imports Lab and was placed in the Lab repository so that World does not depend on Lab.
+
+Verified on 2026-10-09 in a clean environment built from these revisions, 9 passed: `organism@f15c4c5`, `embodiment@3fe3cda`, `environment@f2ef8c2`, `modality@9a0656a`, `observation@cb07ace`, with this repository at `826aef5` plus this change. The `integration` extra pins the same revisions.

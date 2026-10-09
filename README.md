@@ -18,3 +18,14 @@ See [`MIGRATION.md`](MIGRATION.md) for exact source provenance, dispositions, va
 
 
 **Durability boundary:** World can persist and hash-check opaque checkpoint references through the supplied verifier, and delegates restoration to supplied owner callbacks. A registered owner codec validates the encoded owner identity and schema; World creates the typed `OwnerRecoveryReceipt` for that exact reference and repeats owner validation after delegated restoration. This is a trusted in-process owner contract, not a caller-chosen boolean alone. It still cannot independently prove that the adapter is honest, that the declared initial roster includes every real authority, or that underlying storage survives actual process/power loss. This implementation must not be treated as full operational durable owner-closed conformance until canonical Biopeia owner implementations are bound through this contract and their integration is independently verified; receipt structure alone does not prove the guarantees.
+
+## Cross-repository integration tests
+
+`tests/integration` holds the versioned evidence that World coordinates the other authorities in one causal step: the first causal tick, publication and restore of an owner-checkpoint closure, and the first end-to-end physical causal step (`tests/integration/physical_step`). They import `organism`, `embodiment`, `environment`, `modality` and `observation`; the World package itself depends on none of them.
+
+```sh
+python -m pip install -e '.[integration]'   # pinned revisions of the other repositories
+python -m pytest tests/integration
+```
+
+The default `python -m pytest` run does not collect them. The pins in the `integration` extra are the exact revisions the tests were verified against; a newer revision of another repository is not covered until the pin is moved and the tests rerun. Passing them shows the bounded composition they exercise. It is not a claim of physical calibration, solver equivalence, crash consistency or conformance with the target architecture.

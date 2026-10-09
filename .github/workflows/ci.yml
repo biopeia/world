@@ -16,3 +16,31 @@ jobs:
       - run: python -m build
       - run: python -m pip install --no-deps dist/*.whl
       - run: python -m pytest
+
+  # Verifies World's coordination of the other authorities at the revisions
+  # pinned in the integration extra. Runs only where the read-only GitHub App
+  # credentials are configured; otherwise it is skipped, not passed.
+  integration:
+    if: ${{ vars.CI_READ_APP_ID != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.CI_READ_APP_ID }}
+          private-key: ${{ secrets.CI_READ_APP_PRIVATE_KEY }}
+          owner: biopeia
+          repositories: organism,embodiment,environment,modality,observation
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with the pinned integration dependencies
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh auth setup-git
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[integration]'
+      - run: python -m pytest tests/integration
+
