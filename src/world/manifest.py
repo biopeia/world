@@ -210,6 +210,12 @@ class WorldCausalManifestStore:
         if (manifest.world_id, manifest.causal_tick) != (pending.world_id, pending.pending_tick):
             raise ValueError("committed causal cut does not match the pending World transition")
         _require_owner_state(manifest)
+        expected_owners = _owner_keys(pending.checkpoint_references)
+        candidate_owners = _owner_keys(manifest.checkpoint_references)
+        if candidate_owners != expected_owners:
+            raise ManifestError(
+                "transition owner checkpoint identities must match the previous causal cut"
+            )
         if not dependency_verifier(manifest.checkpoint_references):
             raise ManifestError("causal cut checkpoint dependency closure is not verified")
         self._write(manifest)
@@ -289,6 +295,15 @@ def _require_owner_state(manifest: WorldCausalManifest) -> None:
     """A COMPLETE World cut needs semantic-owner state as well as its journal."""
     if not any(reference.owner != _JOURNAL_OWNER for reference in manifest.checkpoint_references):
         raise ManifestError("complete causal cut must identify at least one durable owner checkpoint")
+
+
+def _owner_keys(references: tuple[CheckpointReference, ...]) -> frozenset[tuple[str, str]]:
+    """Return declared semantic-owner identities, excluding World journal state."""
+    return frozenset(
+        (reference.owner, reference.owner_identity)
+        for reference in references
+        if reference.owner != _JOURNAL_OWNER
+    )
 
 
 def _manifest_to_data(manifest: WorldCausalManifest) -> dict:

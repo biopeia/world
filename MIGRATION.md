@@ -118,11 +118,13 @@ but a participant cannot silently disappear or be replaced while the cut is
 published. These owner identities identify semantic resources and are not
 inferred from, or equated with, World presence IDs. Membership changes are
 outside the current API and require a future explicit World transition. This
-requirement is enforced both at durable manifest publication (`initialize`,
+requirement is enforced at durable manifest publication (`initialize`,
 `commit_transition`, and recovery publication) and when validating/restoring a
-runtime, so a journal-only manifest cannot be written through the supported
-store APIs or used to restore an active runtime or publish later ticks. This
-still does not establish that a caller listed every real participant: the
+runtime. Direct store callers cannot omit, add, or substitute declared owner
+identities during a committed transition; a journal-only manifest cannot be
+written through the supported store APIs or used to restore an active runtime
+or publish later ticks. This still does not establish that a caller listed
+every real participant: the
 caller is responsible for declaring the initial owner closure accurately, and
 this API has no authoritative roster from which World can independently
 derive that set.

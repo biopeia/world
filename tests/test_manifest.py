@@ -111,6 +111,37 @@ def test_manifest_store_rejects_journal_only_initial_cut_and_commit(tmp_path):
     assert store.read() == pending
 
 
+@pytest.mark.parametrize(
+    "candidate_refs",
+    [
+        (checkpoint(owner="organism", identity="organism-a"),),  # remove one owner
+        (
+            checkpoint(owner="organism", identity="organism-a"),
+            checkpoint(owner="embodiment", identity="body-a"),
+            checkpoint(owner="environment", identity="environment-a"),
+        ),  # add an owner
+        (
+            checkpoint(owner="organism", identity="organism-b"),
+            checkpoint(owner="embodiment", identity="body-a"),
+        ),  # substitute an identity
+    ],
+)
+def test_manifest_store_rejects_owner_membership_change_on_commit(tmp_path, candidate_refs):
+    store = WorldCausalManifestStore(tmp_path / "world.json")
+    initial_refs = (
+        checkpoint(owner="organism", identity="organism-a"),
+        checkpoint(owner="embodiment", identity="body-a"),
+    )
+    store.initialize(manifest(refs=initial_refs))
+    pending = store.begin_transition("transition-1")
+    candidate = manifest(tick=1, refs=candidate_refs, last_sequence=0, digest="e" * 64)
+
+    with pytest.raises(ManifestError, match="identities must match"):
+        store.commit_transition(candidate, dependency_verifier=lambda _refs: True)
+
+    assert store.read() == pending
+
+
 def test_unverified_checkpoint_dependency_leaves_durable_recovery_required(tmp_path):
     store = WorldCausalManifestStore(tmp_path / "world.json")
     store.initialize(manifest())
