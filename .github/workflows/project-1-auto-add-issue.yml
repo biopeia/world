@@ -11,7 +11,7 @@ jobs:
   add-to-project:
     uses: biopeia/.github-private/.github/workflows/project-1-auto-add-issue.yml@51ae154bcea012fc325c44f01b1df131f58c1799
     with:
-      app_id: ${{ vars.BIOPEIA_PROJECT_APP_ID }}
-      project_id: ${{ vars.BIOPEIA_PROJECT_1_NODE_ID }}
+      app_id: ${{ vars.PROJECT_1_INTAKE_APP_ID }}
+      project_id: ${{ vars.PROJECT_1_NODE_ID }}
     secrets:
-      app_private_key: ${{ secrets.BIOPEIA_PROJECT_APP_PRIVATE_KEY }}
+      app_private_key: ${{ secrets.PROJECT_1_INTAKE_APP_PRIVATE_KEY }}
