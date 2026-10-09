@@ -15,17 +15,15 @@ from __future__ import annotations
 import hashlib
 import json
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
 
-import pytest
 import mujoco
-
+import pytest
 from embodiment.checkpoint import EmbodimentCheckpoint
 from embodiment.metabolism import MetabolicLedger
 from embodiment.observation import BodyPoseSample
-from embodiment.physiology import LivingBodyState
 from embodiment.physics3d.actuation_projection import project_motor_command
 from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
 from embodiment.physics3d.articulated_state import (
@@ -41,14 +39,17 @@ from embodiment.physics3d.physical_transition import (
     PhysicalStepCorrelation,
     SolverBodyCandidate,
 )
+from embodiment.physiology import LivingBodyState
 from environment import (
     FrameDescriptor,
-    PhysicalStepCorrelation as EnvironmentStepCorrelation,
     StaticEnvironmentOwner,
     StaticGroundPlane,
     StaticPhysicalScene,
     StaticSceneCandidate,
     project_static_scene,
+)
+from environment import (
+    PhysicalStepCorrelation as EnvironmentStepCorrelation,
 )
 from observation.semantic import (
     AcquisitionBasis,
@@ -83,6 +84,7 @@ from organism.agency import (
     admit_afforded_action,
 )
 from organism.identity import OrganismIdentity
+
 from world.durable_runtime import (
     DurableJournalSnapshotStore,
     DurableWorldRuntime,
@@ -94,8 +96,13 @@ from world.manifest import (
     ManifestStatus,
     WorldCausalManifestStore,
 )
+from world.physical_step import (
+    PhysicalStepCandidate,
+    PhysicalStepContext,
+    PhysicalStepPorts,
+    run_physical_step,
+)
 from world.runtime import PresenceId, WorldId
-
 
 WORLD_ID = "e2e-physical-world"
 ORGANISM_ID = OrganismIdentity.parse("12345678-1234-5678-1234-567812345678")
@@ -528,22 +535,19 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
     # sensory transduction only, not motor-command adaptation.
     staged: dict[str, object] = {}
 
-    def write_owner_checkpoints(causal_tick: int) -> tuple[CheckpointReference, ...]:
-        assert causal_tick == 1
+    def project_body(context: PhysicalStepContext):
         assert manifest_store.read().status is ManifestStatus.PREPARING
         correlation = PhysicalStepCorrelation(
-            world_id=WORLD_ID,
-            causal_tick=0,
-            physical_step_id="physical-step-1",
-            body_id=BODY_ID,
-            embodiment_episode_id=EPISODE_ID,
-            morphology_revision=MORPHOLOGY_REVISION,
-            environment_revision=ENVIRONMENT_REVISION,
-            solver_config_revision=SOLVER_CONFIGURATION_REVISION,
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            body_id=context.body_id,
+            embodiment_episode_id=context.embodiment_episode_id,
+            morphology_revision=context.morphology_revision,
+            environment_revision=context.environment_revision,
+            solver_config_revision=context.solver_config_revision,
         )
-        # Correlation tick names the source state (tick 0); adoption advances
-        # that state and World commits the resulting cut at tick 1.
-        assert correlation.causal_tick == physical_state.causal_tick == causal_tick - 1
+        assert correlation.causal_tick == physical_state.causal_tick
         projected_body = project_body_physical_input(
             _free_root_box_spec(),
             physical_state.pose,
@@ -551,12 +555,12 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
             linear_velocity_m_per_s=physical_state.linear_velocity_m_per_s,
             angular_velocity_rad_per_s=physical_state.angular_velocity_rad_per_s,
         )
-        frame = controller.frame(commitment, tick=causal_tick)
+        frame = controller.frame(commitment, tick=context.target_causal_tick)
         command = motor_command_from_frame(
             commitment,
             frame,
-            command_id=f"motor-command-{causal_tick}",
-            issued_at_tick=causal_tick,
+            command_id=f"motor-command-{context.target_causal_tick}",
+            issued_at_tick=context.target_causal_tick,
         )
         assert command.commitment_id == commitment.commitment_id
         assert command.competence_id == decision.competence_id
@@ -575,10 +579,29 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
         assert len(actuation.channels) == 1
         assert actuation.channels[0].effector_id == "root.force.x"
         assert actuation.channels[0].value == 0.5
+        staged.update(command=command, actuation=actuation, correlation=correlation)
+        return projected_body, actuation
+
+    def project_environment(context: PhysicalStepContext):
+        assert context.environment_revision == environment.scene.environment_revision
+        return environment.scene
+
+    def execute_solver(context, body_projection, environment_projection):
+        projected_body, actuation = body_projection
         position_m, orientation_xyzw, linear_velocity_m_per_s, angular_velocity_rad_per_s = (
-            _execute_mujoco_step(projected_body, environment.scene, actuation)
+            _execute_mujoco_step(projected_body, environment_projection, actuation)
         )
-        solver_candidate = SolverBodyCandidate(
+        correlation = PhysicalStepCorrelation(
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            body_id=context.body_id,
+            embodiment_episode_id=context.embodiment_episode_id,
+            morphology_revision=context.morphology_revision,
+            environment_revision=context.environment_revision,
+            solver_config_revision=context.solver_config_revision,
+        )
+        body_candidate = SolverBodyCandidate(
             correlation=correlation,
             reference_frame=projected_body.reference_frame,
             body_frame=projected_body.body_frame,
@@ -587,17 +610,30 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
             linear_velocity_m_per_s=linear_velocity_m_per_s,
             angular_velocity_rad_per_s=angular_velocity_rad_per_s,
         )
-        adopted_state = physical_state.adopt_candidate(solver_candidate, expected_step=correlation)
-        assert adopted_state.causal_tick == correlation.causal_tick + 1 == causal_tick
         environment_correlation = EnvironmentStepCorrelation(
-            world_id=correlation.world_id,
-            causal_tick=correlation.causal_tick,
-            physical_step_id=correlation.physical_step_id,
-            environment_id=environment.scene.environment_id,
-            environment_revision=environment.scene.environment_revision,
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            environment_id=environment_projection.environment_id,
+            environment_revision=environment_projection.environment_revision,
         )
+        environment_candidate = StaticSceneCandidate(
+            environment_correlation, project_static_scene(environment_projection)
+        )
+        return PhysicalStepCandidate(body_candidate, environment_candidate)
+
+    def adopt_body(context: PhysicalStepContext, candidate: SolverBodyCandidate) -> None:
+        correlation = staged["correlation"]
+        adopted_state = physical_state.adopt_candidate(candidate, expected_step=correlation)
+        assert adopted_state.causal_tick == context.target_causal_tick
+        staged.update(candidate=candidate, adopted=adopted_state)
+
+    def adopt_environment(context: PhysicalStepContext, candidate: StaticSceneCandidate) -> None:
+        environment_correlation = candidate.correlation
+        if environment_correlation.causal_tick != context.source_causal_tick:
+            raise ValueError("environment candidate has a stale source causal tick")
         environment.validate_and_adopt(
-            StaticSceneCandidate(environment_correlation, project_static_scene(environment.scene)),
+            candidate,
             expected_correlation=environment_correlation,
         )
         environment_projection = {
@@ -610,15 +646,25 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
             ),
             "accepted_tick": environment.last_adopted_tick,
         }
-        assert environment.last_adopted_tick == 0
-        staged.update(
-            command=command,
-            actuation=actuation,
-            candidate=solver_candidate,
-            adopted=adopted_state,
-            correlation=correlation,
-            environment=environment_projection,
+        assert environment.last_adopted_tick == context.source_causal_tick
+        staged["environment"] = environment_projection
+
+    def write_owner_checkpoints(context: PhysicalStepContext) -> tuple[CheckpointReference, ...]:
+        causal_tick = context.target_causal_tick
+        adopted_state = staged["adopted"]
+        command = staged["command"]
+        assert isinstance(adopted_state, EmbodimentPhysicalState)
+        correlation = PhysicalStepCorrelation(
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            body_id=context.body_id,
+            embodiment_episode_id=context.embodiment_episode_id,
+            morphology_revision=context.morphology_revision,
+            environment_revision=context.environment_revision,
+            solver_config_revision=context.solver_config_revision,
         )
+        assert adopted_state.causal_tick == correlation.causal_tick + 1 == causal_tick
         previous_organism_state = json.loads(organism_initial_payload)
         next_organism_state = {
             **previous_organism_state,
@@ -653,7 +699,25 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
             ),
         )
 
-    record = durable_world.tick("physical-step-commit-1", write_owner_checkpoints)
+    ports = PhysicalStepPorts(
+        project_body=project_body,
+        project_environment=project_environment,
+        execute_solver=execute_solver,
+        adopt_body=adopt_body,
+        adopt_environment=adopt_environment,
+        write_checkpoints=write_owner_checkpoints,
+    )
+    record = run_physical_step(
+        durable_world,
+        commit_id="physical-step-commit-1",
+        physical_step_id="physical-step-1",
+        body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision=SOLVER_CONFIGURATION_REVISION,
+        ports=ports,
+    )
     assert durable_world.status is ManifestStatus.COMMITTED
     assert durable_world.causal_tick == 1
     adopted = staged["adopted"]
@@ -810,7 +874,7 @@ def _run_stale_morphology(root: Path) -> tuple[ManifestStatus, int, int]:
     stale = replace(expected, morphology_revision="morphology.previous")
     adopted_candidates: list[EmbodimentPhysicalState] = []
 
-    def fail_transition(tick: int):
+    def execute_stale_solver(context, _body, _environment):
         candidate = SolverBodyCandidate(
             stale,
             "physics3d.world",
@@ -820,11 +884,31 @@ def _run_stale_morphology(root: Path) -> tuple[ManifestStatus, int, int]:
             (0.0, 0.0, 0.0),
             (0.0, 0.0, 0.0),
         )
-        adopted_candidates.append(physical.adopt_candidate(candidate, expected_step=expected))
-        raise AssertionError("stale candidate must be rejected before checkpoint writes")
+        return PhysicalStepCandidate(candidate, None)
 
+    def adopt_stale_body(_context, candidate):
+        adopted_candidates.append(physical.adopt_candidate(candidate, expected_step=expected))
+
+    ports = PhysicalStepPorts(
+        project_body=lambda _context: None,
+        project_environment=lambda _context: None,
+        execute_solver=execute_stale_solver,
+        adopt_body=adopt_stale_body,
+        adopt_environment=lambda _context, _candidate: None,
+        write_checkpoints=lambda _context: pytest.fail("stale candidate reached checkpoint writing"),
+    )
     with pytest.raises(ValueError, match="authorized physical step"):
-        runtime.tick("stale-physical-step", fail_transition)
+        run_physical_step(
+            runtime,
+            commit_id="stale-physical-step",
+            physical_step_id="step-stale",
+            body_id=BODY_ID,
+            embodiment_episode_id=EPISODE_ID,
+            morphology_revision=MORPHOLOGY_REVISION,
+            environment_revision=ENVIRONMENT_REVISION,
+            solver_config_revision=SOLVER_CONFIGURATION_REVISION,
+            ports=ports,
+        )
     manifest = manifest_store.read()
     assert physical.causal_tick == 0
     assert physical.pose.position_m == initial_pose.position_m
