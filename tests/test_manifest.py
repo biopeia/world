@@ -1,4 +1,6 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -122,3 +124,22 @@ def test_cannot_initialize_existing_manifest_or_commit_without_pending_transitio
         store.initialize(manifest())
     with pytest.raises(ValueError, match="pending transition"):
         store.commit_transition(manifest(tick=1), dependency_verifier=lambda _: True)
+
+
+def test_initialize_is_atomic_no_overwrite_for_competing_initializers(tmp_path):
+    store = WorldCausalManifestStore(tmp_path / "world.json")
+    barrier = Barrier(2)
+
+    def initialize(world_id):
+        barrier.wait()
+        try:
+            store.initialize(manifest(world_id=world_id))
+            return "created"
+        except FileExistsError:
+            return "exists"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(initialize, ("world-a", "world-b")))
+
+    assert sorted(results) == ["created", "exists"]
+    assert store.read().world_id in {"world-a", "world-b"}

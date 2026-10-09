@@ -35,6 +35,15 @@ This coordinator deliberately runs the opaque participant callback before journa
 | `src/world/manifest.py` | New target contract implementation from MIG-003 and accepted AD-0006, AD-0009, AD-0018, AD-0019, AD-0032 | REWRITE | Stores World ID, committed causal tick, exact opaque owner checkpoint references and hashes, inclusive durable journal `last_sequence`/prefix digest, schema version, and `COMPLETE`/`RECOVERY_REQUIRED` status. It never decodes owner-private state. |
 | `tests/test_manifest.py` | New bounded tests for MIG-003 | REWRITE | Covers schema validation, inclusive empty/non-empty journal boundary, persisted pending status, dependency-verification rejection, and successful manifest publication. These are API-level tests, not crash experiments. |
 
+## Exclusive tick-zero manifest initialization follow-up
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/manifest.py` | Target-only hardening of the tick-zero manifest initializer, constrained by AD-0010's single-writer/explicit-coordination invariant; no CURRENT code copied | REWRITE | Replaces check-then-replace initialization with same-directory temporary serialization and atomic no-overwrite hard-link publication. This prevents competing initializers from silently replacing the first tick-zero manifest on filesystems supporting same-filesystem hard links. |
+| `tests/test_manifest.py` | New concurrent initializer test | REWRITE | Two threads race to initialize one path; verifies one succeeds and the other receives `FileExistsError`, leaving one valid manifest. This is a process-local concurrency test, not multi-process or crash-durability evidence. |
+
+The increment is intentionally limited to first initialization. It does **not** coordinate later manifest updates across processes, implement a lock/lease, establish a deployment multiplicity contract, or resolve the outstanding identity/checkpoint-retention/zero-presence/tick-ordering questions tracked by MIG-003. Hard-link support and durability behavior are platform/filesystem dependent and were not broadly validated. No source-monorepo code was changed.
+
 ## Integrated durable tick publication slice
 
 | Target path | Provenance | Disposition | Notes |
