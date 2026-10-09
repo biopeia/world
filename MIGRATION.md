@@ -108,3 +108,15 @@ This slice still does not prove that all references describe a semantically comp
 ## Validation scope
 
 CI builds a wheel, installs it without dependencies, and runs the focused unit tests against Python 3.12. Passing this suite validates only this in-memory journal slice; it does not validate World lifecycle, physical integration, environmental law, organism continuity, persistence, or scientific behavior.
+
+# Durable cut participant closure
+
+`DurableWorldRuntime` refuses to initialize a `COMPLETE` cut without at least
+one owner checkpoint. Each ordinary tick must supply the same set of
+`(owner, owner_identity)` pairs as the previous cut; checkpoints may advance,
+but a participant cannot silently disappear or be replaced while the cut is
+published. These owner identities identify semantic resources and are not
+inferred from, or equated with, World presence IDs. Membership changes are
+outside the current API and require a future explicit World transition. This
+does not establish that a caller listed every real participant: the caller is
+still responsible for declaring the initial owner closure accurately.

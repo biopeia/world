@@ -69,6 +69,45 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
     assert manifest_store.require_active() == runtime.manifest
 
 
+def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
+    world_id = WorldId("world-owner-closure")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        DurableWorldRuntime.initialize(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            initial_owner_references=(),
+            owner_checkpoint_verifier=_verifier,
+        )
+
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"owner at tick zero")
+    runtime = DurableWorldRuntime.initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        owner_checkpoint_verifier=_verifier,
+    )
+
+    # Presence is the World participant identity; owner_identity is a separate
+    # resource identity and may differ. The latter must remain in the cut.
+    replacement = tmp_path / "replacement-owner.json"
+    replacement.write_bytes(b"different owner identity")
+    with pytest.raises(ManifestError, match="identities must match"):
+        runtime.tick("transition-1", lambda _tick: (_checkpoint(replacement, owner="embodiment"),))
+
+    pending = manifest_store.read()
+    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.causal_tick == 0
+    assert pending.checkpoint_references[0].owner_identity == "organism-identity"
+
+
 def test_restore_validates_world_cut_then_delegates_owner_restore(tmp_path):
     world_id = WorldId("world-restore")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")

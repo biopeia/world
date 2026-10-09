@@ -104,6 +104,12 @@ OwnerCheckpointRestorer = Callable[[tuple[CheckpointReference, ...]], None]
 class DurableWorldRuntime:
     """Publish each World tick only after its journal and owner refs are durable.
 
+    A complete cut must contain at least one semantic-owner checkpoint. The
+    exact set of ``(owner, owner_identity)`` pairs is held stable across ticks;
+    participant membership changes need a separate explicit transition and are
+    not yet supported here. These owner identities are resource identities,
+    not World presence IDs.
+
     A transition first durably marks the previous complete cut
     ``RECOVERY_REQUIRED``. Its callback then persists owner-owned state and
     returns opaque references. World writes an immutable journal prefix and
@@ -156,8 +162,11 @@ class DurableWorldRuntime:
         owner_checkpoint_verifier: OwnerCheckpointVerifier,
     ) -> DurableWorldRuntime:
         journal = EventJournal()
+        owner_references = tuple(initial_owner_references)
+        if not owner_references:
+            raise ManifestError("initial causal cut must identify at least one durable owner checkpoint")
         journal_reference = journal_store.write(journal, causal_tick=0)
-        references = (*tuple(initial_owner_references), journal_reference)
+        references = (*owner_references, journal_reference)
         if not cls._verify_references(references, owner_checkpoint_verifier):
             raise ManifestError("initial causal cut checkpoint dependency closure is not verified")
         manifest = WorldCausalManifest(
@@ -303,6 +312,14 @@ class DurableWorldRuntime:
             pending = self._manifest_store.begin_transition(transition_id)
             try:
                 owner_references = tuple(write_owner_checkpoints(proposed_tick))
+                expected_owners = self._owner_keys(
+                    tuple(ref for ref in current.checkpoint_references if ref.owner != _JOURNAL_OWNER)
+                )
+                candidate_owners = self._owner_keys(owner_references)
+                if candidate_owners != expected_owners:
+                    raise ManifestError(
+                        "transition owner checkpoint identities must match the previous causal cut"
+                    )
                 record = CausalRecord(
                     record_id=f"{self.world_id.value}:tick:{proposed_tick}",
                     world_id=self.world_id.value,
@@ -354,6 +371,11 @@ class DurableWorldRuntime:
         if len(journal_refs) != 1 or not DurableJournalSnapshotStore.verify(journal_refs[0]):
             return False
         return bool(owner_checkpoint_verifier(owner_refs))
+
+    @staticmethod
+    def _owner_keys(references: tuple[CheckpointReference, ...]) -> frozenset[tuple[str, str]]:
+        """Return the explicitly participating semantic owner identities."""
+        return frozenset((reference.owner, reference.owner_identity) for reference in references)
 
     @staticmethod
     def _validate_cut(manifest: WorldCausalManifest, journal: EventJournal) -> None:
