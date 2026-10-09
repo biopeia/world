@@ -14,14 +14,19 @@ from world import (
 )
 
 
-def manifest(*, tick=0, refs=(), last_sequence=None, digest="", **overrides):
+def manifest(*, tick=0, refs=None, last_sequence=None, digest="", **overrides):
+    references = (checkpoint(),) if refs is None else tuple(refs)
     values = {
         "world_id": "world-a",
         "causal_tick": tick,
         "presence_ids": (),
-        "checkpoint_references": tuple(refs),
+        "checkpoint_references": references,
         "journal_last_sequence": last_sequence,
         "journal_prefix_sha256": digest,
+        "commit_id": f"transition-{tick}" if tick else "genesis:world-a",
+        "registered_owner_ids": tuple(sorted(
+            (ref.owner, ref.owner_identity) for ref in references if ref.owner != "world-journal"
+        )),
     }
     values.update(overrides)
     return WorldCausalManifest(**values)
@@ -64,12 +69,33 @@ def test_durable_pending_transition_blocks_ordinary_execution(tmp_path):
 
     pending = store.begin_transition("transition-1")
 
-    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.status is ManifestStatus.PREPARING
     assert pending.causal_tick == 0
     assert pending.pending_tick == 1
     assert store.read() == pending
     with pytest.raises(ManifestRecoveryRequiredError, match="transition-1"):
         store.require_active()
+    assert store.read().status is ManifestStatus.RECOVERY_REQUIRED
+
+
+def test_only_one_cross_process_transition_can_prepare_at_a_time(tmp_path):
+    store = WorldCausalManifestStore(tmp_path / "world.json")
+    store.initialize(manifest())
+    barrier = Barrier(2)
+
+    def begin(transition_id):
+        barrier.wait()
+        try:
+            store.begin_transition(transition_id)
+            return "prepared"
+        except ManifestRecoveryRequiredError:
+            return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(begin, ("transition-a", "transition-b")))
+
+    assert sorted(outcomes) == ["blocked", "prepared"]
+    assert store.read().status is ManifestStatus.PREPARING
 
 
 def test_successful_causal_cut_publication_verifies_dependency_closure(tmp_path):
@@ -77,16 +103,71 @@ def test_successful_causal_cut_publication_verifies_dependency_closure(tmp_path)
     store.initialize(manifest())
     store.begin_transition("transition-1")
     ref = checkpoint()
-    committed = manifest(tick=1, refs=(ref,), last_sequence=0, digest="b" * 64)
+    committed = manifest(
+        tick=1, refs=(ref,), last_sequence=0, digest="b" * 64, commit_id="transition-1"
+    )
 
     result = store.commit_transition(
         committed,
         dependency_verifier=lambda refs: refs == (ref,),
     )
 
-    assert result.status is ManifestStatus.COMPLETE
+    assert result.status is ManifestStatus.COMMITTED
     assert store.read() == committed
     assert store.require_active() == committed
+
+
+def test_manifest_store_rejects_journal_only_initial_cut_and_commit(tmp_path):
+    store = WorldCausalManifestStore(tmp_path / "world.json")
+    journal = checkpoint(owner="world-journal", identity="world-a")
+    journal_only_initial = manifest(refs=(journal,))
+
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        store.initialize(journal_only_initial)
+    assert not store.path.exists()
+
+    store.initialize(manifest())
+    pending = store.begin_transition("transition-1")
+    journal_only_candidate = manifest(
+        tick=1,
+        refs=(journal,),
+        last_sequence=0,
+        digest="d" * 64,
+    )
+    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
+        store.commit_transition(journal_only_candidate, dependency_verifier=lambda _refs: True)
+    assert store.read() == pending
+
+
+@pytest.mark.parametrize(
+    "candidate_refs",
+    [
+        (checkpoint(owner="organism", identity="organism-a"),),  # remove one owner
+        (
+            checkpoint(owner="organism", identity="organism-a"),
+            checkpoint(owner="embodiment", identity="body-a"),
+            checkpoint(owner="environment", identity="environment-a"),
+        ),  # add an owner
+        (
+            checkpoint(owner="organism", identity="organism-b"),
+            checkpoint(owner="embodiment", identity="body-a"),
+        ),  # substitute an identity
+    ],
+)
+def test_manifest_store_rejects_owner_membership_change_on_commit(tmp_path, candidate_refs):
+    store = WorldCausalManifestStore(tmp_path / "world.json")
+    initial_refs = (
+        checkpoint(owner="organism", identity="organism-a"),
+        checkpoint(owner="embodiment", identity="body-a"),
+    )
+    store.initialize(manifest(refs=initial_refs))
+    pending = store.begin_transition("transition-1")
+    candidate = manifest(tick=1, refs=candidate_refs, last_sequence=0, digest="e" * 64)
+
+    with pytest.raises(ManifestError, match="participant roster differs"):
+        store.commit_transition(candidate, dependency_verifier=lambda _refs: True)
+
+    assert store.read() == pending
 
 
 def test_unverified_checkpoint_dependency_leaves_durable_recovery_required(tmp_path):

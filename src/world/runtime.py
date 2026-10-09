@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
 from threading import Lock
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from .journal import CausalRecord, EventJournal
 
@@ -40,7 +41,7 @@ class TickInProgressError(RuntimeError):
     """Raised when a tick is invoked while another tick is executing."""
 
 
-Transition = Callable[[int], None]
+Transition = Callable[[int], Mapping[str, Any] | None]
 
 
 class WorldRuntime:
@@ -104,14 +105,23 @@ class WorldRuntime:
 
             proposed_tick = self._causal_tick + 1
             try:
-                transition(proposed_tick)
+                event_payload = transition(proposed_tick)
+                if event_payload is not None:
+                    if not isinstance(event_payload, Mapping):
+                        raise TypeError("transition payload must be a JSON object or None")
+                    # Validate before publication. CausalRecord performs its own
+                    # immutable copy; strict JSON encoding rejects NaN/Infinity.
+                    json.dumps(event_payload, allow_nan=False)
                 record = CausalRecord(
                     record_id=f"{self.world_id.value}:tick:{proposed_tick}",
                     world_id=self.world_id.value,
                     causal_tick=proposed_tick,
                     record_type="world.causal_tick.committed",
                     actor_id=self.presence_id,
-                    payload={"presence_id": self.presence_id},
+                    payload={
+                        "presence_id": self.presence_id,
+                        **({"event_payload": event_payload} if event_payload is not None else {}),
+                    },
                 )
                 self._journal.append(record)
             except Exception as exc:
