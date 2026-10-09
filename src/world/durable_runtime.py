@@ -127,6 +127,8 @@ class DurableWorldRuntime:
             raise ValueError("presence id must not be empty")
         if manifest.world_id != world_id.value:
             raise ValueError("manifest World identity does not match runtime")
+        if presence_id not in manifest.presence_ids:
+            raise ValueError("runtime presence is not part of the durable World cut")
         if journal_store.world_id != world_id.value:
             raise ValueError("journal store World identity does not match runtime")
         if manifest.status is not ManifestStatus.COMPLETE:
@@ -161,6 +163,7 @@ class DurableWorldRuntime:
         manifest = WorldCausalManifest(
             world_id=world_id.value,
             causal_tick=0,
+            presence_ids=(presence_id,),
             checkpoint_references=references,
             journal_last_sequence=None,
             journal_prefix_sha256="",
@@ -190,6 +193,8 @@ class DurableWorldRuntime:
         manifest = manifest_store.require_active()
         if manifest.world_id != world_id.value:
             raise ManifestError("stored World identity does not match requested World")
+        if presence_id not in manifest.presence_ids:
+            raise ManifestError("requested presence is not part of the stored World cut")
         references = manifest.checkpoint_references
         journal_refs = tuple(ref for ref in references if ref.owner == _JOURNAL_OWNER)
         if len(journal_refs) != 1 or journal_refs[0].owner_identity != world_id.value:
@@ -256,6 +261,7 @@ class DurableWorldRuntime:
                 candidate = WorldCausalManifest(
                     world_id=self.world_id.value,
                     causal_tick=proposed_tick,
+                    presence_ids=current.presence_ids,
                     checkpoint_references=references,
                     journal_last_sequence=len(candidate_journal) - 1,
                     journal_prefix_sha256=candidate_journal.prefix_digest(),
