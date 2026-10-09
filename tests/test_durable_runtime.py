@@ -116,6 +116,39 @@ def test_restore_validates_world_cut_then_delegates_owner_restore(tmp_path):
         )
 
 
+def test_restore_refuses_runtime_if_owner_restore_changes_checkpoint_dependency(tmp_path):
+    world_id = WorldId("world-restore-mutated-dependency")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    owner_state = tmp_path / "organism.json"
+    owner_state.write_bytes(b"durable owner state")
+    DurableWorldRuntime.initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(owner_state),),
+        owner_checkpoint_verifier=_verifier,
+    )
+
+    def mutating_restore(_references):
+        owner_state.write_bytes(b"changed while restoring")
+
+    with pytest.raises(ManifestError, match="dependency closure changed during restore"):
+        DurableWorldRuntime.restore(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=_verifier,
+            owner_checkpoint_restorer=mutating_restore,
+        )
+
+    # Refusal is local to restore; this does not claim the manifest itself
+    # provides cross-owner recovery or a crash-consistency protocol.
+    assert manifest_store.require_active().causal_tick == 0
+
+
 def test_unverifiable_owner_checkpoint_keeps_durable_manifest_pending(tmp_path):
     world_id = WorldId("world-incomplete")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")

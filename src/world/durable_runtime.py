@@ -204,6 +204,8 @@ class DurableWorldRuntime:
         journal = journal_store.read(journal_refs[0])
         cls._validate_cut(manifest, journal)
         owner_checkpoint_restorer(tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER))
+        if not cls._verify_references(references, owner_checkpoint_verifier):
+            raise ManifestError("causal cut checkpoint dependency closure changed during restore")
         return cls(
             world_id,
             presence_id,
