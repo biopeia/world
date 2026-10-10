@@ -230,7 +230,9 @@ def _checkpoint_reference(
 
 def _fixture(root: Path) -> _Fixture:
     scene = _generated_scene()
-    environment = StaticEnvironmentOwner(scene, owner_id=ENVIRONMENT_OWNER_ID)
+    environment = StaticEnvironmentOwner(
+        scene, owner_id=ENVIRONMENT_OWNER_ID, world_id=WORLD_ID
+    )
     body = _initial_body(environment.scene)
     owner_directory = root / "owner-checkpoints"
     initial_references = (

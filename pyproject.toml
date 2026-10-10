@@ -16,10 +16,10 @@ dependencies = []
 integration = [
     "pytest>=8",
     "mujoco==3.14.0",
-    "organism @ git+https://github.com/biopeia/organism.git@f15c4c57212466c807ab198d2022e72730e21b23",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@3fe3cda64516dd5a8148ec49b826c025925396c0",
-    "environment @ git+https://github.com/biopeia/environment.git@f97ec22272b6be1e6742770e37cd370e7d96d6bc",
-    "observation @ git+https://github.com/biopeia/observation.git@cb07ace206058719a9aa9df65e2eb1f837130ee9",
+    "organism @ git+https://github.com/biopeia/organism.git@fc8a91c61d865663ba6f9468216171506fd29e7a",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@4bb43338c77379c7e89f785b8c5b10000b44cd1a",
+    "environment @ git+https://github.com/biopeia/environment.git@0a9f4fbb1922cc6ca9e7b2489cf891606ef9ee41",
+    "observation @ git+https://github.com/biopeia/observation.git@186da664cdcb04d013fb2a359913bd9b2391e07e",
 ]
 
 [tool.setuptools.packages.find]
