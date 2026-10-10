@@ -432,6 +432,14 @@ This is evidence for one controlled process-termination boundary on the CI/local
 
 This adds evidence for one process-termination point during one manifest temporary-file write on the test filesystem. It does not exercise journal or owner-checkpoint writes, a second process, power loss, storage-device failure, every publication boundary, or general crash consistency. World issue #33 remains open for its other evidence gaps.
 
+## Partial journal temporary-write interruption (World #33)
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `16414d7f5fa141251c756c8f3ae3dd28ef1a2b9e` and the ratified single-logical-writer / durable-cut contract; no historical implementation or API copied | REWRITE | A child publishes `PREPARING`, writes a candidate owner checkpoint file, and exits after writing/flushing a prefix of the candidate immutable journal snapshot temp file, before file `fsync` or hard-link publication. The previous committed journal and cut remain the only published versions. Reopen marks the transition `RECOVERY_REQUIRED`; explicit recovery restores the previous cut. The partial temp and unreferenced candidate owner file remain. The test does not fsync or claim durable publication of the candidate owner checkpoint. |
+
+This is one process-termination test for one journal temporary-file write on the exercised local filesystem. It does not cover owner-checkpoint write interruption, termination during journal fsync/link/directory fsync, second-process interaction, power loss/storage-device behavior, automatic orphan cleanup, or general crash consistency. World issue #33 remains open.
+
 ## Embodiment physical projection consumer update (Embodiment #32)
 
 | Target path | Provenance | Disposition | Notes |
