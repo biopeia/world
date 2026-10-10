@@ -1576,17 +1576,21 @@ def test_retry_after_recovery_publication_interruption_fsyncs_existing_receipt_d
 
 @pytest.mark.parametrize(
     ("boundary", "exit_code"),
-    (("before-fsync", 73), ("after-fsync-before-link", 75)),
+    (
+        ("before-fsync", 73),
+        ("after-fsync-before-link", 75),
+        ("after-link-before-directory-fsync", 77),
+    ),
 )
 def test_process_termination_during_journal_publication_keeps_previous_cut(
     tmp_path, boundary, exit_code
 ):
     """An unpublished journal candidate does not replace the prior cut.
 
-    The child exits either at the candidate temp-file fsync call or after that
-    call returns successfully but before hard-link publication. Both checks
-    exercise process termination on the current local filesystem only; they
-    are not power-loss tests.
+    The child exits at candidate file fsync, after successful file fsync but
+    before hard-link publication, or after hard-link publication but before
+    directory fsync. These checks exercise process termination on the current
+    local filesystem only; they are not power-loss tests.
     """
     world_id = WorldId("world-journal-publication-interruption")
     manifest_path = tmp_path / "manifest.json"
@@ -1694,11 +1698,17 @@ def interrupt_journal_fsync(fd):
     return original_fsync(fd)
 
 def interrupt_journal_link(source, target, *args, **kwargs):
-    if Path(target).name.startswith("journal-") and boundary == "after-fsync-before-link":
+    is_candidate_journal = Path(target).name.startswith("journal-")
+    if is_candidate_journal and boundary == "after-fsync-before-link":
         if not candidate_journal_fsynced:
             os._exit(76)
         os._exit(75)
-    return original_link(source, target, *args, **kwargs)
+    result = original_link(source, target, *args, **kwargs)
+    if is_candidate_journal and boundary == "after-link-before-directory-fsync":
+        if not candidate_journal_fsynced:
+            os._exit(78)
+        os._exit(77)
+    return result
 
 os.fdopen = track_journal_temp
 os.fsync = interrupt_journal_fsync
@@ -1738,7 +1748,16 @@ os._exit(74)
     assert preparing.causal_tick == committed_before.causal_tick
     assert preparing.commit_id == committed_before.commit_id
     assert preparing.checkpoint_references == committed_before.checkpoint_references
-    assert tuple(journal_path.glob("journal-*.json")) == initial_journals
+    published_journals = tuple(journal_path.glob("journal-*.json"))
+    if boundary == "after-link-before-directory-fsync":
+        assert len(published_journals) == len(initial_journals) + 1
+        candidate_published = tuple(path for path in published_journals if path not in initial_journals)
+        assert len(candidate_published) == 1
+        assert candidate_published[0].name.startswith("journal-1-")
+        published_candidate_records = json.loads(candidate_published[0].read_bytes())
+        assert published_candidate_records[-1]["record_id"] == f"{world_id.value}:tick:1"
+    else:
+        assert published_journals == initial_journals
     abandoned_temps = tuple(journal_path.glob(".journal-*"))
     assert len(abandoned_temps) == 1
     candidate_records = json.loads(abandoned_temps[0].read_bytes())
