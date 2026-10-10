@@ -483,3 +483,11 @@ checkpoint references are not accepted as current TARGET test data. This
 updates only World-owned test fixtures and the explicit integration pin; World
 continues to treat owner checkpoint payloads as opaque. It does not add
 checkpoint migration/fallback behavior or expand World recovery guarantees.
+
+## Second-process read during an open transition (World #33)
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `ab33cc3ee5183f7999d3a7253251b9b1c5b392af` and the ratified single-logical-writer contract; no historical implementation or API copied | REWRITE | While the writer is paused in its owner-checkpoint callback after publishing `PREPARING`, a child process reads the manifest and observes the old committed tick plus pending transition metadata. The child does not mutate the manifest or attempt recovery; after it exits, the original writer completes the commit. |
+
+This demonstrates read-only cross-process visibility of one open transition on the exercised local filesystem. It does not exercise a second writer, concurrent recovery, process termination, owner-checkpoint interruption/durability, directory-`fsync` failure, power loss/storage-device behavior, other filesystems/platforms, or general crash consistency. The single-logical-writer precondition remains in force, and World issue #33 remains open for the other evidence gaps.
