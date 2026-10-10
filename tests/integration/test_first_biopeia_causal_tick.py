@@ -318,10 +318,8 @@ def _run_three_ticks() -> tuple[OrganismIdentity, tuple[TickSnapshot, ...]]:
                 "run_id": "deterministic-fixture",
                 "sequence": record.causal_tick,
                 "tick": record.causal_tick,
-                "world_record_id": record.record_id,
                 "body_kind": "synthetic-fixture",
                 "body_age_ticks": body.age_ticks,
-                "metabolic_reserve_ratio": body.energy_reserve / body.max_energy,
                 "cognitive_readouts": 1,
             }
         )
