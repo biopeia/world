@@ -22,6 +22,7 @@ from typing import Callable
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SCHEMA_VERSION = 4
 _JOURNAL_OWNER = "world-journal"
+_RECOVERY_RECEIPT_SCHEMA = "world-recovery-receipt-v2"
 
 
 class ManifestStatus(str, Enum):
@@ -274,6 +275,26 @@ class WorldCausalManifestStore:
                 pending_transition_id=transition_id,
                 pending_tick=current.causal_tick + 1,
             )
+            receipt_path = self._recovery_receipt_path(
+                pending.world_id, transition_id, pending.pending_tick
+            )
+            if receipt_path.exists():
+                try:
+                    receipt = json.loads(receipt_path.read_bytes())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ManifestError("existing recovery receipt is invalid") from exc
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("schema_version") != _RECOVERY_RECEIPT_SCHEMA
+                    or receipt.get("world_id") != pending.world_id
+                    or receipt.get("transition_id") != transition_id
+                    or receipt.get("pending_tick") != pending.pending_tick
+                ):
+                    raise ManifestError("existing recovery receipt identity is invalid")
+                if receipt.get("pending_transition_sha256") != _recovery_transition_digest(pending):
+                    raise ManifestError(
+                        "recovered transition identity cannot be reused with different proposed state"
+                    )
             self._write(pending)
             return pending
 
@@ -370,14 +391,16 @@ class WorldCausalManifestStore:
             presence_owner_links=pending.presence_owner_links,
             step_participant_ids=pending.step_participant_ids,
         )
-        pending_bytes = _canonical_bytes(_manifest_to_data(pending))
+        pending_transition_sha256 = _recovery_transition_digest(pending)
         recovered_bytes = _canonical_bytes(_manifest_to_data(recovered))
         receipt = _canonical_bytes(
             {
+                "schema_version": _RECOVERY_RECEIPT_SCHEMA,
                 "world_id": pending.world_id,
                 "transition_id": transition_id,
+                "pending_tick": pending.pending_tick,
                 "restored_causal_tick": pending.causal_tick,
-                "pending_manifest_sha256": hashlib.sha256(pending_bytes).hexdigest(),
+                "pending_transition_sha256": pending_transition_sha256,
                 "recovered_manifest_sha256": hashlib.sha256(recovered_bytes).hexdigest(),
             }
         )
@@ -386,10 +409,18 @@ class WorldCausalManifestStore:
         # Persist the new directory entry before making a receipt inside it
         # eligible for manifest publication.
         _fsync_directory(receipt_dir.parent)
-        receipt_name = hashlib.sha256(transition_id.encode("utf-8")).hexdigest() + ".json"
-        _write_immutable(receipt_dir / receipt_name, receipt)
+        receipt_path = self._recovery_receipt_path(
+            pending.world_id, transition_id, pending.pending_tick
+        )
+        _write_immutable(receipt_path, receipt)
         self._write(recovered)
         return recovered
+
+    def _recovery_receipt_path(self, world_id: str, transition_id: str, pending_tick: int) -> Path:
+        identity = _canonical_bytes(
+            {"world_id": world_id, "transition_id": transition_id, "pending_tick": pending_tick}
+        )
+        return self.path.parent / "recoveries" / f"{hashlib.sha256(identity).hexdigest()}.json"
 
     def _write(self, manifest: WorldCausalManifest) -> None:
         if manifest.status is ManifestStatus.COMMITTED:
@@ -426,6 +457,14 @@ class WorldCausalManifestStore:
 
 def _canonical_bytes(data: dict) -> bytes:
     return (json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def _recovery_transition_digest(manifest: WorldCausalManifest) -> str:
+    """Hash the proposed transition while excluding mutable recovery diagnostics."""
+    data = _manifest_to_data(manifest)
+    data.pop("failure", None)
+    data.pop("status", None)
+    return hashlib.sha256(_canonical_bytes(data)).hexdigest()
 
 
 def _require_owner_state(manifest: WorldCausalManifest) -> None:
