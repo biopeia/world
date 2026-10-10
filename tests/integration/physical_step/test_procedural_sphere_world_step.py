@@ -71,6 +71,12 @@ from world.manifest import (
     ManifestStatus,
     WorldCausalManifestStore,
 )
+from world.physical_step import (
+    PhysicalStepCandidate,
+    PhysicalStepContext,
+    PhysicalStepPorts,
+    run_physical_step,
+)
 from world.runtime import PresenceId, WorldId
 
 WORLD_ID = "world.procedural-sphere-e2e"
@@ -471,23 +477,30 @@ def _world_verifier(contracts: dict[tuple[str, str], _FixtureOwnerContract]):
 def _advance_and_commit(fixture: _Fixture, *, world_tick: int):
     staged: dict[str, object] = {}
 
-    def persist(causal_tick: int) -> tuple[CheckpointReference, ...]:
-        assert causal_tick == world_tick
+    def project_body(context: PhysicalStepContext):
+        assert context.target_causal_tick == world_tick
         correlation = PhysicalStepCorrelation(
-            world_id=WORLD_ID,
-            causal_tick=causal_tick - 1,
-            physical_step_id=f"physical-step-{causal_tick}",
-            body_id=BODY_ID,
-            embodiment_episode_id=EPISODE_ID,
-            morphology_revision=MORPHOLOGY_REVISION,
-            environment_revision=ENVIRONMENT_REVISION,
-            solver_config_revision=SOLVER_CONFIGURATION_REVISION,
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            body_id=context.body_id,
+            embodiment_episode_id=context.embodiment_episode_id,
+            morphology_revision=context.morphology_revision,
+            environment_revision=context.environment_revision,
+            solver_config_revision=context.solver_config_revision,
         )
         assert correlation.causal_tick == fixture.body.causal_tick
-        body_input = project_body_physical_input(
+        staged["correlation"] = correlation
+        return project_body_physical_input(
             _projectable_body_state(fixture.body, _body_spec()),
             correlation=correlation,
         )
+
+    def project_environment(context: PhysicalStepContext):
+        assert context.environment_revision == fixture.environment.scene.environment_revision
+        return fixture.environment.scene
+
+    def execute_solver(context, body_input, scene):
         (
             position_m,
             orientation_xyzw,
@@ -495,7 +508,9 @@ def _advance_and_commit(fixture: _Fixture, *, world_tick: int):
             angular_velocity_rad_per_s,
             contacted_sphere_ids,
             geom_names,
-        ) = _execute_mujoco_step(body_input, fixture.environment.scene)
+        ) = _execute_mujoco_step(body_input, scene)
+        correlation = staged["correlation"]
+        assert isinstance(correlation, PhysicalStepCorrelation)
         body_candidate = SolverBodyCandidate(
             correlation=correlation,
             reference_frame=body_input.reference_frame,
@@ -505,32 +520,46 @@ def _advance_and_commit(fixture: _Fixture, *, world_tick: int):
             linear_velocity_m_per_s=linear_velocity_m_per_s,
             angular_velocity_rad_per_s=angular_velocity_rad_per_s,
         )
-        next_body = fixture.body.adopt_candidate(body_candidate, expected_step=correlation)
         environment_correlation = EnvironmentStepCorrelation(
-            world_id=correlation.world_id,
-            causal_tick=correlation.causal_tick,
-            physical_step_id=correlation.physical_step_id,
-            environment_id=fixture.environment.scene.environment_id,
-            environment_revision=fixture.environment.scene.environment_revision,
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            environment_id=scene.environment_id,
+            environment_revision=context.environment_revision,
         )
-        fixture.environment.validate_and_adopt(
-            StaticSceneCandidate(environment_correlation, project_static_scene(fixture.environment.scene)),
-            expected_correlation=environment_correlation,
-        )
-        assert next_body.causal_tick == causal_tick
-        assert fixture.environment.last_adopted_tick == causal_tick - 1
         staged.update(
-            correlation=correlation,
-            body=next_body,
             contacted_sphere_ids=contacted_sphere_ids,
             geom_names=geom_names,
+            environment_correlation=environment_correlation,
         )
+        environment_candidate = StaticSceneCandidate(
+            environment_correlation, project_static_scene(scene)
+        )
+        return PhysicalStepCandidate(body_candidate, environment_candidate)
+
+    def adopt_body(context: PhysicalStepContext, candidate: SolverBodyCandidate):
+        next_body = fixture.body.adopt_candidate(candidate, world_context=context)
+        assert next_body.causal_tick == context.target_causal_tick
+        staged["body"] = next_body
+
+    def adopt_environment(context, candidate: StaticSceneCandidate):
+        environment_correlation = staged["environment_correlation"]
+        assert isinstance(environment_correlation, EnvironmentStepCorrelation)
+        fixture.environment.validate_and_adopt(
+            candidate,
+            expected_correlation=environment_correlation,
+        )
+
+    def write_checkpoints(context: PhysicalStepContext):
+        next_body = staged["body"]
+        assert isinstance(next_body, EmbodimentPhysicalState)
+        assert fixture.environment.last_adopted_tick == context.source_causal_tick
         return (
             _checkpoint_reference(
                 fixture.owner_directory,
                 owner="embodiment",
                 owner_identity=BODY_ID,
-                checkpoint_id=f"tick-{causal_tick}",
+                checkpoint_id=f"tick-{context.target_causal_tick}",
                 schema="embodiment-physical-state-v2",
                 encoded=next_body.checkpoint_bytes(),
             ),
@@ -538,13 +567,31 @@ def _advance_and_commit(fixture: _Fixture, *, world_tick: int):
                 fixture.owner_directory,
                 owner="environment",
                 owner_identity=ENVIRONMENT_OWNER_ID,
-                checkpoint_id=f"tick-{causal_tick}",
+                checkpoint_id=f"tick-{context.target_causal_tick}",
                 schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
                 encoded=fixture.environment.checkpoint_bytes(),
             ),
         )
 
-    record = fixture.runtime.tick(f"physical-sphere-commit-{world_tick}", persist)
+    ports = PhysicalStepPorts(
+        project_body=project_body,
+        project_environment=project_environment,
+        execute_solver=execute_solver,
+        adopt_body=adopt_body,
+        adopt_environment=adopt_environment,
+        write_checkpoints=write_checkpoints,
+    )
+    record = run_physical_step(
+        fixture.runtime,
+        commit_id=f"physical-sphere-commit-{world_tick}",
+        physical_step_id=f"physical-step-{world_tick}",
+        body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision=SOLVER_CONFIGURATION_REVISION,
+        ports=ports,
+    )
     assert fixture.runtime.status is ManifestStatus.COMMITTED
     assert fixture.runtime.causal_tick == world_tick == record.causal_tick
     return staged
@@ -745,8 +792,8 @@ def test_stale_morphology_candidate_cannot_commit_sphere_step(tmp_path: Path) ->
     scene_before = fixture.environment.scene
     adopted: list[EmbodimentPhysicalState] = []
 
-    def reject_stale_candidate(causal_tick: int) -> tuple[CheckpointReference, ...]:
-        assert causal_tick == 1
+    def reject_stale_candidate(context: PhysicalStepContext) -> SolverBodyCandidate:
+        assert context.target_causal_tick == 1
         candidate = SolverBodyCandidate(
             correlation=stale,
             reference_frame=FRAME_ID,
@@ -756,11 +803,36 @@ def test_stale_morphology_candidate_cannot_commit_sphere_step(tmp_path: Path) ->
             linear_velocity_m_per_s=(0.0, 0.0, 0.0),
             angular_velocity_rad_per_s=(0.0, 0.0, 0.0),
         )
-        adopted.append(fixture.body.adopt_candidate(candidate, expected_step=expected))
-        raise AssertionError("stale morphology candidate must be rejected before checkpoint writes")
+        return candidate
 
-    with pytest.raises(ValueError, match="authorized physical step"):
-        fixture.runtime.tick("physical-sphere-stale-morphology", reject_stale_candidate)
+    def reject_stale_adoption(context, candidate):
+        adopted.append(fixture.body.adopt_candidate(candidate, world_context=context))
+
+    ports = PhysicalStepPorts(
+        project_body=lambda _context: None,
+        project_environment=lambda _context: None,
+        execute_solver=lambda context, _body, _environment: PhysicalStepCandidate(
+            reject_stale_candidate(context), None
+        ),
+        adopt_body=reject_stale_adoption,
+        adopt_environment=lambda _context, _candidate: None,
+        write_checkpoints=lambda _context: pytest.fail(
+            "stale candidate reached checkpoint writing"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="World physical-step context"):
+        run_physical_step(
+            fixture.runtime,
+            commit_id="physical-sphere-stale-morphology",
+            physical_step_id=expected.physical_step_id,
+            body_id=BODY_ID,
+            embodiment_episode_id=EPISODE_ID,
+            morphology_revision=MORPHOLOGY_REVISION,
+            environment_revision=ENVIRONMENT_REVISION,
+            solver_config_revision=SOLVER_CONFIGURATION_REVISION,
+            ports=ports,
+        )
 
     manifest = fixture.manifest_store.read()
     assert manifest.status is ManifestStatus.RECOVERY_REQUIRED
