@@ -1574,15 +1574,21 @@ def test_retry_after_recovery_publication_interruption_fsyncs_existing_receipt_d
     assert fsynced_directories[-1] == tmp_path
 
 
-def test_process_termination_before_journal_file_fsync_keeps_previous_cut(tmp_path):
-    """A complete candidate journal temp is not committed before file fsync.
+@pytest.mark.parametrize(
+    ("boundary", "exit_code"),
+    (("before-fsync", 73), ("after-fsync-before-link", 75)),
+)
+def test_process_termination_during_journal_publication_keeps_previous_cut(
+    tmp_path, boundary, exit_code
+):
+    """An unpublished journal candidate does not replace the prior cut.
 
-    The child exits when World calls fsync on the candidate journal temp,
-    after the complete JSON payload has been written and flushed but before
-    that fsync call can complete. This exercises process termination on the
-    current local filesystem only; it is not a power-loss test.
+    The child exits either at the candidate temp-file fsync call or after that
+    call returns successfully but before hard-link publication. Both checks
+    exercise process termination on the current local filesystem only; they
+    are not power-loss tests.
     """
-    world_id = WorldId("world-journal-fsync-interruption")
+    world_id = WorldId("world-journal-publication-interruption")
     manifest_path = tmp_path / "manifest.json"
     journal_path = tmp_path / "journal"
     manifest_store = WorldCausalManifestStore(manifest_path)
@@ -1618,7 +1624,8 @@ from world import (
 )
 
 root = Path(sys.argv[1])
-world_id = WorldId("world-journal-fsync-interruption")
+boundary = sys.argv[2]
+world_id = WorldId("world-journal-publication-interruption")
 manifest_store = WorldCausalManifestStore(root / "manifest.json")
 
 def verify(references):
@@ -1647,8 +1654,10 @@ runtime = DurableWorldRuntime.restore(
 
 original_fdopen = os.fdopen
 original_fsync = os.fsync
+original_link = os.link
 fdopen_calls = 0
 journal_fd = None
+candidate_journal_fsynced = False
 class TrackingWriter:
     def __init__(self, fd, mode):
         self.stream = original_fdopen(fd, mode)
@@ -1675,12 +1684,25 @@ def track_journal_temp(fd, mode):
     return original_fdopen(fd, mode)
 
 def interrupt_journal_fsync(fd):
+    global candidate_journal_fsynced
     if fd == journal_fd:
-        os._exit(73)
+        if boundary == "before-fsync":
+            os._exit(73)
+        result = original_fsync(fd)
+        candidate_journal_fsynced = True
+        return result
     return original_fsync(fd)
+
+def interrupt_journal_link(source, target, *args, **kwargs):
+    if Path(target).name.startswith("journal-") and boundary == "after-fsync-before-link":
+        if not candidate_journal_fsynced:
+            os._exit(76)
+        os._exit(75)
+    return original_link(source, target, *args, **kwargs)
 
 os.fdopen = track_journal_temp
 os.fsync = interrupt_journal_fsync
+os.link = interrupt_journal_link
 
 def write_candidate_owner(tick):
     assert tick == 1
@@ -1697,11 +1719,11 @@ def write_candidate_owner(tick):
         sha256=sha256(state.read_bytes()).hexdigest(),
     ),)
 
-runtime.tick("transition-interrupted-before-journal-fsync", write_candidate_owner)
+runtime.tick(f"transition-interrupted-{boundary}", write_candidate_owner)
 os._exit(74)
 """
     result = subprocess.run(
-        [sys.executable, "-c", child, str(tmp_path)],
+        [sys.executable, "-c", child, str(tmp_path), boundary],
         cwd=Path(__file__).resolve().parents[1],
         env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
         capture_output=True,
@@ -1709,7 +1731,7 @@ os._exit(74)
         timeout=15,
         check=False,
     )
-    assert result.returncode == 73, result.stderr
+    assert result.returncode == exit_code, result.stderr
 
     preparing = manifest_store.read()
     assert preparing.status is ManifestStatus.PREPARING

@@ -448,6 +448,14 @@ This is one process-termination test for one journal temporary-file write on the
 
 This adds evidence for process termination immediately before the candidate journal temporary-file `fsync` call on the exercised local filesystem. It does not prove the completed write survives power loss, that `fsync` itself succeeds or is durable on other filesystems, or behavior after successful file `fsync` and during hard-link/directory `fsync`. It does not cover owner-checkpoint write interruption, second-process interaction, power loss/storage-device behavior, orphan cleanup, or general crash consistency. World issue #33 remains open.
 
+## Journal file fsync returned before hard-link publication (World #33)
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `98e3bf4299e1da95d3688f56bbbc067e13240d33` and the ratified single-logical-writer / durable-cut contract; no historical implementation or API copied | REWRITE | A parameterized subprocess test covers both termination at the candidate journal temporary-file `fsync` call and termination after that call returns successfully but before hard-link publication. For the post-fsync case, the child invokes the real `fsync` on the candidate journal file, confirms its return, then exits at the attempted hard link. In both cases the previously published manifest and journal set remain unchanged; reopening requires explicit recovery, which restores the previous cut. The candidate journal temporary file and owner file may remain; owner-checkpoint durability is not claimed. |
+
+This adds process-termination evidence for one post-successful-file-`fsync`, pre-hard-link boundary on the exercised local filesystem. It does not test termination after hard-link publication or during directory `fsync`, power loss/storage-device persistence, owner-checkpoint write interruption or durability, second-process interaction, orphan cleanup, other filesystem/platform behavior, or general crash consistency. World issue #33 remains open.
+
 ## Embodiment physical projection consumer update (Embodiment #32)
 
 | Target path | Provenance | Disposition | Notes |
