@@ -30,14 +30,21 @@ from world import (
 def _initialize(
     world_id, presence_id, manifest_store, journal_store, *,
     initial_owner_references, registered_owner_ids, owner_checkpoint_verifier,
-    owner_checkpoint_contracts,
+    owner_checkpoint_contracts, presence_owner_links=None,
 ):
+    owner_ids = tuple(registered_owner_ids)
+    if presence_owner_links is None:
+        if len(owner_ids) != 1:
+            raise AssertionError("tests with multiple owners must declare the presence owner explicitly")
+        owner, identity = owner_ids[0]
+        presence_owner_links = (PresenceOwnerLink(PresenceId(presence_id), owner, identity),)
     genesis = WorldGenesisSpec(
         world_id=world_id,
         initial_presence_ids=(presence_id,),
         registered_owner_ids=tuple(registered_owner_ids),
         initial_owner_references=tuple(initial_owner_references),
         owner_checkpoint_contracts=owner_checkpoint_contracts,
+        presence_owner_links=presence_owner_links,
     )
     return DurableWorldRuntime.initialize(
         genesis, presence_id, manifest_store, journal_store,
@@ -371,6 +378,7 @@ os._exit(74)  # Defensive: the callback must terminate before tick returns.
     assert recovered.status is ManifestStatus.COMMITTED
     assert recovered.causal_tick == committed_before.causal_tick
     assert recovered.manifest.commit_id == committed_before.commit_id
+    assert recovered.manifest.presence_owner_links == committed_before.presence_owner_links
 
     owner_one = tmp_path / "owner-1.json"
     owner_one.write_bytes(b"owner state after explicit recovery")
@@ -521,7 +529,7 @@ def test_owner_causal_record_is_not_committed_when_manifest_publication_fails(tm
     assert tuple((tmp_path / "journal").glob("journal-1-*.json"))
 
 
-def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
+def test_genesis_requires_presence_owner_and_durable_checkpoint_closure(tmp_path):
     world_id = WorldId("world-owner-closure")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
@@ -533,9 +541,9 @@ def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):
             manifest_store,
             journal_store,
             initial_owner_references=(),
-            registered_owner_ids=(),
+            registered_owner_ids=(("organism", "organism-identity"),),
             owner_checkpoint_verifier=_verifier,
-            owner_checkpoint_contracts={},
+            owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
         )
 
     initial_owner = tmp_path / "organism-0.json"
@@ -592,12 +600,57 @@ def test_genesis_spec_is_authoritative_input_for_tick_zero_roster(tmp_path):
 
     assert runtime.manifest.presence_ids == ("presence-a", "presence-b")
     assert runtime.manifest.registered_owner_ids == owners
+    expected_links = (
+        ("presence-a", "organism", "organism-identity"),
+        ("presence-b", "embodiment", "embodiment-identity"),
+    )
+    assert runtime.manifest.presence_owner_links == expected_links
+    assert store.read().presence_owner_links == expected_links
+    old_schema_data = manifest_module._manifest_to_data(runtime.manifest)
+    old_schema_data["schema_version"] = 3
+    with pytest.raises(ValueError, match="unsupported manifest schema version: 3"):
+        manifest_module._manifest_from_data(old_schema_data)
+    historical_v3_data = dict(old_schema_data)
+    historical_v3_data.pop("presence_owner_links")
+    historical_v3_data.pop("pending_presence_owner_links")
+    with pytest.raises(ValueError, match="manifest fields do not match schema"):
+        manifest_module._manifest_from_data(historical_v3_data)
     assert frozenset((ref.owner, ref.owner_identity) for ref in runtime.manifest.checkpoint_references if ref.owner != "world-journal") == frozenset(owners)
 
     with pytest.raises(ManifestError, match="accepted World genesis spec"):
         DurableWorldRuntime.initialize(
             spec, "presence-outside-genesis", store, journal,
             owner_checkpoint_verifier=_verifier,
+        )
+
+
+def test_genesis_requires_explicit_unique_links_to_registered_owners():
+    world_id = WorldId("world-genesis-presence-links")
+    owners = (("organism", "organism-identity"),)
+    base = {
+        "world_id": world_id,
+        "initial_presence_ids": ("presence-a",),
+        "registered_owner_ids": owners,
+        "initial_owner_references": (),
+        "owner_checkpoint_contracts": {},
+    }
+
+    with pytest.raises(ValueError, match="cover each genesis presence exactly once"):
+        WorldGenesisSpec(**base)
+    with pytest.raises(ValueError, match="cover each genesis presence exactly once"):
+        WorldGenesisSpec(
+            **base,
+            presence_owner_links=(
+                PresenceOwnerLink(PresenceId("presence-a"), "organism", "organism-identity"),
+                PresenceOwnerLink(PresenceId("presence-a"), "organism", "organism-identity"),
+            ),
+        )
+    with pytest.raises(ValueError, match="target a registered genesis owner"):
+        WorldGenesisSpec(
+            **base,
+            presence_owner_links=(
+                PresenceOwnerLink(PresenceId("presence-a"), "environment", "environment-identity"),
+            ),
         )
 
 
@@ -716,18 +769,88 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
     )
     next_owner = tmp_path / "owner-next.json"
     next_owner.write_bytes(b"owner-next")
+    # A presence without an explicitly registered owner is not a valid roster
+    # transition, and must be rejected before World publishes PREPARING.
+    with pytest.raises(ManifestError, match="exactly one registered causal owner"):
+        runtime.tick(
+            "presence-join-without-owner",
+            lambda _tick: (_checkpoint(next_owner),),
+            register_presence=("presence-b",),
+        )
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert runtime.manifest.presence_ids == ("presence-a",)
+
+    def interrupt_join(_tick):
+        raise RuntimeError("presence owner adoption interrupted")
+
+    with pytest.raises(RuntimeError, match="presence owner adoption interrupted"):
+        runtime.tick(
+            "presence-join-interrupted",
+            interrupt_join,
+            register_presence=("presence-b",),
+            register_owners=(("embodiment", "embodiment-identity"),),
+            presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "embodiment", "embodiment-identity"),),
+            register_owner_contracts=_contracts(("embodiment", "embodiment-identity")),
+        )
+    pending = store.read()
+    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
+    assert pending.pending_presence_owner_links == (
+        ("presence-a", "organism", "organism-identity"),
+        ("presence-b", "embodiment", "embodiment-identity"),
+    )
+    runtime = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        store,
+        journal,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+        owner_checkpoint_restorer=lambda _references: None,
+    )
+    assert runtime.manifest.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
+
+    body = tmp_path / "body-next.json"
+    body.write_bytes(b"body-next")
     runtime.tick(
         "presence-join",
-        lambda _tick: (_checkpoint(next_owner),),
+        lambda _tick: (_checkpoint(next_owner), _checkpoint(body, owner="embodiment")),
         register_presence=("presence-b",),
+        register_owners=(("embodiment", "embodiment-identity"),),
+        presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "embodiment", "embodiment-identity"),),
+        register_owner_contracts=_contracts(("embodiment", "embodiment-identity")),
     )
     assert runtime.manifest.presence_ids == ("presence-a", "presence-b")
+    assert runtime.manifest.presence_owner_links == (
+        ("presence-a", "organism", "organism-identity"),
+        ("presence-b", "embodiment", "embodiment-identity"),
+    )
+    with pytest.raises(ManifestError, match="each active presence owner must be in the proposed registered owner roster"):
+        runtime.tick(
+            "unregister-linked-owner",
+            lambda _tick: (_checkpoint(next_owner),),
+            unregister_owners=(("embodiment", "embodiment-identity"),),
+        )
+    assert runtime.manifest.presence_ids == ("presence-a", "presence-b")
+
+    # An owner may own multiple presences when the relationship is explicit.
+    runtime.tick(
+        "reassign-presence-owner",
+        lambda _tick: (_checkpoint(next_owner), _checkpoint(body, owner="embodiment")),
+        presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "organism", "organism-identity"),),
+    )
+    assert runtime.manifest.presence_owner_links == (
+        ("presence-a", "organism", "organism-identity"),
+        ("presence-b", "organism", "organism-identity"),
+    )
     runtime.tick(
         "presence-leave",
         lambda _tick: (_checkpoint(next_owner),),
         unregister_presence=("presence-b",),
+        unregister_owners=(("embodiment", "embodiment-identity"),),
     )
     assert runtime.manifest.presence_ids == ("presence-a",)
+    assert runtime.manifest.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
 
 
 def test_failed_registration_keeps_prior_cut_and_pending_roster_for_recovery(tmp_path):
@@ -798,57 +921,59 @@ def test_restore_and_recovery_reject_publicly_published_cuts_without_owner_state
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     journal_reference = journal_store.write(EventJournal(), causal_tick=0)
-    journal_only = WorldCausalManifest(
-        world_id=world_id.value,
-        causal_tick=0,
-        presence_ids=("presence-a",),
-        checkpoint_references=(journal_reference,),
-        journal_last_sequence=None,
-        journal_prefix_sha256="",
-        commit_id="genesis:world-journal-only",
+    owner_state = tmp_path / "owner.json"
+    owner_state.write_bytes(b"valid owner")
+    valid_runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(owner_state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
     )
+    valid_data = manifest_module._manifest_to_data(valid_runtime.manifest)
+    journal_only_data = dict(valid_data)
+    journal_only_data["checkpoint_references"] = [
+        {
+            "owner": journal_reference.owner,
+            "owner_identity": journal_reference.owner_identity,
+            "checkpoint_id": journal_reference.checkpoint_id,
+            "schema_version": journal_reference.schema_version,
+            "locator": journal_reference.locator,
+            "sha256": journal_reference.sha256,
+        }
+    ]
+    with pytest.raises(ValueError, match="owner checkpoint references must exactly match"):
+        manifest_module._manifest_from_data(journal_only_data)
 
-    # The internal persistence operation rejects this cut. Also exercise restore
-    # fail-closed against an invalid/legacy on-disk manifest that bypasses it.
-    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
-        manifest_store._initialize(journal_only)
-    manifest_store.path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_store.path.write_text(
-        json.dumps(manifest_module._manifest_to_data(journal_only)), encoding="utf-8"
-    )
-    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
-        DurableWorldRuntime.restore(
-            world_id,
-            "presence-a",
-            manifest_store,
-            journal_store,
-            owner_checkpoint_verifier=lambda references: not references,
-            owner_checkpoint_contracts={},
-            owner_checkpoint_restorer=lambda _references: None,
-        )
+    # Simulate a pending manifest that has lost its durable owner checkpoint.
+    pending_journal_only_data = dict(journal_only_data)
+    pending_journal_only_data.update({
+        "status": ManifestStatus.RECOVERY_REQUIRED.value,
+        "pending_transition_id": "transition-pending",
+        "pending_tick": 1,
+        "failure": "simulated missing owner state",
+        "pending_registered_owner_ids": [["organism", "organism-identity"]],
+        "pending_presence_owner_links": [["presence-a", "organism", "organism-identity"]],
+        "pending_step_participant_ids": [],
+        "pending_presence_ids": ["presence-a"],
+    })
+    with pytest.raises(ValueError, match="owner checkpoint references must exactly match"):
+        manifest_module._manifest_from_data(pending_journal_only_data)
 
-    pending_journal_only = WorldCausalManifest(
-        world_id=world_id.value,
-        causal_tick=0,
-        presence_ids=("presence-a",),
-        checkpoint_references=(journal_reference,),
-        journal_last_sequence=None,
-        journal_prefix_sha256="",
-        commit_id="genesis:world-journal-only",
-        status=ManifestStatus.RECOVERY_REQUIRED,
-        pending_transition_id="transition-pending",
-        pending_tick=1,
-    )
-    manifest_store._write(pending_journal_only)
-    with pytest.raises(ManifestError, match="at least one durable owner checkpoint"):
-        DurableWorldRuntime.recover_previous_cut(
-            world_id,
-            "presence-a",
-            manifest_store,
-            journal_store,
-            owner_checkpoint_verifier=lambda references: not references,
-            owner_checkpoint_contracts={},
-            owner_checkpoint_restorer=lambda _references: None,
+    # The constructor boundary is now strict: an invalid active-presence cut
+    # without its one-owner link cannot be represented as a TARGET manifest.
+    with pytest.raises(ValueError, match="exactly one owner link per active presence"):
+        WorldCausalManifest(
+            world_id=world_id.value,
+            causal_tick=0,
+            presence_ids=("presence-a",),
+            checkpoint_references=(journal_reference,),
+            journal_last_sequence=None,
+            journal_prefix_sha256="",
+            commit_id="genesis:world-journal-only",
         )
 
 
@@ -1023,6 +1148,7 @@ def test_explicit_recovery_restores_prior_cut_through_owner_and_records_receipt(
     assert recovered.status is ManifestStatus.COMMITTED
     assert recovered.causal_tick == 0
     assert recovered.records == ()
+    assert recovered.manifest.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
     assert manifest_store._require_active() == recovered.manifest
 
     receipt_files = tuple((tmp_path / "recoveries").glob("*.json"))
