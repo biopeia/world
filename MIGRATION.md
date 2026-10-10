@@ -422,7 +422,15 @@ This capability is not a Lab evidence registry. A Lab record may preserve an int
 | --- | --- | --- | --- |
 | `tests/test_durable_runtime.py` | New Biopeia TARGET test, based on the ratified single-logical-writer and explicit-recovery contracts; no historical implementation or API copied | REWRITE | A child process starts from an existing committed cut, reaches the owner callback only after the store reports `PREPARING`, then terminates via `os._exit` before candidate owner state, journal prefix, or `COMMITTED` manifest publication. A fresh runtime restore detects the stranded prepare, retains the prior tick/commit/references as `RECOVERY_REQUIRED`, refuses ordinary restore, and succeeds only after explicit `recover_previous_cut`; a subsequent tick then commits. |
 
-This is evidence for one controlled process-termination boundary on the CI/local filesystem, not power-loss testing, filesystem/platform durability validation, multi-writer coordination, or a general crash-consistency guarantee. The test does not terminate during an individual filesystem write and does not claim every publication boundary is covered.
+This is evidence for one controlled process-termination boundary on the CI/local filesystem, not power-loss testing, filesystem/platform durability validation, multi-writer coordination, or a general crash-consistency guarantee. The first test does not terminate during an individual filesystem write and does not claim every publication boundary is covered.
+
+## Partial manifest temporary-write interruption (World #33)
+
+| Target path | Source/provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `cb6bfb7c9bccd16c2f85f0f24deba1a12bfc80c8` and the ratified single-logical-writer / durable-cut contract; no historical implementation or API copied | REWRITE | A child restores a committed tick-zero cut, begins a transition, and exits while only a prefix of the `PREPARING` manifest has been written to its temporary file, before file `fsync` or atomic replacement. The test verifies the old `COMMITTED` manifest remains intact and a fresh runtime restores that prior cut; the incomplete temporary file remains. |
+
+This adds evidence for one process-termination point during one manifest temporary-file write on the test filesystem. It does not exercise journal or owner-checkpoint writes, a second process, power loss, storage-device failure, every publication boundary, or general crash consistency. World issue #33 remains open for its other evidence gaps.
 
 ## Embodiment physical projection consumer update (Embodiment #32)
 
