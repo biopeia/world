@@ -463,6 +463,142 @@ os._exit(74)  # Defensive: the callback must terminate before tick returns.
     assert resumed.causal_tick == 1
     assert recovered.status is ManifestStatus.COMMITTED
 
+def test_process_termination_during_partial_owner_checkpoint_write_requires_recovery(tmp_path):
+    """An interrupted owner write cannot become the committed next cut.
+
+    The writer exits after emitting only a prefix of a candidate owner
+    checkpoint from the callback. World has already published PREPARING, but
+    the callback never returns a reference and no candidate journal or
+    COMMITTED manifest is published. This is process-termination evidence on
+    the exercised local filesystem, not proof of owner-file durability or
+    power-loss behavior.
+    """
+    world_id = WorldId("world-partial-owner-checkpoint-write")
+    manifest_path = tmp_path / "manifest.json"
+    journal_path = tmp_path / "journal"
+    manifest_store = WorldCausalManifestStore(manifest_path)
+    journal_store = DurableJournalSnapshotStore(journal_path, world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"committed owner state at tick zero")
+    contracts = _contracts(("organism", "organism-identity"))
+    _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    committed_before = manifest_store.read()
+    initial_journals = tuple(journal_path.glob("journal-*.json"))
+    assert committed_before.status is ManifestStatus.COMMITTED
+    assert committed_before.causal_tick == 0
+    assert len(initial_journals) == 1
+
+    child = r"""
+import os
+import sys
+from pathlib import Path
+from world import (
+    DurableJournalSnapshotStore,
+    DurableWorldRuntime,
+    WorldCausalManifestStore,
+    WorldId,
+)
+
+root = Path(sys.argv[1])
+world_id = WorldId("world-partial-owner-checkpoint-write")
+manifest_store = WorldCausalManifestStore(root / "manifest.json")
+
+def verify(references):
+    import hashlib
+    return all(
+        Path(ref.locator).is_file()
+        and hashlib.sha256(Path(ref.locator).read_bytes()).hexdigest() == ref.sha256
+        for ref in references
+    )
+
+class Contract:
+    def validate_checkpoint(self, encoded, owner_identity, schema_version):
+        return bool(encoded) and owner_identity == "organism-identity" and schema_version == "v1"
+    def verify_restoration(self, encoded, owner_identity, schema_version):
+        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+
+runtime = DurableWorldRuntime.restore(
+    world_id,
+    "presence-a",
+    manifest_store,
+    DurableJournalSnapshotStore(root / "journal", world_id),
+    owner_checkpoint_verifier=verify,
+    owner_checkpoint_contracts={("organism", "organism-identity"): Contract()},
+    owner_checkpoint_restorer=lambda _refs: None,
+)
+
+def write_partial_owner_checkpoint(tick):
+    assert tick == 1
+    payload = b"candidate owner state at tick one"
+    fd = os.open(root / "owner-1.json", os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    os.write(fd, payload[:12])
+    os._exit(73)
+
+runtime.tick("transition-interrupted-mid-owner-write", write_partial_owner_checkpoint)
+os._exit(74)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 73, result.stderr
+
+    candidate_owner = tmp_path / "owner-1.json"
+    assert candidate_owner.read_bytes() == b"candidate ow"
+    preparing = manifest_store.read()
+    assert preparing.status is ManifestStatus.PREPARING
+    assert preparing.causal_tick == committed_before.causal_tick
+    assert preparing.commit_id == committed_before.commit_id
+    assert preparing.checkpoint_references == committed_before.checkpoint_references
+    assert tuple(journal_path.glob("journal-*.json")) == initial_journals
+
+    with pytest.raises(ManifestRecoveryRequiredError):
+        DurableWorldRuntime.restore(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=_verifier,
+            owner_checkpoint_contracts=contracts,
+            owner_checkpoint_restorer=lambda _refs: None,
+        )
+
+    pending = manifest_store.read()
+    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.causal_tick == committed_before.causal_tick
+    assert pending.commit_id == committed_before.commit_id
+    assert pending.checkpoint_references == committed_before.checkpoint_references
+
+    recovered = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda references: references == tuple(
+            ref for ref in committed_before.checkpoint_references if ref.owner != "world-journal"
+        ) or pytest.fail("explicit recovery did not restore the prior owner cut"),
+    )
+    assert recovered.status is ManifestStatus.COMMITTED
+    assert recovered.causal_tick == committed_before.causal_tick
+    assert recovered.manifest.commit_id == committed_before.commit_id
+    assert recovered.manifest.checkpoint_references == committed_before.checkpoint_references
+
 
 def test_process_termination_during_partial_manifest_write_keeps_previous_cut(tmp_path):
     """An interrupted temp-file write must not replace the committed manifest.
