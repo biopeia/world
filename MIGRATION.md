@@ -537,3 +537,12 @@ This addresses receipt identity and retry behavior at the tested manifest/filesy
 | `README.md` | Target capability documentation | REWRITE | Documents explicit presence lifecycle transitions and states that empty presence roster does not terminate the World. |
 
 This slice does not implement World termination, biological death, ownerless autonomous World advancement, checkpoint garbage collection, or any stronger crash/power-loss guarantee than the existing tested World commit/recovery protocol. It preserves the distinction between presence lifecycle and Organism/Embodiment lifecycle. Validation on the reviewed candidate: `uv run --with pytest python -m pytest -q` (87 passed); `uv run --extra integration --with pytest python -m pytest -q tests/integration` (26 passed); `uv run --with build python -m build` (sdist and wheel built successfully).
+
+## Per-cut owner checkpoint references (World #72)
+
+| Target path | Source/provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/durable_runtime.py` | Target-only follow-up to the durable causal-cut journal contract, based on World `0356f7611c9512e9525a5af54e72a16c5450263a` and [World issue #72](https://github.com/biopeia/world/issues/72); no historical implementation copied | REWRITE | Adds one World-owned `world.causal_cut.committed` journal record for genesis and each committed tick. Each record retains the cut commit identity, participant identities, and opaque owner checkpoint references. Existing journal references use the explicit `event-journal-v2` schema; no v1 compatibility decoder is retained. The journal's committed prefix remains published through the manifest. |
+| `tests/test_durable_runtime.py`, `tests/integration/test_durable_checkpoint_restore_slice.py` | New Biopeia TARGET tests for World issue #72; no source tests copied | REWRITE | Verifies exact genesis/tick reference identities, two-tick historical discovery after restore, and the existing publication/recovery failure boundaries with the additional journal records. |
+
+This slice preserves stable references for each retained committed cut; it does not preserve or own the referenced checkpoint bytes, guarantee their continued availability, add arbitrary historical state restoration, or define compaction/retention policy. Journal complexity and retention policy remain separate from this identity/provenance contract.

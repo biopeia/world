@@ -983,7 +983,6 @@ def _committed_cut_observations(fixture: _Fixture) -> tuple[tuple[object, ...], 
             value={
                 "commit_id": manifest_before.commit_id,
                 "causal_tick": manifest_before.causal_tick,
-                "journal_prefix_sha256": manifest_before.journal_prefix_sha256,
                 "owner_checkpoint_sha256": tuple(
                     (reference.owner, reference.owner_identity, reference.sha256)
                     for reference in references
@@ -1012,6 +1011,9 @@ def _committed_cut_observations(fixture: _Fixture) -> tuple[tuple[object, ...], 
         for reference in references
         if reference.owner != "world-journal"
     ) == owner_bytes_before
+    # The local journal digest includes owner checkpoint locators, which vary
+    # across independent temp roots. Compare semantic cut identity and owner
+    # checkpoint content, while validating each journal digest separately.
     normalized_cut = (
         manifest_before.world_id,
         manifest_before.causal_tick,
@@ -1019,7 +1021,6 @@ def _committed_cut_observations(fixture: _Fixture) -> tuple[tuple[object, ...], 
         manifest_before.status,
         manifest_before.presence_ids,
         manifest_before.registered_owner_ids,
-        manifest_before.journal_prefix_sha256,
         tuple(
             (
                 ref.owner,
@@ -1029,6 +1030,7 @@ def _committed_cut_observations(fixture: _Fixture) -> tuple[tuple[object, ...], 
                 ref.sha256,
             )
             for ref in references
+            if ref.owner != "world-journal"
         ),
     )
     return normalized_cut, (
