@@ -17,10 +17,10 @@ mujoco = ["mujoco==3.14.0"]
 integration = [
     "pytest>=8",
     "mujoco==3.14.0",
-    "organism @ git+https://github.com/biopeia/organism.git@fc8a91c61d865663ba6f9468216171506fd29e7a",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@028e2f912eccbe554a9d7f8543fe9dfe2bb94218",
+    "organism @ git+https://github.com/biopeia/organism.git@d1adf081333acd15c0252df84d498a7ba9e276ad",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@6114f3d9bcc0d5c44ecbfb6262f87f5824f92903",
     "environment @ git+https://github.com/biopeia/environment.git@0a9f4fbb1922cc6ca9e7b2489cf891606ef9ee41",
-    "observation @ git+https://github.com/biopeia/observation.git@186da664cdcb04d013fb2a359913bd9b2391e07e",
+    "observation @ git+https://github.com/biopeia/observation.git@be82907d1d677b2362e369d15eb1e8e964d893aa",
 ]
 
 [tool.setuptools.packages.find]
