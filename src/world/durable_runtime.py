@@ -31,7 +31,107 @@ from .manifest import (
 from .runtime import PresenceId, RecoveryRequiredError, TickInProgressError, WorldId
 
 _JOURNAL_OWNER = "world-journal"
-_JOURNAL_SCHEMA = "event-journal-v1"
+_JOURNAL_SCHEMA = "event-journal-v2"
+_CAUSAL_CUT_RECORD_TYPE = "world.causal_cut.committed"
+
+
+def _reference_descriptor(reference: CheckpointReference) -> dict[str, str]:
+    """Serialize an opaque checkpoint reference without inspecting its bytes."""
+    return {
+        "owner_id": reference.owner,
+        "owner_identity": reference.owner_identity,
+        "checkpoint_id": reference.checkpoint_id,
+        "schema_version": reference.schema_version,
+        "locator": reference.locator,
+        "sha256": reference.sha256,
+    }
+
+
+def _causal_cut_record(
+    *,
+    world_id: str,
+    causal_tick: int,
+    commit_id: str,
+    references: tuple[CheckpointReference, ...],
+) -> CausalRecord:
+    owner_references = tuple(
+        sorted(
+            (ref for ref in references if ref.owner != _JOURNAL_OWNER),
+            key=lambda ref: (ref.owner, ref.owner_identity),
+        )
+    )
+    participants = tuple(sorted((ref.owner, ref.owner_identity) for ref in owner_references))
+    if len(participants) != len(set(participants)):
+        raise ManifestError("causal-cut checkpoint references contain duplicate participants")
+    return CausalRecord(
+        record_id=f"{world_id}:causal-cut:{causal_tick}",
+        world_id=world_id,
+        causal_tick=causal_tick,
+        record_type=_CAUSAL_CUT_RECORD_TYPE,
+        actor_id="world",
+        payload={
+            "commit_id": commit_id,
+            "participants": [list(item) for item in participants],
+            "owner_checkpoint_references": [
+                _reference_descriptor(reference) for reference in owner_references
+            ],
+        },
+    )
+
+
+def _validate_causal_cut_record(record: CausalRecord) -> None:
+    """Fail closed on malformed per-cut roster/reference history."""
+    if (
+        record.record_type != _CAUSAL_CUT_RECORD_TYPE
+        or record.actor_id != "world"
+        or record.causal_tick < 0
+        or record.record_id != f"{record.world_id}:causal-cut:{record.causal_tick}"
+    ):
+        raise ManifestError("persisted causal-cut record has an invalid identity")
+    payload = record.payload
+    if set(payload) != {"commit_id", "participants", "owner_checkpoint_references"}:
+        raise ManifestError("persisted causal-cut record has an invalid envelope")
+    commit_id = payload["commit_id"]
+    participants = payload["participants"]
+    references = payload["owner_checkpoint_references"]
+    if not isinstance(commit_id, str) or not commit_id.strip():
+        raise ManifestError("persisted causal-cut record has an invalid commit identity")
+    if not isinstance(participants, tuple) or not isinstance(references, tuple):
+        raise ManifestError("persisted causal-cut record has invalid participant references")
+    normalized_participants: list[tuple[str, str]] = []
+    for participant in participants:
+        if (
+            not isinstance(participant, tuple)
+            or len(participant) != 2
+            or any(not isinstance(item, str) or not item.strip() for item in participant)
+        ):
+            raise ManifestError("persisted causal-cut record has an invalid participant identity")
+        normalized_participants.append((participant[0], participant[1]))
+    if normalized_participants != sorted(set(normalized_participants)):
+        raise ManifestError("persisted causal-cut participants are duplicated or unordered")
+    required_reference_fields = {
+        "owner_id", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"
+    }
+    normalized_references: list[tuple[str, str]] = []
+    for reference in references:
+        if not isinstance(reference, Mapping) or set(reference) != required_reference_fields:
+            raise ManifestError("persisted causal-cut record has an invalid checkpoint reference")
+        values = tuple(reference[field] for field in (
+            "owner_id", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"
+        ))
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ManifestError("persisted causal-cut record has an invalid checkpoint reference")
+        # Reuse the canonical descriptor validation without changing ownership.
+        try:
+            CheckpointReference(*values)
+        except ValueError as exc:
+            raise ManifestError("persisted causal-cut record has an invalid checkpoint reference") from exc
+        normalized_references.append((values[0], values[1]))
+    if (
+        normalized_references != sorted(set(normalized_references))
+        or tuple(normalized_references) != tuple(normalized_participants)
+    ):
+        raise ManifestError("causal-cut participants and checkpoint references do not match exactly")
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +424,15 @@ class DurableWorldRuntime:
         cls._require_owner_references(owner_references, "initial causal cut")
         if cls._owner_keys(owner_references) != frozenset(registered_owner_ids):
             raise ManifestError("initial owner checkpoints must exactly match the World-registered owner roster")
+        genesis_commit_id = f"genesis:{world_id.value}"
+        journal.append(
+            _causal_cut_record(
+                world_id=world_id.value,
+                causal_tick=0,
+                commit_id=genesis_commit_id,
+                references=owner_references,
+            )
+        )
         journal_reference = journal_store.write(journal, causal_tick=0)
         references = (*owner_references, journal_reference)
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
@@ -333,9 +442,9 @@ class DurableWorldRuntime:
             causal_tick=0,
             presence_ids=genesis.initial_presence_ids,
             checkpoint_references=references,
-            journal_last_sequence=None,
-            journal_prefix_sha256="",
-            commit_id=f"genesis:{world_id.value}",
+            journal_last_sequence=len(journal) - 1,
+            journal_prefix_sha256=journal.prefix_digest(),
+            commit_id=genesis_commit_id,
             registered_owner_ids=registered_owner_ids,
             presence_owner_links=tuple(
                 (link.presence_id.value, link.owner_id, link.owner_identity)
@@ -667,6 +776,14 @@ class DurableWorldRuntime:
                 if existing_owner_record_keys.intersection(owner_record_keys):
                     raise ManifestError("owner causal record identity was already committed in this World")
                 candidate_journal.append(record)
+                candidate_journal.append(
+                    _causal_cut_record(
+                        world_id=self.world_id.value,
+                        causal_tick=proposed_tick,
+                        commit_id=transition_id,
+                        references=owner_references,
+                    )
+                )
                 if presence_lifecycle is not None:
                     owner_refs = tuple(
                         {
@@ -860,7 +977,33 @@ class DurableWorldRuntime:
         )
         if commit_ticks != tuple(range(1, manifest.causal_tick + 1)):
             raise ManifestError("journal does not cover the manifest causal tick prefix")
-        if any(record.causal_tick < 1 or record.causal_tick > manifest.causal_tick for record in records):
+        cut_records = tuple(
+            record for record in records if record.record_type == _CAUSAL_CUT_RECORD_TYPE
+        )
+        if tuple(record.causal_tick for record in cut_records) != tuple(
+            range(0, manifest.causal_tick + 1)
+        ):
+            raise ManifestError("journal does not preserve owner references for every committed causal cut")
+        for record in cut_records:
+            _validate_causal_cut_record(record)
+        current_cut = cut_records[-1]
+        expected_current_refs = tuple(
+            _reference_descriptor(ref)
+            for ref in sorted(
+                (ref for ref in manifest.checkpoint_references if ref.owner != _JOURNAL_OWNER),
+                key=lambda ref: (ref.owner, ref.owner_identity),
+            )
+        )
+        current_payload = current_cut.payload
+        if (
+            current_cut.world_id != manifest.world_id
+            or current_payload["commit_id"] != manifest.commit_id
+            or tuple(tuple(item) for item in current_payload["participants"])
+            != tuple(sorted((*manifest.registered_owner_ids, *manifest.step_participant_ids)))
+            or tuple(current_payload["owner_checkpoint_references"]) != expected_current_refs
+        ):
+            raise ManifestError("latest causal-cut journal record does not match the committed manifest")
+        if any(record.causal_tick < 0 or record.causal_tick > manifest.causal_tick for record in records):
             raise ManifestError("journal contains a record outside the committed causal tick prefix")
         DurableWorldRuntime._owner_causal_record_keys(records)
         expected_last = len(records) - 1 if records else None

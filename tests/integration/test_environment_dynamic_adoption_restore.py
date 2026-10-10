@@ -176,6 +176,8 @@ def _step(runtime, environment, root: Path, *, target_tick: int, reject: bool = 
 
 
 def _normalized_cut(runtime):
+    # Journal hashes bind local owner-reference locators; compare the stable
+    # committed owner identities/content, not storage-root-specific bytes.
     return (
         runtime.manifest.world_id,
         runtime.manifest.causal_tick,
@@ -183,6 +185,7 @@ def _normalized_cut(runtime):
         tuple(
             (ref.owner, ref.owner_identity, ref.checkpoint_id, ref.schema_version, ref.sha256)
             for ref in runtime.manifest.checkpoint_references
+            if ref.owner != "world-journal"
         ),
     )
 

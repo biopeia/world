@@ -203,7 +203,7 @@ def test_owner_checkpoints_publish_and_restore_one_bounded_causal_cut(tmp_path: 
     published = runtime.manifest
     assert published.status is ManifestStatus.COMMITTED
     assert published.causal_tick == 1
-    assert published.journal_last_sequence == 0
+    assert published.journal_last_sequence == 2
     assert len(published.checkpoint_references) == 3
 
     organism_ref = next(ref for ref in published.checkpoint_references if ref.owner == "organism")
@@ -226,7 +226,20 @@ def test_owner_checkpoints_publish_and_restore_one_bounded_causal_cut(tmp_path: 
     assert restored_embodiment.episode_id == EPISODE_ID
     assert restored_ledger.body_state.energy_reserve == restored_body.energy_reserve
     assert restored_journal.prefix_digest() == published.journal_prefix_sha256
-    assert restored_journal.replay()[0] == committed_record
+    restored_ticks = tuple(
+        item for item in restored_journal.replay()
+        if item.record_type == "world.causal_tick.committed"
+    )
+    assert restored_ticks == (committed_record,)
+    cut_records = tuple(
+        item for item in restored_journal.replay()
+        if item.record_type == "world.causal_cut.committed"
+    )
+    assert tuple(item.causal_tick for item in cut_records) == (0, 1)
+    assert tuple(
+        tuple(reference["checkpoint_id"] for reference in item.payload["owner_checkpoint_references"])
+        for item in cut_records
+    ) == (("embodiment-tick-0", "organism-tick-0"), ("embodiment-tick-1", "organism-tick-1"))
 
 
 def test_manifest_stays_recovery_required_when_dependency_is_unverified(tmp_path: Path) -> None:
@@ -398,8 +411,10 @@ def test_durable_world_runtime_publishes_and_restores_owner_checkpoint_closure(
     restored_cognitive = restored["cognitive"]
     assert isinstance(restored_cognitive, CognitiveRuntimeCheckpoint)
     assert restored_world.causal_tick == 1
-    assert restored_world.records == (record,)
-    assert restored_world.manifest.journal_last_sequence == 0
+    assert tuple(
+        item for item in restored_world.records if item.record_type == "world.causal_tick.committed"
+    ) == (record,)
+    assert restored_world.manifest.journal_last_sequence == 2
     assert restored_cognitive.state == cognitive.state
     assert restored_embodiment.body_state.checkpoint() == body.checkpoint()
     assert restored_embodiment.metabolic_ledger.checkpoint() == ledger.checkpoint()
@@ -415,9 +430,11 @@ def test_durable_world_runtime_publishes_and_restores_owner_checkpoint_closure(
 
     assert second_record.causal_tick == 2
     assert restored_world.causal_tick == 2
-    assert restored_world.records == (record, second_record)
+    assert tuple(
+        item for item in restored_world.records if item.record_type == "world.causal_tick.committed"
+    ) == (record, second_record)
     assert restored_world.manifest.status is ManifestStatus.COMMITTED
-    assert restored_world.manifest.journal_last_sequence == 1
+    assert restored_world.manifest.journal_last_sequence == 4
     assert restored_world.manifest.presence_ids == (str(IDENTITY),)
     assert {reference.checkpoint_id for reference in restored_world.manifest.checkpoint_references} == {
         "organism-tick-2",
@@ -460,8 +477,22 @@ def test_durable_world_runtime_publishes_and_restores_owner_checkpoint_closure(
     assert isinstance(second_embodiment, EmbodimentCheckpoint)
     assert isinstance(second_cognitive, CognitiveRuntimeCheckpoint)
     assert second_world.causal_tick == 2
-    assert second_world.records == (record, second_record)
-    assert second_world.manifest.journal_last_sequence == 1
+    assert tuple(
+        item for item in second_world.records if item.record_type == "world.causal_tick.committed"
+    ) == (record, second_record)
+    assert second_world.manifest.journal_last_sequence == 4
+    retained_cuts = tuple(
+        item for item in second_world.records if item.record_type == "world.causal_cut.committed"
+    )
+    assert tuple(item.causal_tick for item in retained_cuts) == (0, 1, 2)
+    assert tuple(
+        tuple(reference["checkpoint_id"] for reference in item.payload["owner_checkpoint_references"])
+        for item in retained_cuts
+    ) == (
+        ("embodiment-tick-0", "organism-tick-0"),
+        ("embodiment-tick-1", "organism-tick-1"),
+        ("embodiment-tick-2", "organism-tick-2"),
+    )
     assert second_world.manifest.presence_ids == (str(IDENTITY),)
     assert second_cognitive.state.identity == IDENTITY
     assert second_cognitive.state == cognitive.state

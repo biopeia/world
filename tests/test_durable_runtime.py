@@ -124,8 +124,13 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
 
     assert runtime.status is ManifestStatus.COMMITTED
     assert runtime.causal_tick == 1
-    assert runtime.records == (record,)
-    assert runtime.manifest.journal_last_sequence == 0
+    assert tuple(item for item in runtime.records if item.record_type == "world.causal_tick.committed") == (record,)
+    assert tuple(item.record_type for item in runtime.records) == (
+        "world.causal_cut.committed",
+        "world.causal_tick.committed",
+        "world.causal_cut.committed",
+    )
+    assert runtime.manifest.journal_last_sequence == 2
     assert len(runtime.manifest.checkpoint_references) == 2
     assert manifest_store._require_active() == runtime.manifest
 
@@ -1088,7 +1093,7 @@ def test_owner_causal_record_rejects_duplicate_ids_within_tick_and_non_json_payl
             ),
         )
     assert runtime.causal_tick == 0
-    assert not runtime.records
+    assert tuple(item.record_type for item in runtime.records) == ("world.causal_cut.committed",)
 
     with pytest.raises(TypeError, match="keys must be strings"):
         OwnerCausalRecord("organism", "organism-identity", "invalid", {1: "not JSON object key"})
@@ -1437,8 +1442,12 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
         lambda _tick: (_checkpoint(next_owner), _checkpoint(body, owner="embodiment")),
     )
     assert runtime.presence_id == "presence-a"
-    assert runtime.records[-1].actor_id == "presence-a"
-    assert runtime.records[-1].payload["presence_id"] == "presence-a"
+    latest_tick_record = next(
+        record for record in reversed(runtime.records)
+        if record.record_type == "world.causal_tick.committed"
+    )
+    assert latest_tick_record.actor_id == "presence-a"
+    assert latest_tick_record.payload["presence_id"] == "presence-a"
     with pytest.raises(ManifestError, match="each active presence owner must be in the proposed registered owner roster"):
         runtime.tick(
             "unregister-linked-owner",
@@ -1549,7 +1558,7 @@ def test_last_presence_can_terminate_world_remains_active_and_later_registers(tm
     assert restored_empty.causal_tick == 2
     assert restored_empty.presence_id == "presence-b"
     assert restored_empty.manifest.presence_ids == ("presence-b",)
-    assert restored_empty.records[0].record_type == "world.causal_tick.committed"
+    assert restored_empty.records[0].record_type == "world.causal_cut.committed"
     retained_lifecycle = next(
         record for record in restored_empty.records
         if record.record_type == "world.presence.lifecycle.committed"
@@ -1952,7 +1961,7 @@ def test_explicit_recovery_restores_prior_cut_through_owner_and_records_receipt(
     assert restored and restored[0][0].owner == "organism"
     assert recovered.status is ManifestStatus.COMMITTED
     assert recovered.causal_tick == 0
-    assert recovered.records == ()
+    assert tuple(record.record_type for record in recovered.records) == ("world.causal_cut.committed",)
     assert recovered.manifest.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
     assert manifest_store._require_active() == recovered.manifest
 
@@ -2424,14 +2433,14 @@ os._exit(74)
         assert len(candidate_published) == 1
         assert candidate_published[0].name.startswith("journal-1-")
         published_candidate_records = json.loads(candidate_published[0].read_bytes())
-        assert published_candidate_records[-1]["record_id"] == f"{world_id.value}:tick:1"
+        assert published_candidate_records[-1]["record_id"] == f"{world_id.value}:causal-cut:1"
     else:
         assert published_journals == initial_journals
     abandoned_temps = tuple(journal_path.glob(".journal-*"))
     assert len(abandoned_temps) == 1
     candidate_records = json.loads(abandoned_temps[0].read_bytes())
     assert isinstance(candidate_records, list)
-    assert candidate_records[-1]["record_id"] == f"{world_id.value}:tick:1"
+    assert candidate_records[-1]["record_id"] == f"{world_id.value}:causal-cut:1"
     assert candidate_records[-1]["causal_tick"] == 1
 
     with pytest.raises(ManifestRecoveryRequiredError):
