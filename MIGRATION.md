@@ -433,3 +433,13 @@ This is evidence for one controlled process-termination boundary on the CI/local
 | `pyproject.toml` integration extra | Exact merged Embodiment revision above | REWRITE | Pins the integration consumer to the owner API revision it exercises. |
 
 This is World-owned consumer integration evidence only. It does not add or authenticate World authorization, implement a production solver adapter, change owner-adoption semantics, establish material coefficient semantics, or prove scientific validity or full crash/power-loss recovery. It contributes to Embodiment issue #32 acceptance; the issue remains open until this cross-repository consumer slice is merged and verified.
+
+## Embodiment checkpoint v2 consumer contract
+
+World integration fixtures and the pinned integration dependency now use the
+Embodiment owner schema `embodiment-checkpoint-v2` introduced at
+`biopeia/embodiment@028e2f912eccbe554a9d7f8543fe9dfe2bb94218`. Prior v1
+checkpoint references are not accepted as current TARGET test data. This
+updates only World-owned test fixtures and the explicit integration pin; World
+continues to treat owner checkpoint payloads as opaque. It does not add
+checkpoint migration/fallback behavior or expand World recovery guarantees.

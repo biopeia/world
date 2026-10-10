@@ -118,7 +118,7 @@ def test_owner_checkpoints_publish_and_restore_one_bounded_causal_cut(tmp_path: 
         identity = str(IDENTITY) if owner == "organism" else BODY_ID if owner == "embodiment" else "fixture-environment"
         schema = {
             "organism": "organism-cognitive-v1",
-            "embodiment": "embodiment-checkpoint-v1",
+            "embodiment": "embodiment-checkpoint-v2",
         }[owner]
         initial_owner_refs.append(_reference(owner, identity, f"{owner}-tick-0", path, schema))
     initial_refs = tuple(initial_owner_refs)
@@ -184,7 +184,7 @@ def test_owner_checkpoints_publish_and_restore_one_bounded_causal_cut(tmp_path: 
                 "embodiment",
                 BODY_ID,
                 f"embodiment-tick-{causal_tick}",
-                "embodiment-checkpoint-v1",
+                "embodiment-checkpoint-v2",
                 EmbodimentCheckpoint(BODY_ID, EPISODE_ID, next_body, next_ledger).to_bytes(),
             ),
         )
@@ -297,7 +297,7 @@ def test_durable_world_runtime_publishes_and_restores_owner_checkpoint_closure(
             path,
             {
                 "organism": "organism-cognitive-v1",
-                "embodiment": "embodiment-checkpoint-v1",
+                "embodiment": "embodiment-checkpoint-v2",
             }[name],
         )
 
