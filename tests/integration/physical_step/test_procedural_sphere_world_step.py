@@ -19,6 +19,10 @@ import mujoco
 import pytest
 from embodiment.observation import BodyPoseSample
 from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
+from embodiment.physics3d.articulated_state import (
+    ActiveArticulatedMorphology,
+    ArticulatedEmbodimentPhysicalState,
+)
 from embodiment.physics3d.mechanics import SegmentSpec
 from embodiment.physics3d.physical_projection import project_body_physical_input
 from embodiment.physics3d.physical_transition import (
@@ -204,6 +208,19 @@ def _initial_body(scene: StaticPhysicalScene) -> EmbodimentPhysicalState:
         linear_velocity_m_per_s=(0.0, 0.0, 0.0),
         angular_velocity_rad_per_s=(0.0, 0.0, 0.0),
     )
+
+
+def _projectable_body_state(
+    root: EmbodimentPhysicalState, spec: ArticulatedBodySpec
+) -> ArticulatedEmbodimentPhysicalState:
+    """Bind the fixture's zero-joint root to its active morphology."""
+    morphology = ActiveArticulatedMorphology.from_spec(
+        body_id=root.body_id,
+        embodiment_episode_id=root.embodiment_episode_id,
+        morphology_revision=root.morphology_revision,
+        spec=spec,
+    )
+    return ArticulatedEmbodimentPhysicalState(root=root, morphology=morphology, joints=())
 
 
 def _checkpoint_reference(
@@ -468,11 +485,8 @@ def _advance_and_commit(fixture: _Fixture, *, world_tick: int):
         )
         assert correlation.causal_tick == fixture.body.causal_tick
         body_input = project_body_physical_input(
-            _body_spec(),
-            fixture.body.pose,
+            _projectable_body_state(fixture.body, _body_spec()),
             correlation=correlation,
-            linear_velocity_m_per_s=fixture.body.linear_velocity_m_per_s,
-            angular_velocity_rad_per_s=fixture.body.angular_velocity_rad_per_s,
         )
         (
             position_m,
@@ -594,11 +608,8 @@ def test_procedural_spheres_are_adopted_committed_restored_and_reused(tmp_path: 
     )
     initial_body = _initial_body(original_scene)
     body_input = project_body_physical_input(
-        _body_spec(),
-        initial_body.pose,
+        _projectable_body_state(initial_body, _body_spec()),
         correlation=correlation,
-        linear_velocity_m_per_s=initial_body.linear_velocity_m_per_s,
-        angular_velocity_rad_per_s=initial_body.angular_velocity_rad_per_s,
     )
     with_spheres = _execute_mujoco_step(body_input, original_scene)
     without_spheres = _execute_mujoco_step(body_input, replace(original_scene, spheres=()))
@@ -648,11 +659,8 @@ def test_sphere_projection_is_stable_under_collection_permutation() -> None:
         solver_config_revision=SOLVER_CONFIGURATION_REVISION,
     )
     body_input = project_body_physical_input(
-        _body_spec(),
-        body.pose,
+        _projectable_body_state(body, _body_spec()),
         correlation=correlation,
-        linear_velocity_m_per_s=body.linear_velocity_m_per_s,
-        angular_velocity_rad_per_s=body.angular_velocity_rad_per_s,
     )
     projected = _execute_mujoco_step(body_input, scene)
     permuted_projected = _execute_mujoco_step(body_input, permuted)
@@ -677,11 +685,8 @@ def test_solver_rejects_non_identity_environment_frame_without_transforming() ->
         solver_config_revision=SOLVER_CONFIGURATION_REVISION,
     )
     body_input = project_body_physical_input(
-        _body_spec(),
-        body.pose,
+        _projectable_body_state(body, _body_spec()),
         correlation=correlation,
-        linear_velocity_m_per_s=body.linear_velocity_m_per_s,
-        angular_velocity_rad_per_s=body.angular_velocity_rad_per_s,
     )
     with pytest.raises(ValueError, match="identity physics3d.world frame"):
         _execute_mujoco_step(body_input, unsupported)

@@ -254,6 +254,19 @@ def _free_root_box_spec() -> ArticulatedBodySpec:
     )
 
 
+def _articulated_free_root_state(
+    root: EmbodimentPhysicalState, spec: ArticulatedBodySpec
+) -> ArticulatedEmbodimentPhysicalState:
+    """Bind a zero-joint fixture root to its active morphology for projection."""
+    morphology = ActiveArticulatedMorphology.from_spec(
+        body_id=root.body_id,
+        embodiment_episode_id=root.embodiment_episode_id,
+        morphology_revision=root.morphology_revision,
+        spec=spec,
+    )
+    return ArticulatedEmbodimentPhysicalState(root=root, morphology=morphology, joints=())
+
+
 def _environment_owner() -> StaticEnvironmentOwner:
     scene = StaticPhysicalScene(
         environment_id=ENVIRONMENT_ID,
@@ -614,11 +627,8 @@ def _run_valid_step(
         )
         assert correlation.causal_tick == physical_state.causal_tick
         projected_body = project_body_physical_input(
-            _free_root_box_spec(),
-            physical_state.pose,
+            _articulated_free_root_state(physical_state, _free_root_box_spec()),
             correlation=correlation,
-            linear_velocity_m_per_s=physical_state.linear_velocity_m_per_s,
-            angular_velocity_rad_per_s=physical_state.angular_velocity_rad_per_s,
         )
         frame = controller.frame(commitment, tick=context.target_causal_tick)
         command = motor_command_from_frame(
@@ -1221,11 +1231,9 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
     # Correlation tick identifies the source owner state (tick 0); the
     # candidate transition advances Embodiment and World to committed tick 1.
     assert correlation.causal_tick == owner_state.root.causal_tick == 0
-    projected = project_body_physical_input(
-        articulated_spec, initial_pose, correlation=correlation,
-        linear_velocity_m_per_s=root_state.linear_velocity_m_per_s,
-        angular_velocity_rad_per_s=root_state.angular_velocity_rad_per_s,
-    )
+    projected = project_body_physical_input(owner_state, correlation=correlation)
+    assert tuple(joint.joint_id for joint in projected.joints) == ("joint.hinge",)
+    assert projected.joints == owner_state.joints
     # The numerical fixture is deliberately limited to this exact projected
     # one-hinge morphology; it does not substitute a different body model.
     urdf = ET.fromstring(projected.articulated_description)
@@ -1270,7 +1278,20 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
     root_qvel = int(model.jnt_dofadr[root_joint])
     hinge_qpos = int(model.jnt_qposadr[hinge_joint])
     hinge_qvel = int(model.jnt_dofadr[hinge_joint])
-    data.qpos[root_qpos : root_qpos + 7] = (0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0)
+    data.qpos[root_qpos : root_qpos + 7] = (
+        *projected.position_m,
+        projected.orientation_xyzw[3],
+        *projected.orientation_xyzw[:3],
+    )
+    data.qvel[root_qvel : root_qvel + 6] = (
+        *projected.linear_velocity_m_per_s,
+        *projected.angular_velocity_rad_per_s,
+    )
+    projected_joints = {joint.joint_id: joint for joint in projected.joints}
+    for joint_id in projected_joints:
+        solver_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        data.qpos[int(model.jnt_qposadr[solver_joint])] = projected_joints[joint_id].position_rad
+        data.qvel[int(model.jnt_dofadr[solver_joint])] = projected_joints[joint_id].velocity_rad_per_s
     # Apply a declared positive hinge torque in N*m for this deterministic fixture.
     data.qfrc_applied[hinge_qvel] = 0.5
     pending_step_result: dict[str, object] = {}
@@ -1392,11 +1413,8 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
     )
     assert next_correlation.causal_tick == restored_body.root.causal_tick == restarted_world.causal_tick
     next_projection = project_body_physical_input(
-        articulated_spec,
-        restored_body.root.pose,
+        restored_body,
         correlation=next_correlation,
-        linear_velocity_m_per_s=restored_body.root.linear_velocity_m_per_s,
-        angular_velocity_rad_per_s=restored_body.root.angular_velocity_rad_per_s,
     )
     assert next_projection.articulated_description == projected.articulated_description
     resumed_model = mujoco.MjModel.from_xml_string(xml)
@@ -1408,16 +1426,18 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
     resumed_hinge_qpos = int(resumed_model.jnt_qposadr[resumed_hinge_joint])
     resumed_hinge_qvel = int(resumed_model.jnt_dofadr[resumed_hinge_joint])
     resumed_data.qpos[resumed_root_qpos : resumed_root_qpos + 7] = (
-        *restored_body.root.pose.position_m,
-        restored_body.root.pose.orientation_xyzw[3],
-        *restored_body.root.pose.orientation_xyzw[:3],
+        *next_projection.position_m,
+        next_projection.orientation_xyzw[3],
+        *next_projection.orientation_xyzw[:3],
     )
     resumed_data.qvel[resumed_root_qvel : resumed_root_qvel + 6] = (
-        *restored_body.root.linear_velocity_m_per_s,
-        *restored_body.root.angular_velocity_rad_per_s,
+        *next_projection.linear_velocity_m_per_s,
+        *next_projection.angular_velocity_rad_per_s,
     )
-    resumed_data.qpos[resumed_hinge_qpos] = restored_body.joints[0].position_rad
-    resumed_data.qvel[resumed_hinge_qvel] = restored_body.joints[0].velocity_rad_per_s
+    resumed_joints = {joint.joint_id: joint for joint in next_projection.joints}
+    assert "joint.hinge" in resumed_joints
+    resumed_data.qpos[resumed_hinge_qpos] = resumed_joints["joint.hinge"].position_rad
+    resumed_data.qvel[resumed_hinge_qvel] = resumed_joints["joint.hinge"].velocity_rad_per_s
     next_environment_correlation = EnvironmentStepCorrelation(
         WORLD_ID,
         1,
