@@ -24,6 +24,10 @@ import pytest
 from embodiment.checkpoint import EmbodimentCheckpoint
 from embodiment.metabolism import MetabolicLedger
 from embodiment.observation import BodyPoseSample
+from embodiment.physics3d.actuator_binding import (
+    ActuatorChannelBinding,
+    EmbodimentActuatorBinding,
+)
 from embodiment.physics3d.actuation_projection import project_motor_command
 from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
 from embodiment.physics3d.articulated_state import (
@@ -152,6 +156,38 @@ class _Morphology:
     embodiment_episode_id: str
     morphology_revision: str
     effectors: tuple[_Effector, ...]
+
+
+def _actuator_binding(
+    surface: _PhysicalSurface,
+    *,
+    binding_id: str,
+    body_id: str,
+    embodiment_episode_id: str,
+) -> EmbodimentActuatorBinding:
+    """Build the owner binding from explicit actuator/effector identities."""
+    return EmbodimentActuatorBinding(
+        binding_id=binding_id,
+        body_id=body_id,
+        embodiment_episode_id=embodiment_episode_id,
+        morphology_revision=surface.morphology_revision,
+        source_surface_fingerprint=surface.contract_fingerprint,
+        channels=tuple(
+            ActuatorChannelBinding(
+                actuator_id=channel.actuator_id,
+                effector_id=channel.effector_id,
+                command_kind=channel.command_kind,
+                quantity=channel.quantity,
+                unit=channel.unit,
+                minimum=channel.minimum,
+                neutral=channel.neutral,
+                maximum=channel.maximum,
+                saturation=channel.saturation,
+                available=channel.available,
+            )
+            for channel in surface.channels
+        ),
+    )
 
 
 class _FilesystemOwnerContract:
@@ -577,7 +613,12 @@ def _run_valid_step(
         )
         actuation = project_motor_command(
             command,
-            surface,
+            _actuator_binding(
+                surface,
+                binding_id="binding.physical-e2e.body.r1",
+                body_id=BODY_ID,
+                embodiment_episode_id=EPISODE_ID,
+            ),
             morphology,
             body_pose=physical_state.pose,
             embodiment_checkpoint=embodiment_checkpoint,
