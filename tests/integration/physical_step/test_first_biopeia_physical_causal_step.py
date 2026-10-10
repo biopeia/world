@@ -233,7 +233,9 @@ def _environment_owner() -> StaticEnvironmentOwner:
         gravity_m_s2=(0.0, 0.0, -9.81),
         objects=(StaticGroundPlane("ground.z0", (0.0, 0.0, 1.0), 0.0),),
     )
-    return StaticEnvironmentOwner(scene, owner_id=ENVIRONMENT_ID)
+    return StaticEnvironmentOwner(
+        scene, owner_id=ENVIRONMENT_ID, world_id=WORLD_ID
+    )
 
 
 def _execute_mujoco_step(body_input, scene, actuation):
@@ -431,7 +433,10 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
         ),
     )
 
-    actuator_surface = ActuatorSurface.from_count(2, fingerprint_material="physical-e2e-surface-v1")
+    actuator_surface = ActuatorSurface.from_effector_ids(
+        ("joint.elbow", "joint.wrist"),
+        fingerprint_material="physical-e2e-surface-v1",
+    )
     morphology = _Morphology(
         BODY_ID,
         EPISODE_ID,

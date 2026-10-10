@@ -118,8 +118,9 @@ def _run_three_ticks() -> tuple[OrganismIdentity, tuple[TickSnapshot, ...]]:
         "fixture",
         0,
     )
-    actuator_surface = ActuatorSurface.from_count(
-        2, fingerprint_material="integration-command-surface-v1"
+    actuator_surface = ActuatorSurface.from_effector_ids(
+        ("joint.elbow", "joint.wrist"),
+        fingerprint_material="integration-command-surface-v1",
     )
     # This is explicit embodiment-supplied identity mapping, not positional
     # authority: reverse the order to ensure IDs carry the association.
