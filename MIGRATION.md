@@ -491,3 +491,11 @@ checkpoint migration/fallback behavior or expand World recovery guarantees.
 | `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `ab33cc3ee5183f7999d3a7253251b9b1c5b392af` and the ratified single-logical-writer contract; no historical implementation or API copied | REWRITE | While the writer is paused in its owner-checkpoint callback after publishing `PREPARING`, a child process reads the manifest and observes the old committed tick plus pending transition metadata. The child does not mutate the manifest or attempt recovery; after it exits, the original writer completes the commit. |
 
 This demonstrates read-only cross-process visibility of one open transition on the exercised local filesystem. It does not exercise a second writer, concurrent recovery, process termination, owner-checkpoint interruption/durability, directory-`fsync` failure, power loss/storage-device behavior, other filesystems/platforms, or general crash consistency. The single-logical-writer precondition remains in force, and World issue #33 remains open for the other evidence gaps.
+
+## Owner checkpoint callback interrupted during a partial write (World #33)
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `8f8b2446e1328b4c7446d3538e56204139abf1b4` and the existing opaque owner-checkpoint callback contract; no historical implementation or API copied | REWRITE | After `PREPARING` is published, the subprocess owner callback writes only a prefix of a candidate checkpoint and exits without returning a checkpoint reference. No candidate journal or committed cut is published; restart requires explicit recovery to the prior cut. The test does not `fsync` the candidate and does not claim owner-byte durability. |
+
+This is a bounded process-termination test on the exercised local filesystem. It does not establish the behavior of arbitrary owner implementations, actual interrupted system calls, power loss, storage-device persistence, other filesystems/platforms, or general crash consistency. The partial candidate file remains outside the committed cut; orphan cleanup is not tested.
