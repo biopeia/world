@@ -723,7 +723,7 @@ def _run_valid_step(
 
     def adopt_body(context: PhysicalStepContext, candidate: SolverBodyCandidate) -> None:
         correlation = staged["correlation"]
-        adopted_state = physical_state.adopt_candidate(candidate, expected_step=correlation)
+        adopted_state = physical_state.adopt_candidate(candidate, world_context=context)
         assert adopted_state.causal_tick == context.target_causal_tick
         staged.update(candidate=candidate, adopted=adopted_state)
 
@@ -1021,8 +1021,8 @@ def _run_stale_morphology(root: Path) -> tuple[ManifestStatus, int, int]:
         )
         return PhysicalStepCandidate(candidate, None)
 
-    def adopt_stale_body(_context, candidate):
-        adopted_candidates.append(physical.adopt_candidate(candidate, expected_step=expected))
+    def adopt_stale_body(context, candidate):
+        adopted_candidates.append(physical.adopt_candidate(candidate, world_context=context))
 
     ports = PhysicalStepPorts(
         project_body=lambda _context: None,
@@ -1032,7 +1032,7 @@ def _run_stale_morphology(root: Path) -> tuple[ManifestStatus, int, int]:
         adopt_environment=lambda _context, _candidate: None,
         write_checkpoints=lambda _context: pytest.fail("stale candidate reached checkpoint writing"),
     )
-    with pytest.raises(ValueError, match="authorized physical step"):
+    with pytest.raises(ValueError, match="World physical-step context"):
         run_physical_step(
             runtime,
             commit_id="stale-physical-step",
@@ -1312,7 +1312,18 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
         )
         # Embodiment returns a candidate state without mutating its prior
         # value; Environment adoption follows before any references are emitted.
-        adopted = owner_state.adopt_candidate(candidate, expected_step=correlation)
+        world_context = PhysicalStepContext(
+            world_id=correlation.world_id,
+            source_causal_tick=correlation.causal_tick,
+            target_causal_tick=causal_tick,
+            physical_step_id=correlation.physical_step_id,
+            body_id=correlation.body_id,
+            embodiment_episode_id=correlation.embodiment_episode_id,
+            morphology_revision=correlation.morphology_revision,
+            environment_revision=correlation.environment_revision,
+            solver_config_revision=correlation.solver_config_revision,
+        )
+        adopted = owner_state.adopt_candidate(candidate, world_context=world_context)
         assert adopted.root.causal_tick == causal_tick
         env_correlation = EnvironmentStepCorrelation(
             WORLD_ID, 0, correlation.physical_step_id, environment.scene.environment_id, ENVIRONMENT_REVISION
@@ -1475,8 +1486,19 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
                 ),
             ),
         )
+        world_context = PhysicalStepContext(
+            world_id=next_correlation.world_id,
+            source_causal_tick=next_correlation.causal_tick,
+            target_causal_tick=causal_tick,
+            physical_step_id=next_correlation.physical_step_id,
+            body_id=next_correlation.body_id,
+            embodiment_episode_id=next_correlation.embodiment_episode_id,
+            morphology_revision=next_correlation.morphology_revision,
+            environment_revision=next_correlation.environment_revision,
+            solver_config_revision=next_correlation.solver_config_revision,
+        )
         continued_body = restored_body.adopt_candidate(
-            next_candidate, expected_step=next_correlation
+            next_candidate, world_context=world_context
         )
         restored_environment.validate_and_adopt(
             StaticSceneCandidate(
