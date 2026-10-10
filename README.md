@@ -21,6 +21,27 @@ See [`MIGRATION.md`](MIGRATION.md) for exact source provenance, dispositions, va
 
 **Durability boundary:** World can persist and hash-check opaque checkpoint references through the supplied verifier, and delegates restoration to supplied owner callbacks. A registered owner codec validates the encoded owner identity and schema; World accepts a literal `True` result and repeats owner validation after delegated restoration. This is a trusted in-process owner contract, not an independently verifiable attestation. It still cannot independently prove that the adapter is honest, that the declared initial roster includes every real authority, or that underlying storage survives actual process/power loss. This implementation must not be treated as full operational durable owner-closed conformance until canonical Biopeia owner implementations are bound through this contract and their integration is independently verified.
 
+## Optional MuJoCo numerical executor
+
+`world.adapters.mujoco.execute_mujoco_step` is an optional, engine-specific
+numerical executor (`pip install 'world[mujoco]'`). The caller supplies an
+already compiled `mujoco.MjModel` and explicit `qpos`, `qvel`, and `ctrl`
+vectors. The function advances one step and returns an immutable candidate
+correlated to the supplied `PhysicalStepContext`.
+
+This is not a Biopeia physical-scene schema or a complete production causal
+step. Model assembly and owner projections/adoption remain outside the adapter;
+the adapter does not mutate or persist owner state, validate authorization,
+split results between Embodiment and Environment, or commit a World cut. The
+caller is responsible for declaring and correlating the model's effective
+timestep and solver settings; the adapter verifies only a positive effective
+timestep, not how it was configured. Callers must reject projections they
+cannot represent and resolve stable identities, units, and frame semantics
+before mapping values to MuJoCo-native vector positions. An explicit
+control vector is mandatory; this API does not infer commands for omitted
+channels. MuJoCo remains an optional numerical substrate, not a semantic
+authority. No calibration or physical-equivalence claim is made.
+
 ## Cross-repository integration tests
 
 `tests/integration` holds the versioned evidence that World coordinates the other authorities in one causal step: the first causal tick, publication and restore of an owner-checkpoint closure, and the first end-to-end physical causal step (`tests/integration/physical_step`). They import `organism`, `embodiment`, `environment` and `observation`; the World package itself depends on none of them.
