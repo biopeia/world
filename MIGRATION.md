@@ -440,6 +440,14 @@ This adds evidence for one process-termination point during one manifest tempora
 
 This is one process-termination test for one journal temporary-file write on the exercised local filesystem. It does not cover owner-checkpoint write interruption, termination during journal fsync/link/directory fsync, second-process interaction, power loss/storage-device behavior, automatic orphan cleanup, or general crash consistency. World issue #33 remains open.
 
+## Journal temporary-file complete before file fsync (World #33)
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `a7cf15b1e898ee30f56694a13c90adefcd97eac5` and the ratified single-logical-writer / durable-cut contract; no historical implementation or API copied | REWRITE | A child publishes `PREPARING`, writes an owner candidate, then exits when `fsync` is called for the candidate journal temporary file. The full JSON payload has already been written and flushed to the OS, but that file `fsync` has not run and the immutable journal snapshot has not been hard-link published. The prior committed manifest and published journal remain unchanged; startup requires recovery and explicit recovery returns the prior cut. The temporary file and candidate owner file remain; candidate owner durability is not claimed. |
+
+This adds evidence for process termination immediately before the candidate journal temporary-file `fsync` call on the exercised local filesystem. It does not prove the completed write survives power loss, that `fsync` itself succeeds or is durable on other filesystems, or behavior after successful file `fsync` and during hard-link/directory `fsync`. It does not cover owner-checkpoint write interruption, second-process interaction, power loss/storage-device behavior, orphan cleanup, or general crash consistency. World issue #33 remains open.
+
 ## Embodiment physical projection consumer update (Embodiment #32)
 
 | Target path | Provenance | Disposition | Notes |

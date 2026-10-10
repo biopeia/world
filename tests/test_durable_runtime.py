@@ -1572,3 +1572,186 @@ def test_retry_after_recovery_publication_interruption_fsyncs_existing_receipt_d
     assert receipt_dir in fsynced_directories
     assert fsynced_directories.index(receipt_dir) < len(fsynced_directories) - 1
     assert fsynced_directories[-1] == tmp_path
+
+
+def test_process_termination_before_journal_file_fsync_keeps_previous_cut(tmp_path):
+    """A complete candidate journal temp is not committed before file fsync.
+
+    The child exits when World calls fsync on the candidate journal temp,
+    after the complete JSON payload has been written and flushed but before
+    that fsync call can complete. This exercises process termination on the
+    current local filesystem only; it is not a power-loss test.
+    """
+    world_id = WorldId("world-journal-fsync-interruption")
+    manifest_path = tmp_path / "manifest.json"
+    journal_path = tmp_path / "journal"
+    manifest_store = WorldCausalManifestStore(manifest_path)
+    journal_store = DurableJournalSnapshotStore(journal_path, world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"committed owner state at tick zero")
+    contracts = _contracts(("organism", "organism-identity"))
+    _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    committed_before = manifest_store.read()
+    initial_journals = tuple(journal_path.glob("journal-*.json"))
+    assert committed_before.status is ManifestStatus.COMMITTED
+    assert committed_before.causal_tick == 0
+    assert len(initial_journals) == 1
+
+    child = r"""
+import os
+import sys
+from pathlib import Path
+from world import (
+    DurableJournalSnapshotStore,
+    DurableWorldRuntime,
+    WorldCausalManifestStore,
+    WorldId,
+)
+
+root = Path(sys.argv[1])
+world_id = WorldId("world-journal-fsync-interruption")
+manifest_store = WorldCausalManifestStore(root / "manifest.json")
+
+def verify(references):
+    import hashlib
+    return all(
+        Path(ref.locator).is_file()
+        and hashlib.sha256(Path(ref.locator).read_bytes()).hexdigest() == ref.sha256
+        for ref in references
+    )
+
+class Contract:
+    def validate_checkpoint(self, encoded, owner_identity, schema_version):
+        return bool(encoded) and owner_identity == "organism-identity" and schema_version == "v1"
+    def verify_restoration(self, encoded, owner_identity, schema_version):
+        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+
+runtime = DurableWorldRuntime.restore(
+    world_id,
+    "presence-a",
+    manifest_store,
+    DurableJournalSnapshotStore(root / "journal", world_id),
+    owner_checkpoint_verifier=verify,
+    owner_checkpoint_contracts={("organism", "organism-identity"): Contract()},
+    owner_checkpoint_restorer=lambda _refs: None,
+)
+
+original_fdopen = os.fdopen
+original_fsync = os.fsync
+fdopen_calls = 0
+journal_fd = None
+class TrackingWriter:
+    def __init__(self, fd, mode):
+        self.stream = original_fdopen(fd, mode)
+    def __enter__(self):
+        global journal_fd
+        journal_fd = self.stream.fileno()
+        return self
+    def __exit__(self, exc_type, exc, traceback):
+        return self.stream.__exit__(exc_type, exc, traceback)
+    def write(self, payload):
+        return self.stream.write(payload)
+    def flush(self):
+        return self.stream.flush()
+    def fileno(self):
+        return self.stream.fileno()
+
+def track_journal_temp(fd, mode):
+    global fdopen_calls
+    fdopen_calls += 1
+    if fdopen_calls == 2:
+        # The first fdopen writes PREPARING's manifest temp. The second owns
+        # the candidate journal temp whose fsync boundary is under test.
+        return TrackingWriter(fd, mode)
+    return original_fdopen(fd, mode)
+
+def interrupt_journal_fsync(fd):
+    if fd == journal_fd:
+        os._exit(73)
+    return original_fsync(fd)
+
+os.fdopen = track_journal_temp
+os.fsync = interrupt_journal_fsync
+
+def write_candidate_owner(tick):
+    assert tick == 1
+    state = root / "owner-1.json"
+    state.write_bytes(b"candidate owner state at tick one")
+    from hashlib import sha256
+    from world import CheckpointReference
+    return (CheckpointReference(
+        owner="organism",
+        owner_identity="organism-identity",
+        checkpoint_id="organism-checkpoint-1",
+        schema_version="v1",
+        locator=str(state),
+        sha256=sha256(state.read_bytes()).hexdigest(),
+    ),)
+
+runtime.tick("transition-interrupted-before-journal-fsync", write_candidate_owner)
+os._exit(74)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 73, result.stderr
+
+    preparing = manifest_store.read()
+    assert preparing.status is ManifestStatus.PREPARING
+    assert preparing.causal_tick == committed_before.causal_tick
+    assert preparing.commit_id == committed_before.commit_id
+    assert preparing.checkpoint_references == committed_before.checkpoint_references
+    assert tuple(journal_path.glob("journal-*.json")) == initial_journals
+    abandoned_temps = tuple(journal_path.glob(".journal-*"))
+    assert len(abandoned_temps) == 1
+    candidate_records = json.loads(abandoned_temps[0].read_bytes())
+    assert isinstance(candidate_records, list)
+    assert candidate_records[-1]["record_id"] == f"{world_id.value}:tick:1"
+    assert candidate_records[-1]["causal_tick"] == 1
+
+    with pytest.raises(ManifestRecoveryRequiredError):
+        DurableWorldRuntime.restore(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=_verifier,
+            owner_checkpoint_contracts=contracts,
+            owner_checkpoint_restorer=lambda _refs: None,
+        )
+
+    pending = manifest_store.read()
+    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.causal_tick == committed_before.causal_tick
+    assert pending.commit_id == committed_before.commit_id
+    assert pending.checkpoint_references == committed_before.checkpoint_references
+
+    recovered = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda references: references == tuple(
+            ref for ref in committed_before.checkpoint_references if ref.owner != "world-journal"
+        ) or pytest.fail("explicit recovery did not restore the prior owner cut"),
+    )
+    assert recovered.status is ManifestStatus.COMMITTED
+    assert recovered.causal_tick == committed_before.causal_tick
+    assert recovered.manifest.commit_id == committed_before.commit_id
