@@ -356,9 +356,9 @@ def test_failed_registration_keeps_prior_cut_and_pending_roster_for_recovery(tmp
     )
 
 
-@pytest.mark.parametrize("validation_error", ["owner-rejects", "owner-returns-receipt"])
-def test_world_issues_receipt_only_after_owner_checkpoint_validation(tmp_path, validation_error):
-    world_id = WorldId(f"world-validation-{validation_error}")
+@pytest.mark.parametrize("validation_result", [False, object()], ids=["reject", "non-boolean-result"])
+def test_world_rejects_owner_checkpoint_unless_contract_returns_true(tmp_path, validation_result):
+    world_id = WorldId("world-validation")
     store = WorldCausalManifestStore(tmp_path / "manifest.json")
     journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
     owner = tmp_path / "owner.json"
@@ -374,19 +374,10 @@ def test_world_issues_receipt_only_after_owner_checkpoint_validation(tmp_path, v
     next_owner = tmp_path / "next-owner.json"
     next_owner.write_bytes(b"next")
     reference = _checkpoint(next_owner)
-    if validation_error == "owner-rejects":
-        contract.valid = False
-    else:
-        # A contract cannot self-issue a World receipt in the new interface.
-        from world import OwnerRecoveryReceipt
-
-        contract.validate_checkpoint = lambda *_args: OwnerRecoveryReceipt(
-            owner="organism", owner_identity="organism-identity", checkpoint_id="x",
-            schema_version="v1", locator="x", sha256="0" * 64, recoverable=True,
-        )
+    contract.validate_checkpoint = lambda *_args: validation_result
 
     with pytest.raises(ManifestError, match="owner checkpoint validation"):
-        runtime.tick("receipt-transition", lambda _tick: (reference,))
+        runtime.tick("validation-transition", lambda _tick: (reference,))
     assert store.read().status is ManifestStatus.RECOVERY_REQUIRED
     assert store.read().causal_tick == 0
 
