@@ -19,7 +19,7 @@ from threading import Lock
 from types import MappingProxyType
 from typing import Protocol
 
-from .journal import CausalRecord, EventJournal
+from .journal import CausalRecord, EventJournal, _freeze_json, _thaw_json
 from .manifest import (
     CheckpointReference,
     DependencyVerifier,
@@ -65,7 +65,7 @@ class PresenceLifecycleTransition:
         if not isinstance(self.trigger_provenance, Mapping) or not self.trigger_provenance:
             raise ValueError("presence lifecycle requires explicit trigger provenance")
         _validate_json_object(self.trigger_provenance)
-        object.__setattr__(self, "trigger_provenance", MappingProxyType(dict(self.trigger_provenance)))
+        object.__setattr__(self, "trigger_provenance", _freeze_json(self.trigger_provenance))
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,7 +700,7 @@ class DurableWorldRuntime:
                                 },
                                 "source_tick": current.causal_tick,
                                 "target_tick": proposed_tick,
-                                "trigger_provenance": dict(presence_lifecycle.trigger_provenance),
+                                "trigger_provenance": _thaw_json(presence_lifecycle.trigger_provenance),
                                 "required_participants": [list(key) for key in sorted(expected_owners)],
                                 "owner_checkpoint_references": list(owner_refs),
                                 "resulting_active_presence_ids": sorted(active_presence),
@@ -767,7 +767,11 @@ class DurableWorldRuntime:
                 self._owner_checkpoint_contracts = {
                     key: proposed_contracts[key] for key in registered
                 }
-                if presence_lifecycle is not None and presence_lifecycle.transition_type == "REGISTER":
+                if (
+                    presence_lifecycle is not None
+                    and presence_lifecycle.transition_type == "REGISTER"
+                    and self.presence_id is None
+                ):
                     self.presence_id = presence_lifecycle.presence_id.value
                 elif (
                     presence_lifecycle is not None

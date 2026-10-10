@@ -1431,6 +1431,14 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
         ("presence-a", "organism", "organism-identity"),
         ("presence-b", "embodiment", "embodiment-identity"),
     )
+    # Registering another presence does not silently rebind this runtime's actor.
+    runtime.tick(
+        "ordinary-after-register",
+        lambda _tick: (_checkpoint(next_owner), _checkpoint(body, owner="embodiment")),
+    )
+    assert runtime.presence_id == "presence-a"
+    assert runtime.records[-1].actor_id == "presence-a"
+    assert runtime.records[-1].payload["presence_id"] == "presence-a"
     with pytest.raises(ManifestError, match="each active presence owner must be in the proposed registered owner roster"):
         runtime.tick(
             "unregister-linked-owner",
@@ -2457,3 +2465,15 @@ os._exit(74)
     assert recovered.status is ManifestStatus.COMMITTED
     assert recovered.causal_tick == committed_before.causal_tick
     assert recovered.manifest.commit_id == committed_before.commit_id
+
+
+def test_presence_lifecycle_detaches_and_deep_freezes_trigger_provenance():
+    supplied = {"source": {"principal": "operator", "labels": ["manual"]}}
+    transition = PresenceLifecycleTransition("REGISTER", PresenceId("presence-a"), supplied)
+    supplied["source"]["principal"] = "changed"
+    supplied["source"]["labels"].append("changed")
+
+    assert transition.trigger_provenance["source"]["principal"] == "operator"
+    assert transition.trigger_provenance["source"]["labels"] == ("manual",)
+    with pytest.raises(TypeError):
+        transition.trigger_provenance["source"]["principal"] = "mutated"
