@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import world.durable_runtime as durable_runtime_module
 import world.manifest as manifest_module
 from world import (
     CheckpointReference,
@@ -594,6 +595,85 @@ os._exit(74)
             ref for ref in committed_before.checkpoint_references if ref.owner != "world-journal"
         ) or pytest.fail("explicit recovery did not restore the prior owner cut"),
     )
+    assert recovered.status is ManifestStatus.COMMITTED
+    assert recovered.causal_tick == committed_before.causal_tick
+    assert recovered.manifest.commit_id == committed_before.commit_id
+    assert recovered.manifest.checkpoint_references == committed_before.checkpoint_references
+
+
+def test_journal_directory_fsync_failure_requires_recovery_to_previous_cut(tmp_path, monkeypatch):
+    """A reported journal-directory fsync failure cannot commit the candidate cut.
+
+    The failure is injected at the directory-fsync boundary, before invoking
+    the underlying OS call. This checks World failure handling, not the host
+    filesystem's behavior after a real fsync error or power loss.
+    """
+    world_id = WorldId("world-directory-fsync-failure")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_path = tmp_path / "journal"
+    journal_store = DurableJournalSnapshotStore(journal_path, world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"committed owner state at tick zero")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    committed_before = manifest_store.read()
+    initial_journals = tuple(journal_path.glob("journal-*.json"))
+    original_fsync_directory = durable_runtime_module._fsync_directory
+    fsync_attempts = []
+
+    def fail_journal_directory_fsync(path):
+        if Path(path) == journal_path:
+            fsync_attempts.append(Path(path))
+            raise OSError(5, "injected journal directory fsync failure")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(durable_runtime_module, "_fsync_directory", fail_journal_directory_fsync)
+
+    def write_candidate_owner(tick):
+        assert tick == 1
+        candidate_owner = tmp_path / "owner-1.json"
+        candidate_owner.write_bytes(b"candidate owner state at tick one")
+        return (_checkpoint(candidate_owner),)
+
+    with pytest.raises(OSError, match="injected journal directory fsync failure"):
+        runtime.tick("transition-directory-fsync-failure", write_candidate_owner)
+
+    assert fsync_attempts == [journal_path]
+    candidate_journals = tuple(
+        path for path in journal_path.glob("journal-*.json") if path not in initial_journals
+    )
+    assert len(candidate_journals) == 1
+    assert candidate_journals[0].name.startswith("journal-1-")
+
+    pending = manifest_store.read()
+    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.causal_tick == committed_before.causal_tick
+    assert pending.commit_id == committed_before.commit_id
+    assert pending.checkpoint_references == committed_before.checkpoint_references
+    assert set(journal_path.glob("journal-*.json")) == set(initial_journals) | set(candidate_journals)
+
+    restored_owner_references = []
+    recovered = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda references: restored_owner_references.extend(references),
+    )
+    assert restored_owner_references == [
+        reference for reference in committed_before.checkpoint_references if reference.owner != "world-journal"
+    ]
     assert recovered.status is ManifestStatus.COMMITTED
     assert recovered.causal_tick == committed_before.causal_tick
     assert recovered.manifest.commit_id == committed_before.commit_id
