@@ -18,13 +18,25 @@ jobs:
       - run: python -m pytest
 
   # Verifies World's coordination of the other authorities at the revisions
-  # pinned in the integration extra. Runs only where the read-only GitHub App
-  # credentials are configured; otherwise it is skipped, not passed.
+  # pinned in the integration extra. This is a required validation path: missing
+  # read-only GitHub App credentials fail visibly before any token is requested.
   integration:
-    if: ${{ vars.CI_READ_APP_ID != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Require integration read credentials
+        env:
+          CI_READ_APP_ID: ${{ vars.CI_READ_APP_ID }}
+          CI_READ_APP_PRIVATE_KEY: ${{ secrets.CI_READ_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "${CI_READ_APP_ID}" ]; then
+            echo "::error::Required integration configuration CI_READ_APP_ID is missing."
+            exit 1
+          fi
+          if [ -z "${CI_READ_APP_PRIVATE_KEY}" ]; then
+            echo "::error::Required integration secret CI_READ_APP_PRIVATE_KEY is missing."
+            exit 1
+          fi
       - uses: actions/create-github-app-token@v2
         id: app
         with:

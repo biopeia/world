@@ -52,3 +52,5 @@ python -m pytest tests/integration
 ```
 
 The default `python -m pytest` run does not collect them. The pins in the `integration` extra are the exact revisions the tests were verified against; a newer revision of another repository is not covered until the pin is moved and the tests rerun. Passing them shows the bounded composition they exercise. It is not a claim of physical calibration, solver equivalence, crash consistency or conformance with the target architecture.
+
+The `integration` CI job is required and never silently skipped. It requires the repository variable `CI_READ_APP_ID` and secret `CI_READ_APP_PRIVATE_KEY` so it can install pinned private-repository dependencies. Missing configuration fails the job with a value-free error before token creation; credentials are never printed. Configure both on the canonical repository. Forks without these credentials will show an explicit failed integration check rather than a false green result.
