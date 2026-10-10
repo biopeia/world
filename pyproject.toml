@@ -17,7 +17,7 @@ integration = [
     "pytest>=8",
     "mujoco==3.14.0",
     "organism @ git+https://github.com/biopeia/organism.git@fc8a91c61d865663ba6f9468216171506fd29e7a",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@6f5fd9edb46c3a4557733df08149453f16bddb9f",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@97cb09a82b0bc9bf4ad11f6497cce071b85efedd",
     "environment @ git+https://github.com/biopeia/environment.git@0a9f4fbb1922cc6ca9e7b2489cf891606ef9ee41",
     "observation @ git+https://github.com/biopeia/observation.git@186da664cdcb04d013fb2a359913bd9b2391e07e",
 ]
