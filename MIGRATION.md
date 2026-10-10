@@ -499,3 +499,11 @@ This demonstrates read-only cross-process visibility of one open transition on t
 | `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `8f8b2446e1328b4c7446d3538e56204139abf1b4` and the existing opaque owner-checkpoint callback contract; no historical implementation or API copied | REWRITE | After `PREPARING` is published, the subprocess owner callback writes only a prefix of a candidate checkpoint and exits without returning a checkpoint reference. No candidate journal or committed cut is published; restart requires explicit recovery to the prior cut. The test does not `fsync` the candidate and does not claim owner-byte durability. |
 
 This is a bounded process-termination test on the exercised local filesystem. It does not establish the behavior of arbitrary owner implementations, actual interrupted system calls, power loss, storage-device persistence, other filesystems/platforms, or general crash consistency. The partial candidate file remains outside the committed cut; orphan cleanup is not tested.
+
+## Injected journal directory-fsync failure (World #33)
+
+| Target path | Provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `tests/test_durable_runtime.py` | Follow-up Biopeia TARGET test for [World issue #33](https://github.com/biopeia/world/issues/33), based on World `f2334b9030ffbf7fc7d91a1da03ad8c83fd2ef7f` and the existing durable-journal contract; no historical implementation or API copied | REWRITE | Injects an `OSError` at the journal-directory-fsync boundary after the candidate journal link is visible, before calling the underlying OS `fsync`. World records `RECOVERY_REQUIRED` with the prior committed tick/refs; explicit recovery restores the prior cut. The candidate journal path remains visible but unreferenced. |
+
+This verifies World failure handling for an injected directory-fsync-boundary error. It does not exercise a real OS-level `fsync` failure, directory-entry durability after power loss, arbitrary filesystems/platforms, owner checkpoint durability, concurrent second-process mutation/recovery, or general crash consistency. World issue #33 remains open.
