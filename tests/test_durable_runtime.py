@@ -13,15 +13,15 @@ from world import (
     ManifestError,
     ManifestRecoveryRequiredError,
     ManifestStatus,
+    OwnerCausalRecord,
     PresenceId,
     PresenceOwnerLink,
     RecoveryRequiredError,
     WorldCausalManifest,
     WorldCausalManifestStore,
-    WorldId,
     WorldGenesisSpec,
+    WorldId,
 )
-
 
 
 def _initialize(
@@ -108,6 +108,268 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
     assert runtime.manifest.journal_last_sequence == 0
     assert len(runtime.manifest.checkpoint_references) == 2
     assert manifest_store._require_active() == runtime.manifest
+
+
+def test_owner_causal_record_survives_later_tick_and_restore(tmp_path):
+    world_id = WorldId("world-owner-record-history")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"owner zero")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    record_payload = {"checkpoint_sha256": "a" * 64, "nested": {"value": 3}}
+
+    def write_owner_records(tick, references):
+        assert tick == 1
+        assert references[0].owner == "organism"
+        return (
+            OwnerCausalRecord(
+                "organism",
+                "organism-identity",
+                "action-1",
+                record_payload,
+            ),
+        )
+
+    first_state = tmp_path / "owner-1.json"
+    first_state.write_bytes(b"owner one")
+    runtime.tick(
+        "transition-1",
+        lambda _tick: (_checkpoint(first_state),),
+        write_owner_records=write_owner_records,
+    )
+    record_payload["nested"]["value"] = 99
+
+    second_state = tmp_path / "owner-2.json"
+    second_state.write_bytes(b"owner two")
+    runtime.tick("transition-2", lambda _tick: (_checkpoint(second_state),))
+
+    restored = DurableWorldRuntime.restore(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _references: None,
+    )
+    owner_records = tuple(
+        item for item in restored.records if item.record_type == "world.owner_record.committed"
+    )
+    assert restored.causal_tick == 2
+    assert len(owner_records) == 1
+    assert owner_records[0].causal_tick == 1
+    assert owner_records[0].payload["owner_id"] == "organism"
+    assert owner_records[0].payload["owner_record_id"] == "action-1"
+    assert owner_records[0].payload["data"]["nested"]["value"] == 3
+
+
+def test_owner_causal_record_survives_recovery_after_later_failed_tick(tmp_path):
+    world_id = WorldId("world-owner-record-recovery")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"owner zero")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+
+    first_state = tmp_path / "owner-1.json"
+    first_state.write_bytes(b"owner one")
+    runtime.tick(
+        "transition-1",
+        lambda _tick: (_checkpoint(first_state),),
+        write_owner_records=lambda _tick, _refs: (
+            OwnerCausalRecord("organism", "organism-identity", "action-1", {"v": 1}),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="tick callback failed"):
+        runtime.tick(
+            "transition-2-failed",
+            lambda _tick: (_ for _ in ()).throw(RuntimeError("tick callback failed")),
+            write_owner_records=lambda _tick, _refs: (
+                OwnerCausalRecord("organism", "organism-identity", "action-2", {"v": 2}),
+            ),
+        )
+    assert manifest_store.read().status is ManifestStatus.RECOVERY_REQUIRED
+
+    recovered = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _refs: None,
+    )
+
+    owner_records = tuple(
+        item for item in recovered.records if item.record_type == "world.owner_record.committed"
+    )
+    assert recovered.status is ManifestStatus.COMMITTED
+    assert recovered.causal_tick == 1
+    assert [item.payload["owner_record_id"] for item in owner_records] == ["action-1"]
+
+
+def test_duplicate_owner_record_id_is_rejected_across_world_ticks(tmp_path):
+    world_id = WorldId("world-owner-record-unique")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"owner zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+
+    def commit_action(transition_id):
+        state = tmp_path / f"{transition_id}.json"
+        state.write_bytes(transition_id.encode())
+        return runtime.tick(
+            transition_id,
+            lambda _tick: (_checkpoint(state),),
+            write_owner_records=lambda _tick, _refs: (
+                OwnerCausalRecord("organism", "organism-identity", "same-action", {"v": 1}),
+            ),
+        )
+
+    commit_action("transition-1")
+    with pytest.raises(ManifestError, match="already committed"):
+        commit_action("transition-2")
+
+    assert manifest_store.read().causal_tick == 1
+    assert runtime.causal_tick == 1
+    assert len(tuple(item for item in runtime.records if item.record_type == "world.owner_record.committed")) == 1
+
+
+def test_owner_causal_records_must_be_unique_and_bound_to_participants(tmp_path):
+    world_id = WorldId("world-owner-record-boundary")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"owner zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    state = tmp_path / "owner-1.json"
+    state.write_bytes(b"owner one")
+
+    with pytest.raises(ManifestError, match="participating owner"):
+        runtime.tick(
+            "transition-unbound",
+            lambda _tick: (_checkpoint(state),),
+            write_owner_records=lambda _tick, _refs: (
+                OwnerCausalRecord("lab", "run-1", "action-1", {}),
+            ),
+        )
+    assert runtime.causal_tick == 0
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+    assert not any(item.record_type == "world.causal_tick.committed" for item in runtime.records)
+
+
+def test_owner_causal_record_rejects_duplicate_ids_within_tick_and_non_json_payload(tmp_path):
+    world_id = WorldId("world-owner-record-invalid")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"owner zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    state = tmp_path / "owner-1.json"
+    state.write_bytes(b"owner one")
+
+    with pytest.raises(ManifestError, match="duplicate owner causal record identities"):
+        runtime.tick(
+            "transition-duplicate",
+            lambda _tick: (_checkpoint(state),),
+            write_owner_records=lambda _tick, _refs: (
+                OwnerCausalRecord("organism", "organism-identity", "same", {}),
+                OwnerCausalRecord("organism", "organism-identity", "same", {}),
+            ),
+        )
+    assert runtime.causal_tick == 0
+    assert not runtime.records
+
+    with pytest.raises(TypeError, match="keys must be strings"):
+        OwnerCausalRecord("organism", "organism-identity", "invalid", {1: "not JSON object key"})
+
+
+def test_owner_causal_record_is_not_committed_when_manifest_publication_fails(tmp_path, monkeypatch):
+    world_id = WorldId("world-owner-record-publication-failure")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"owner zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    state = tmp_path / "owner-1.json"
+    state.write_bytes(b"owner one")
+
+    def fail_publication(*_args, **_kwargs):
+        raise OSError("simulated manifest publication failure")
+
+    monkeypatch.setattr(manifest_store, "_commit_transition", fail_publication)
+    with pytest.raises(OSError, match="simulated manifest publication failure"):
+        runtime.tick(
+            "transition-publication-failure",
+            lambda _tick: (_checkpoint(state),),
+            write_owner_records=lambda _tick, _refs: (
+                OwnerCausalRecord("organism", "organism-identity", "action-failed", {"v": 1}),
+            ),
+        )
+
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+    assert runtime.causal_tick == 0
+    assert not any(item.record_type == "world.owner_record.committed" for item in runtime.records)
+    assert tuple((tmp_path / "journal").glob("journal-1-*.json"))
 
 
 def test_complete_cut_requires_nonempty_stable_owner_identity_closure(tmp_path):

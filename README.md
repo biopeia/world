@@ -14,6 +14,8 @@ This remains a bounded coordinator, not a general crash-recovery protocol. `reco
 
 Tick-zero initialization uses atomic no-overwrite publication. Subsequent manifest operations use a POSIX advisory writer lock plus atomic replacement. This is a single-logical-writer protocol, not distributed consensus.
 
+During a durable tick, a participating owner may contribute opaque `OwnerCausalRecord` values. World binds each record to the current World/tick and the exact participating `(owner_id, owner_identity)`, rejects duplicate stable record identities within the World, and stores the records in the same immutable journal prefix referenced by the committed manifest. Payloads must be strict JSON objects and are detached before publication. World does not interpret the payload or claim scientific custody; the contributing owner retains those responsibilities. This proves durable identification alongside the committed cut under the existing bounded local persistence contract, not independent proof of owner semantics or power-loss durability.
+
 See [`MIGRATION.md`](MIGRATION.md) for exact source provenance, dispositions, validation scope, and deferred responsibilities.
 
 

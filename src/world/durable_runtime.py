@@ -11,11 +11,13 @@ import hashlib
 import json
 import os
 import tempfile
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
-from types import MappingProxyType
 from threading import Lock
-from typing import Callable, Iterable, Mapping, Protocol
+from types import MappingProxyType
+from typing import Protocol
 
 from .journal import CausalRecord, EventJournal
 from .manifest import (
@@ -27,7 +29,6 @@ from .manifest import (
     WorldCausalManifestStore,
 )
 from .runtime import PresenceId, RecoveryRequiredError, TickInProgressError, WorldId
-
 
 _JOURNAL_OWNER = "world-journal"
 _JOURNAL_SCHEMA = "event-journal-v1"
@@ -161,6 +162,68 @@ class DurableJournalSnapshotStore:
 OwnerCheckpointWriter = Callable[[int], Iterable[CheckpointReference]]
 OwnerCheckpointVerifier = Callable[[tuple[CheckpointReference, ...]], bool]
 OwnerCheckpointRestorer = Callable[[tuple[CheckpointReference, ...]], None]
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerCausalRecord:
+    """Opaque owner-authored record committed in a World causal journal.
+
+    ``owner_record_id`` is stable within the owner identity and World. World
+    binds the record to the causal tick and stores it without interpreting the
+    payload's domain meaning.
+    """
+
+    owner_id: str
+    owner_identity: str
+    owner_record_id: str
+    payload: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        for field_name in ("owner_id", "owner_identity", "owner_record_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        if not isinstance(self.payload, Mapping):
+            raise TypeError("owner causal record payload must be a JSON object")
+        _validate_json_object(self.payload)
+        # Validate strict JSON before freezing. CausalRecord performs the
+        # immutable nested copy when the journal record is materialized.
+        json.dumps(self.payload, allow_nan=False)
+
+
+OwnerCausalRecordWriter = Callable[
+    [int, tuple[CheckpointReference, ...]], Iterable[OwnerCausalRecord]
+]
+
+
+_OWNER_CAUSAL_RECORD_TYPE = "world.owner_record.committed"
+
+
+def _validate_json_object(value: object) -> None:
+    """Reject non-JSON values and non-string object keys without coercion."""
+    if not isinstance(value, Mapping):
+        raise TypeError("owner causal record payload must be a JSON object")
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError("owner causal record payload keys must be strings")
+        _validate_json_value(item)
+
+
+def _validate_json_value(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("owner causal record payload keys must be strings")
+            _validate_json_value(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_json_value(item)
+    elif value is None or isinstance(value, (str, bool, int)) or (
+        isinstance(value, float) and isfinite(value)
+    ):
+        return
+    else:
+        raise TypeError(f"unsupported owner causal record payload value: {type(value).__name__}")
 
 
 class OwnerCheckpointContract(Protocol):
@@ -406,6 +469,7 @@ class DurableWorldRuntime:
         transition_id: str,
         write_owner_checkpoints: OwnerCheckpointWriter,
         *,
+        write_owner_records: OwnerCausalRecordWriter | None = None,
         register_owners: Iterable[tuple[str, str]] = (),
         unregister_owners: Iterable[tuple[str, str]] = (),
         step_participants: Iterable[tuple[str, str]] = (),
@@ -482,6 +546,22 @@ class DurableWorldRuntime:
                     raise ManifestError("transition lacks an owner recoverability contract for every participant")
                 if not self._validate_owner_checkpoints(owner_references, proposed_contracts):
                     raise ManifestError("owner checkpoint validation failed for one or more checkpoint references")
+                owner_records = tuple(
+                    write_owner_records(proposed_tick, owner_references)
+                    if write_owner_records is not None
+                    else ()
+                )
+                owner_record_keys = tuple(
+                    (item.owner_id, item.owner_identity, item.owner_record_id)
+                    for item in owner_records
+                )
+                if len(set(owner_record_keys)) != len(owner_record_keys):
+                    raise ManifestError("tick contains duplicate owner causal record identities")
+                if any(
+                    (item.owner_id, item.owner_identity) not in expected_owners
+                    for item in owner_records
+                ):
+                    raise ManifestError("owner causal record must belong to a participating owner")
                 record = CausalRecord(
                     record_id=f"{self.world_id.value}:tick:{proposed_tick}",
                     world_id=self.world_id.value,
@@ -491,7 +571,38 @@ class DurableWorldRuntime:
                     payload={"presence_id": self.presence_id},
                 )
                 candidate_journal = EventJournal.from_snapshot(self._journal.snapshot())
+                existing_owner_record_keys = self._owner_causal_record_keys(
+                    candidate_journal.replay()
+                )
+                if existing_owner_record_keys.intersection(owner_record_keys):
+                    raise ManifestError("owner causal record identity was already committed in this World")
                 candidate_journal.append(record)
+                for owner_record in owner_records:
+                    encoded_identity = json.dumps(
+                        [owner_record.owner_id, owner_record.owner_identity, owner_record.owner_record_id],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    owner_record_event_id = hashlib.sha256(encoded_identity).hexdigest()
+                    # Round-trip into a detached JSON tree so the journal never
+                    # retains caller-owned mutable payload containers.
+                    payload = json.loads(json.dumps(owner_record.payload, allow_nan=False))
+                    candidate_journal.append(
+                        CausalRecord(
+                            record_id=(
+                                f"{self.world_id.value}:owner-record:{proposed_tick}:{owner_record_event_id}"
+                            ),
+                            world_id=self.world_id.value,
+                            causal_tick=proposed_tick,
+                            record_type=_OWNER_CAUSAL_RECORD_TYPE,
+                            payload={
+                                "owner_id": owner_record.owner_id,
+                                "owner_identity": owner_record.owner_identity,
+                                "owner_record_id": owner_record.owner_record_id,
+                                "data": payload,
+                            },
+                        )
+                    )
                 journal_reference = self._journal_store.write(candidate_journal, causal_tick=proposed_tick)
                 references = (*owner_references, journal_reference)
                 candidate = WorldCausalManifest(
@@ -592,8 +703,16 @@ class DurableWorldRuntime:
         records = journal.replay()
         if any(record.world_id != manifest.world_id for record in records):
             raise ManifestError("journal contains a record for another World")
-        if tuple(record.causal_tick for record in records) != tuple(range(1, manifest.causal_tick + 1)):
+        commit_ticks = tuple(
+            record.causal_tick
+            for record in records
+            if record.record_type == "world.causal_tick.committed"
+        )
+        if commit_ticks != tuple(range(1, manifest.causal_tick + 1)):
             raise ManifestError("journal does not cover the manifest causal tick prefix")
+        if any(record.causal_tick < 1 or record.causal_tick > manifest.causal_tick for record in records):
+            raise ManifestError("journal contains a record outside the committed causal tick prefix")
+        DurableWorldRuntime._owner_causal_record_keys(records)
         expected_last = len(records) - 1 if records else None
         if manifest.journal_last_sequence != expected_last:
             raise ManifestError("manifest journal sequence does not match persisted record prefix")
@@ -609,6 +728,29 @@ class DurableWorldRuntime:
         if not owner_references:
             raise ManifestError(f"{cut_description} must identify at least one durable owner checkpoint")
         return owner_references
+
+    @staticmethod
+    def _owner_causal_record_keys(
+        records: Iterable[CausalRecord],
+    ) -> set[tuple[str, str, str]]:
+        """Validate and return unique World-scoped owner record identities."""
+        keys: set[tuple[str, str, str]] = set()
+        for record in records:
+            if record.record_type != _OWNER_CAUSAL_RECORD_TYPE:
+                continue
+            payload = record.payload
+            if set(payload) != {"owner_id", "owner_identity", "owner_record_id", "data"}:
+                raise ManifestError("persisted owner causal record has an invalid envelope")
+            owner_id = payload["owner_id"]
+            owner_identity = payload["owner_identity"]
+            owner_record_id = payload["owner_record_id"]
+            if any(not isinstance(value, str) or not value.strip() for value in (owner_id, owner_identity, owner_record_id)):
+                raise ManifestError("persisted owner causal record has an invalid stable identity")
+            key = (owner_id, owner_identity, owner_record_id)
+            if key in keys:
+                raise ManifestError("journal contains a duplicate owner causal record identity")
+            keys.add(key)
+        return keys
 
 
 def _fsync_directory(path: Path) -> None:
