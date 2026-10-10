@@ -147,6 +147,9 @@ def _generated_scene() -> StaticPhysicalScene:
         sphere_count=2,
         minimum_radius_m=0.20,
         maximum_radius_m=0.20,
+        # The fixture's MuJoCo scene explicitly models frictionless contacts.
+        # Keep Environment genesis consistent with that solver configuration.
+        sphere_sliding_friction_coefficient=0.0,
     )
     spec = EnvironmentGenesisSpec(
         environment_seed=82731,
