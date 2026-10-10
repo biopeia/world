@@ -80,6 +80,7 @@ from organism.actuation import (
     SequenceController,
     motor_command_from_frame,
 )
+from organism.actuation.system import ActuatorSystem
 from organism.agency import (
     ActionAffordance,
     ActionIntent,
@@ -115,6 +116,7 @@ EPISODE_ID = "episode.integration-1"
 MORPHOLOGY_REVISION = "morphology.integration-r1"
 ENVIRONMENT_REVISION = "environment.integration-r1"
 ENVIRONMENT_ID = "environment.integration-1"
+ENVIRONMENT_OWNER_ID = "owner.environment.static-scene-1"
 SOLVER_CONFIGURATION_REVISION = f"mujoco-{mujoco.__version__}-free-root-box-euler-dt0.01-ground-half-extent-10m-r2"
 
 
@@ -269,9 +271,11 @@ def _environment_owner() -> StaticEnvironmentOwner:
         gravity_m_s2=(0.0, 0.0, -9.81),
         objects=(StaticGroundPlane("ground.z0", (0.0, 0.0, 1.0), 0.0),),
     )
-    return StaticEnvironmentOwner(
-        scene, owner_id=ENVIRONMENT_ID, world_id=WORLD_ID
+    owner = StaticEnvironmentOwner(
+        scene, owner_id=ENVIRONMENT_OWNER_ID, world_id=WORLD_ID
     )
+    assert owner.owner_id != owner.scene.environment_id
+    return owner
 
 
 def _execute_mujoco_step(body_input, scene, actuation):
@@ -378,7 +382,7 @@ def _store_initial_state(root: Path, environment: StaticEnvironmentOwner, physic
         _write_checkpoint(
             root,
             owner="environment",
-            owner_identity=ENVIRONMENT_ID,
+            owner_identity=ENVIRONMENT_OWNER_ID,
             checkpoint_id="environment-tick-0",
             schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
             encoded=environment.checkpoint_bytes(),
@@ -423,7 +427,7 @@ def _run_valid_step(
 
     def validate_environment(encoded: bytes) -> bool:
         return StaticEnvironmentOwner.validate_checkpoint(
-            encoded, ENVIRONMENT_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA
+            encoded, ENVIRONMENT_OWNER_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA
         )
 
     def validate_organism(encoded: bytes) -> bool:
@@ -441,8 +445,8 @@ def _run_valid_step(
             schema_version="embodiment-physical-state-v2",
             validate=validate_embodiment,
         ),
-        ("environment", ENVIRONMENT_ID): _FilesystemOwnerContract(
-            owner_identity=ENVIRONMENT_ID,
+        ("environment", ENVIRONMENT_OWNER_ID): _FilesystemOwnerContract(
+            owner_identity=ENVIRONMENT_OWNER_ID,
             schema_version=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
             validate=validate_environment,
         ),
@@ -470,6 +474,24 @@ def _run_valid_step(
             for ref in refs
         ),
     )
+    # World registers the causal owner identity; the Environment-owned
+    # checkpoint binds that registered owner to its distinct environment ID.
+    environment_registration = ("environment", environment.owner_id)
+    assert environment_registration in durable_world.manifest.registered_owner_ids
+    environment_reference = next(
+        ref
+        for ref in initial_references
+        if (ref.owner, ref.owner_identity) == environment_registration
+    )
+    assert (
+        environment_reference.owner,
+        environment_reference.owner_identity,
+    ) == environment_registration
+    restored_environment = StaticEnvironmentOwner.from_checkpoint_bytes(
+        Path(environment_reference.locator).read_bytes()
+    )
+    assert restored_environment.owner_id == environment.owner_id
+    assert restored_environment.scene.environment_id == ENVIRONMENT_ID
 
     actuator_surface = ActuatorSurface.from_effector_ids(
         ("joint.elbow", "joint.wrist"),
@@ -607,12 +629,22 @@ def _run_valid_step(
         )
         assert command.commitment_id == commitment.commitment_id
         assert command.competence_id == decision.competence_id
+        delivered_actuations = ActuatorSystem().execute_command(command, actuator_surface)
+        assert tuple(
+            (item.actuator_id, item.delivered) for item in delivered_actuations
+        ) == command.channels
+        delivered_command = replace(
+            command,
+            channels=tuple(
+                (item.actuator_id, item.delivered) for item in delivered_actuations
+            ),
+        )
         physiology = LivingBodyState(energy_reserve=1.0, max_energy=2.0)
         embodiment_checkpoint = EmbodimentCheckpoint(
             BODY_ID, EPISODE_ID, physiology, MetabolicLedger(body_state=physiology)
         )
         actuation = project_motor_command(
-            command,
+            delivered_command,
             _actuator_binding(
                 surface,
                 binding_id="binding.physical-e2e.body.r1",
@@ -751,7 +783,7 @@ def _run_valid_step(
             _write_checkpoint(
                 root / "owners",
                 owner="environment",
-                owner_identity=ENVIRONMENT_ID,
+                owner_identity=ENVIRONMENT_OWNER_ID,
                 checkpoint_id=f"environment-tick-{causal_tick}",
                 schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
                 encoded=environment.checkpoint_bytes(),
@@ -808,6 +840,18 @@ def _run_valid_step(
     assert restored == adopted
     assert restored.causal_tick == staged["correlation"].causal_tick + 1 == record.causal_tick
     assert restored.last_physical_step == staged["correlation"]
+    environment_registration = ("environment", ENVIRONMENT_OWNER_ID)
+    committed_environment_references = tuple(
+        ref
+        for ref in durable_world.manifest.checkpoint_references
+        if (ref.owner, ref.owner_identity) == environment_registration
+    )
+    assert len(committed_environment_references) == 1
+    committed_environment = StaticEnvironmentOwner.from_checkpoint_bytes(
+        Path(committed_environment_references[0].locator).read_bytes()
+    )
+    assert committed_environment.owner_id == ENVIRONMENT_OWNER_ID
+    assert committed_environment.scene.environment_id == ENVIRONMENT_ID
 
     body_identity = IdentityAssertion(
         IdentityRef("body_id", BODY_ID, ActorRef("domain", "embodiment"), scope=EPISODE_ID),
@@ -919,10 +963,10 @@ def _run_stale_morphology(root: Path) -> tuple[ManifestStatus, int, int]:
                 and EmbodimentPhysicalState.restore_checkpoint(b).embodiment_episode_id == EPISODE_ID
             ),
         ),
-        ("environment", ENVIRONMENT_ID): (
+        ("environment", ENVIRONMENT_OWNER_ID): (
             StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
             lambda b: StaticEnvironmentOwner.validate_checkpoint(
-                b, ENVIRONMENT_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA
+                b, ENVIRONMENT_OWNER_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA
             ),
         ),
     }
@@ -1126,7 +1170,7 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
             checkpoint_id="embodiment-tick-0", schema=articulated_schema, encoded=owner_state.checkpoint_bytes(),
         ),
         _write_checkpoint(
-            tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_ID,
+            tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_OWNER_ID,
             checkpoint_id="environment-tick-0", schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
             encoded=environment.checkpoint_bytes(),
         ),
@@ -1146,10 +1190,10 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
             owner_identity=articulated_body_id, schema_version=articulated_schema,
             validate=valid_body_checkpoint,
         ),
-        ("environment", ENVIRONMENT_ID): _FilesystemOwnerContract(
-            owner_identity=ENVIRONMENT_ID, schema_version=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
+        ("environment", ENVIRONMENT_OWNER_ID): _FilesystemOwnerContract(
+            owner_identity=ENVIRONMENT_OWNER_ID, schema_version=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
             validate=lambda encoded: StaticEnvironmentOwner.validate_checkpoint(
-                encoded, ENVIRONMENT_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA
+                encoded, ENVIRONMENT_OWNER_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA
             ),
         ),
     }
@@ -1267,7 +1311,7 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
                 checkpoint_id="embodiment-tick-1", schema=articulated_schema, encoded=adopted.checkpoint_bytes(),
             ),
             _write_checkpoint(
-                tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_ID,
+                tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_OWNER_ID,
                 checkpoint_id="environment-tick-1", schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
                 encoded=environment.checkpoint_bytes(),
             ),
@@ -1438,7 +1482,7 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
                 encoded=continued_body.checkpoint_bytes(),
             ),
             _write_checkpoint(
-                tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_ID,
+                tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_OWNER_ID,
                 checkpoint_id="environment-tick-2", schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
                 encoded=restored_environment.checkpoint_bytes(),
             ),
