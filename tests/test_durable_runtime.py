@@ -120,6 +120,83 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
     assert manifest_store._require_active() == runtime.manifest
 
 
+def test_second_process_can_observe_preparing_manifest_while_writer_callback_is_open(tmp_path):
+    """A separate process can read the pending cut without joining the write.
+
+    This is a single-logical-writer observation test: the writer pauses in its
+    owner callback after publishing PREPARING, a child process reads that
+    manifest, and only then does the original writer continue and commit. It
+    does not establish multi-writer coordination or cross-process recovery.
+    """
+    world_id = WorldId("world-second-process-observation")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_store = WorldCausalManifestStore(manifest_path)
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"owner state at tick zero")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+
+    reader = r"""
+import json
+import sys
+from world import WorldCausalManifestStore
+
+manifest = WorldCausalManifestStore(sys.argv[1]).read()
+print(json.dumps({
+    "status": manifest.status.value,
+    "causal_tick": manifest.causal_tick,
+    "pending_transition_id": manifest.pending_transition_id,
+    "pending_tick": manifest.pending_tick,
+}))
+"""
+
+    def write_owner_checkpoint(tick: int):
+        assert tick == 1
+        result = subprocess.run(
+            [sys.executable, "-c", reader, str(manifest_path)],
+            cwd=Path(__file__).resolve().parents[1],
+            env={
+                **os.environ,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        observed = json.loads(result.stdout)
+        assert observed == {
+            "status": ManifestStatus.PREPARING.value,
+            "causal_tick": 0,
+            "pending_transition_id": "transition-visible-to-second-process",
+            "pending_tick": 1,
+        }
+
+        state = tmp_path / "owner-1.json"
+        state.write_bytes(b"owner state at tick one")
+        return (_checkpoint(state),)
+
+    record = runtime.tick(
+        "transition-visible-to-second-process",
+        write_owner_checkpoint,
+    )
+
+    assert record.causal_tick == 1
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert manifest_store.read().commit_id == "transition-visible-to-second-process"
+
+
 def test_owner_causal_record_survives_later_tick_and_restore(tmp_path):
     world_id = WorldId("world-owner-record-history")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
