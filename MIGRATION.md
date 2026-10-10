@@ -438,7 +438,7 @@ This is World-owned consumer integration evidence only. It does not add or authe
 
 World integration fixtures and the pinned integration dependency now use the
 Embodiment owner schema `embodiment-checkpoint-v2` introduced at
-`biopeia/embodiment@9da395da6e74d0f86dec0ef7469c18ded8bff7b9`. Prior v1
+`biopeia/embodiment@028e2f912eccbe554a9d7f8543fe9dfe2bb94218`. Prior v1
 checkpoint references are not accepted as current TARGET test data. This
 updates only World-owned test fixtures and the explicit integration pin; World
 continues to treat owner checkpoint payloads as opaque. It does not add
