@@ -9,4 +9,4 @@ permissions:
 
 jobs:
   validate:
-    uses: biopeia/.github-private/.github/workflows/auto-pr-checks.yml@9e9e0edf2efc6d8f8b148497ec05b20faf9e20e9
+    uses: biopeia/.github/.github/workflows/auto-pr-checks.yml@89e79268aac967abe3ed0c666feefa5ebb73ae7e
