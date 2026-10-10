@@ -69,8 +69,7 @@ from observation.semantic import (
     SubjectScope,
 )
 from organism.actuation import (
-    ActionArbitrator,
-    ActionCommitment,
+    ActionDomain,
     ActionEvaluation,
     ActionJustification,
     ActionProposal,
@@ -78,14 +77,10 @@ from organism.actuation import (
     ActuatorSurface,
     MotorIntent,
     SequenceController,
-    motor_command_from_frame,
 )
-from organism.actuation.system import ActuatorSystem
 from organism.agency import (
     ActionAffordance,
-    ActionIntent,
     ExecutiveAdmissionPolicy,
-    IntentStatus,
     admit_afforded_action,
 )
 from organism.identity import OrganismIdentity
@@ -549,27 +544,15 @@ def _run_valid_step(
     assert decision is not None
     assert decision.competence_id == "competence.fixture"
     assert decision.supporting_affordance_id == affordance.affordance_id
-    intent = ActionIntent(
+    action_domain = ActionDomain()
+    intent = action_domain.admit(
+        decision,
+        supporting_affordance=affordance,
         intent_id="intent.physical-e2e",
-        competence_id=decision.competence_id,
-        anticipated_effect_id=decision.anticipated_effect_id,
         context_ref=affordance.context_ref,
         embodiment_id=affordance.embodiment_id,
-        origin_refs=decision.origin_refs,
-        prediction_ref=decision.prediction_ref,
-        confidence=decision.confidence,
-        epistemic_relevance=decision.epistemic_relevance,
-        homeostatic_relevance=decision.homeostatic_relevance,
-        supporting_affordance_id=decision.supporting_affordance_id,
-        created_tick=0,
-        activated_tick=None,
-        last_progress_tick=0,
-        status=IntentStatus.PENDING,
-        termination_reason=None,
-        admission=decision.admission,
+        tick=0,
     )
-    intent.transition(IntentStatus.ACTIVE, tick=1)
-    assert intent.status is IntentStatus.ACTIVE
     proposal = ActionProposal(
         proposal_id="proposal.physical-e2e",
         source=ActionSource.PROSPECTION,
@@ -590,19 +573,20 @@ def _run_valid_step(
         ),
         intent_id=intent.intent_id,
     )
-    arbitration = ActionArbitrator().choose(proposals=(proposal,), tick=1)
-    assert arbitration.proposal is proposal
-    commitment = ActionCommitment(
+    selection = action_domain.select_and_commit(
+        (proposal,),
+        tick=1,
         commitment_id="commitment.physical-e2e",
-        proposal_id=proposal.proposal_id,
-        effect_target_id=proposal.effect_target_id,
-        competence_id=proposal.competence_id,
-        started_tick=1,
         controller_id="controller.integration",
-        surface_fingerprint=actuator_surface.contract_fingerprint,
+        surface=actuator_surface,
         embodiment_id=EPISODE_ID,
-        intent_id=intent.intent_id,
+        interruptibility=1.0,
+        minimum_duration=0,
+        maximum_duration=None,
     )
+    assert selection.decision.proposal is proposal
+    commitment = selection.commitment
+    assert commitment is not None
     assert commitment.intent_id == intent.intent_id
     # One command channel only: the missing right channel remains NO COMMAND.
     controller = SequenceController(
@@ -630,16 +614,14 @@ def _run_valid_step(
             _articulated_free_root_state(physical_state, _free_root_box_spec()),
             correlation=correlation,
         )
-        frame = controller.frame(commitment, tick=context.target_causal_tick)
-        command = motor_command_from_frame(
-            commitment,
-            frame,
+        command = action_domain.issue_command(
+            controller,
+            tick=context.target_causal_tick,
             command_id=f"motor-command-{context.target_causal_tick}",
-            issued_at_tick=context.target_causal_tick,
         )
         assert command.commitment_id == commitment.commitment_id
         assert command.competence_id == decision.competence_id
-        delivered_actuations = ActuatorSystem().execute_command(command, actuator_surface)
+        delivered_actuations = action_domain.execute(command, actuator_surface)
         assert tuple(
             (item.actuator_id, item.delivered) for item in delivered_actuations
         ) == command.channels
