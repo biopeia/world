@@ -23,7 +23,6 @@ from .manifest import (
     DependencyVerifier,
     ManifestError,
     ManifestStatus,
-    OwnerRecoveryReceipt,
     WorldCausalManifest,
     WorldCausalManifestStore,
 )
@@ -165,7 +164,7 @@ OwnerCheckpointRestorer = Callable[[tuple[CheckpointReference, ...]], None]
 
 
 class OwnerCheckpointContract(Protocol):
-    """Owner codec capability; World, not the owner adapter, issues receipts."""
+    """Owner codec capability used to validate checkpoint bytes in process."""
 
     def validate_checkpoint(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool: ...
 
@@ -302,7 +301,7 @@ class DurableWorldRuntime:
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("causal cut checkpoint dependency closure is not verified")
         owner_checkpoint_restorer(tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER))
-        if not cls._verify_owner_receipts(
+        if not cls._validate_owner_checkpoints(
             tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER),
             contracts,
             method="verify_restoration",
@@ -367,7 +366,7 @@ class DurableWorldRuntime:
 
         owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
         owner_checkpoint_restorer(owner_references)
-        if not cls._verify_owner_receipts(owner_references, contracts, method="verify_restoration"):
+        if not cls._validate_owner_checkpoints(owner_references, contracts, method="verify_restoration"):
             raise ManifestError("owner restoration validation failed for one or more checkpoint references")
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("previous causal cut dependency closure changed during recovery")
@@ -481,7 +480,7 @@ class DurableWorldRuntime:
                     )
                 if not self._contracts_cover_keys(expected_owners, proposed_contracts):
                     raise ManifestError("transition lacks an owner recoverability contract for every participant")
-                if not self._verify_owner_receipts(owner_references, proposed_contracts):
+                if not self._validate_owner_checkpoints(owner_references, proposed_contracts):
                     raise ManifestError("owner checkpoint validation failed for one or more checkpoint references")
                 record = CausalRecord(
                     record_id=f"{self.world_id.value}:tick:{proposed_tick}",
@@ -542,12 +541,12 @@ class DurableWorldRuntime:
         owner_refs = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
         if len(journal_refs) != 1 or not DurableJournalSnapshotStore.verify(journal_refs[0]):
             return False
-        return bool(owner_checkpoint_verifier(owner_refs)) and DurableWorldRuntime._verify_owner_receipts(
+        return bool(owner_checkpoint_verifier(owner_refs)) and DurableWorldRuntime._validate_owner_checkpoints(
             owner_refs, owner_checkpoint_contracts
         )
 
     @staticmethod
-    def _verify_owner_receipts(
+    def _validate_owner_checkpoints(
         references: tuple[CheckpointReference, ...],
         contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
         *,
@@ -569,19 +568,6 @@ class DurableWorldRuntime:
             except Exception:
                 return False
             if validated is not True:
-                return False
-            # Only World constructs the receipt after verifying the exact bytes
-            # and receiving a positive validation result from the owner codec.
-            receipt = OwnerRecoveryReceipt(
-                owner=reference.owner,
-                owner_identity=reference.owner_identity,
-                checkpoint_id=reference.checkpoint_id,
-                schema_version=reference.schema_version,
-                locator=reference.locator,
-                sha256=reference.sha256,
-                recoverable=True,
-            )
-            if not receipt.matches(reference):
                 return False
         return True
 

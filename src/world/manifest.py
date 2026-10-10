@@ -59,30 +59,6 @@ class CheckpointReference:
 
 
 @dataclass(frozen=True, slots=True)
-class OwnerRecoveryReceipt:
-    """Trusted owner-component attestation bound to one exact checkpoint ref."""
-
-    owner: str
-    owner_identity: str
-    checkpoint_id: str
-    schema_version: str
-    locator: str
-    sha256: str
-    recoverable: bool
-
-    def matches(self, reference: CheckpointReference) -> bool:
-        return self == OwnerRecoveryReceipt(
-            owner=reference.owner,
-            owner_identity=reference.owner_identity,
-            checkpoint_id=reference.checkpoint_id,
-            schema_version=reference.schema_version,
-            locator=reference.locator,
-            sha256=reference.sha256,
-            recoverable=True,
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class WorldCausalManifest:
     """World-owned description of a committed cut or pending transition."""
 
