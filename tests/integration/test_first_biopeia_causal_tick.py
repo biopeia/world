@@ -17,6 +17,10 @@ from embodiment.checkpoint import EmbodimentCheckpoint
 from embodiment.metabolism import MetabolicLedger
 from embodiment.observation import BodyPoseSample
 from embodiment.physiology import LivingBodyState
+from embodiment.physics3d.actuator_binding import (
+    ActuatorChannelBinding,
+    EmbodimentActuatorBinding,
+)
 from embodiment.physics3d.actuation_projection import project_motor_command
 from observation.projection import runtime_tick_events
 from organism.actuation import (
@@ -89,6 +93,38 @@ class TickSnapshot:
     motor_command_id: str
     world_record_id: str
     observations: tuple[dict[str, object], ...]
+
+
+def _actuator_binding(
+    surface: PhysicalSurface,
+    *,
+    binding_id: str,
+    body_id: str,
+    embodiment_episode_id: str,
+) -> EmbodimentActuatorBinding:
+    """Build the Embodiment-owned map from explicit fixture channel IDs."""
+    return EmbodimentActuatorBinding(
+        binding_id=binding_id,
+        body_id=body_id,
+        embodiment_episode_id=embodiment_episode_id,
+        morphology_revision=surface.morphology_revision,
+        source_surface_fingerprint=surface.contract_fingerprint,
+        channels=tuple(
+            ActuatorChannelBinding(
+                actuator_id=channel.actuator_id,
+                effector_id=channel.effector_id,
+                command_kind=channel.command_kind,
+                quantity=channel.quantity,
+                unit=channel.unit,
+                minimum=channel.minimum,
+                neutral=channel.neutral,
+                maximum=channel.maximum,
+                saturation=channel.saturation,
+                available=channel.available,
+            )
+            for channel in surface.channels
+        ),
+    )
 
 
 def _run_three_ticks() -> tuple[OrganismIdentity, tuple[TickSnapshot, ...]]:
@@ -214,7 +250,12 @@ def _run_three_ticks() -> tuple[OrganismIdentity, tuple[TickSnapshot, ...]]:
             )
             physical_actuation = project_motor_command(
                 command,
-                physical_surface,
+                _actuator_binding(
+                    physical_surface,
+                    binding_id="binding.integration-body.r1",
+                    body_id=body_id,
+                    embodiment_episode_id=episode_id,
+                ),
                 active_morphology,
                 body_pose=body_pose,
                 embodiment_checkpoint=candidate_embodiment,
