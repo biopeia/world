@@ -351,7 +351,9 @@ def _store_initial_state(root: Path, environment: StaticEnvironmentOwner, physic
     return references, organism_payload
 
 
-def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[str, object], tuple[SemanticObservation[object], ...]]:
+def _run_valid_step(
+    root: Path, *, reverse_surface: bool = True, wrong_environment_world: bool = False
+) -> tuple[dict[str, object], tuple[SemanticObservation[object], ...]]:
     world_id = WorldId(WORLD_ID)
     environment = _environment_owner()
     initial_pose = BodyPoseSample(
@@ -589,6 +591,15 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
 
     def project_environment(context: PhysicalStepContext):
         assert context.environment_revision == environment.scene.environment_revision
+        # This expected owner correlation is derived from World authority before
+        # solver execution; adoption must never trust the candidate to define it.
+        staged["environment_expected_correlation"] = EnvironmentStepCorrelation(
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            environment_id=environment.scene.environment_id,
+            environment_revision=context.environment_revision,
+        )
         return environment.scene
 
     def execute_solver(context, body_projection, environment_projection):
@@ -616,7 +627,7 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
             angular_velocity_rad_per_s=angular_velocity_rad_per_s,
         )
         environment_correlation = EnvironmentStepCorrelation(
-            world_id=context.world_id,
+            world_id=("unrelated-world" if wrong_environment_world else context.world_id),
             causal_tick=context.source_causal_tick,
             physical_step_id=context.physical_step_id,
             environment_id=environment_projection.environment_id,
@@ -634,12 +645,13 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
         staged.update(candidate=candidate, adopted=adopted_state)
 
     def adopt_environment(context: PhysicalStepContext, candidate: StaticSceneCandidate) -> None:
-        environment_correlation = candidate.correlation
-        if environment_correlation.causal_tick != context.source_causal_tick:
-            raise ValueError("environment candidate has a stale source causal tick")
+        expected_correlation = staged["environment_expected_correlation"]
+        assert isinstance(expected_correlation, EnvironmentStepCorrelation)
+        assert expected_correlation.world_id == context.world_id
+        assert expected_correlation.causal_tick == context.source_causal_tick
         environment.validate_and_adopt(
             candidate,
-            expected_correlation=environment_correlation,
+            expected_correlation=expected_correlation,
         )
         environment_projection = {
             "environment_revision": environment.scene.environment_revision,
@@ -655,6 +667,7 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
         staged["environment"] = environment_projection
 
     def write_owner_checkpoints(context: PhysicalStepContext) -> tuple[CheckpointReference, ...]:
+        staged["checkpoint_writes_started"] = True
         causal_tick = context.target_causal_tick
         adopted_state = staged["adopted"]
         command = staged["command"]
@@ -712,6 +725,28 @@ def _run_valid_step(root: Path, *, reverse_surface: bool = True) -> tuple[dict[s
         adopt_environment=adopt_environment,
         write_checkpoints=write_owner_checkpoints,
     )
+    if wrong_environment_world:
+        with pytest.raises(ValueError, match="candidate correlation does not match expected"):
+            run_physical_step(
+                durable_world,
+                commit_id="physical-step-commit-1",
+                physical_step_id="physical-step-1",
+                body_id=BODY_ID,
+                embodiment_episode_id=EPISODE_ID,
+                morphology_revision=MORPHOLOGY_REVISION,
+                environment_revision=ENVIRONMENT_REVISION,
+                solver_config_revision=SOLVER_CONFIGURATION_REVISION,
+                ports=ports,
+            )
+        assert durable_world.status is ManifestStatus.RECOVERY_REQUIRED
+        assert durable_world.causal_tick == 0
+        assert durable_world.manifest.pending_tick == 1
+        assert environment.last_adopted_tick == -1
+        assert staged.get("checkpoint_writes_started") is not True
+        assert staged["environment_expected_correlation"].world_id == WORLD_ID
+        assert staged["environment_expected_correlation"].physical_step_id == "physical-step-1"
+        return {"status": durable_world.status.value, "tick": durable_world.causal_tick}, ()
+
     record = run_physical_step(
         durable_world,
         commit_id="physical-step-commit-1",
@@ -942,6 +977,14 @@ def test_first_biopeia_end_to_end_physical_causal_step_is_deterministic(tmp_path
         AuthorityDomain.ENVIRONMENT,
     ]
     assert observations[0].claim.value["status"] == ManifestStatus.COMMITTED.value
+
+
+def test_wrong_world_environment_candidate_cannot_publish_the_next_world_cut(tmp_path: Path) -> None:
+    result, observations = _run_valid_step(
+        tmp_path / "wrong-environment-world", wrong_environment_world=True
+    )
+    assert result == {"status": ManifestStatus.RECOVERY_REQUIRED.value, "tick": 0}
+    assert observations == ()
 
 
 def test_stale_morphology_candidate_cannot_publish_the_next_world_cut(tmp_path: Path) -> None:
