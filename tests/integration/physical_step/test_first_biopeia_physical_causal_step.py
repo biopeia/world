@@ -1223,37 +1223,81 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
             ) for ref in refs if ref.owner != "world"
         ),
     )
-    correlation = PhysicalStepCorrelation(
-        WORLD_ID, 0, "physical-step-articulated-1", articulated_body_id,
-        articulated_episode, articulated_revision, ENVIRONMENT_REVISION,
-        f"mujoco-{mujoco.__version__}-articulated-hinge-euler-dt0.01-r1",
-    )
-    # Correlation tick identifies the source owner state (tick 0); the
-    # candidate transition advances Embodiment and World to committed tick 1.
-    assert correlation.causal_tick == owner_state.root.causal_tick == 0
-    projected = project_body_physical_input(owner_state, correlation=correlation)
-    assert tuple(joint.joint_id for joint in projected.joints) == ("joint.hinge",)
-    assert projected.joints == owner_state.joints
-    # The numerical fixture is deliberately limited to this exact projected
-    # one-hinge morphology; it does not substitute a different body model.
-    urdf = ET.fromstring(projected.articulated_description)
-    assert [node.attrib["name"] for node in urdf.findall("joint") if node.attrib["type"] == "revolute"] == ["joint.hinge"]
-    assert {node.attrib["name"] for node in urdf.findall("link")} == {"body.root", "body.arm"}
-    projected_links = {node.attrib["name"]: node for node in urdf.findall("link")}
-    root_link = projected_links["body.root"]
-    arm_link = projected_links["body.arm"]
-    root_mass = float(root_link.find("inertial/mass").attrib["value"])
-    root_size = tuple(float(value) / 2 for value in root_link.find("collision/geometry/box").attrib["size"].split())
-    arm_mass = float(arm_link.find("inertial/mass").attrib["value"])
-    arm_size = tuple(float(value) / 2 for value in arm_link.find("collision/geometry/box").attrib["size"].split())
-    arm_collision_origin = tuple(float(value) for value in arm_link.find("collision/origin").attrib["xyz"].split())
-    hinge = next(node for node in urdf.findall("joint") if node.attrib.get("name") == "joint.hinge")
-    hinge_origin = tuple(float(value) for value in hinge.find("origin").attrib["xyz"].split())
-    hinge_axis = tuple(float(value) for value in hinge.find("axis").attrib["xyz"].split())
-    hinge_limit = hinge.find("limit")
-    hinge_dynamics = hinge.find("dynamics")
-    assert hinge_limit is not None and hinge_dynamics is not None
-    xml = f"""
+    pending_step_result: dict[str, object] = {}
+
+    def project_articulated_body(context: PhysicalStepContext):
+        correlation = PhysicalStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            context.body_id,
+            context.embodiment_episode_id,
+            context.morphology_revision,
+            context.environment_revision,
+            context.solver_config_revision,
+        )
+        assert correlation.causal_tick == owner_state.root.causal_tick == 0
+        projected = project_body_physical_input(owner_state, correlation=correlation)
+        assert tuple(joint.joint_id for joint in projected.joints) == ("joint.hinge",)
+        assert projected.joints == owner_state.joints
+        pending_step_result.update(correlation=correlation, projected=projected)
+        return projected
+
+    def project_articulated_environment(context: PhysicalStepContext):
+        assert context.environment_revision == environment.scene.environment_revision
+        return environment.scene
+
+    def execute_articulated_solver(
+        context: PhysicalStepContext,
+        projected,
+        scene,
+    ) -> PhysicalStepCandidate:
+        # The numerical fixture is deliberately limited to this exact projected
+        # one-hinge morphology; it does not substitute a different body model.
+        urdf = ET.fromstring(projected.articulated_description)
+        assert [
+            node.attrib["name"]
+            for node in urdf.findall("joint")
+            if node.attrib["type"] == "revolute"
+        ] == ["joint.hinge"]
+        assert {node.attrib["name"] for node in urdf.findall("link")} == {
+            "body.root",
+            "body.arm",
+        }
+        projected_links = {
+            node.attrib["name"]: node for node in urdf.findall("link")
+        }
+        root_link = projected_links["body.root"]
+        arm_link = projected_links["body.arm"]
+        root_mass = float(root_link.find("inertial/mass").attrib["value"])
+        root_size = tuple(
+            float(value) / 2
+            for value in root_link.find("collision/geometry/box").attrib["size"].split()
+        )
+        arm_mass = float(arm_link.find("inertial/mass").attrib["value"])
+        arm_size = tuple(
+            float(value) / 2
+            for value in arm_link.find("collision/geometry/box").attrib["size"].split()
+        )
+        arm_collision_origin = tuple(
+            float(value)
+            for value in arm_link.find("collision/origin").attrib["xyz"].split()
+        )
+        hinge = next(
+            node
+            for node in urdf.findall("joint")
+            if node.attrib.get("name") == "joint.hinge"
+        )
+        hinge_origin = tuple(
+            float(value) for value in hinge.find("origin").attrib["xyz"].split()
+        )
+        hinge_axis = tuple(
+            float(value) for value in hinge.find("axis").attrib["xyz"].split()
+        )
+        hinge_limit = hinge.find("limit")
+        hinge_dynamics = hinge.find("dynamics")
+        assert hinge_limit is not None and hinge_dynamics is not None
+        xml = f"""
     <mujoco model="biopeia-articulated-step-fixture">
       <compiler angle="radian" coordinate="local"/>
       <option timestep="0.01" integrator="Euler" gravity="0 0 -9.81"/>
@@ -1270,86 +1314,163 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
       </worldbody>
     </mujoco>
     """
-    model = mujoco.MjModel.from_xml_string(xml)
-    data = mujoco.MjData(model)
-    root_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "root.free")
-    hinge_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "joint.hinge")
-    root_qpos = int(model.jnt_qposadr[root_joint])
-    root_qvel = int(model.jnt_dofadr[root_joint])
-    hinge_qpos = int(model.jnt_qposadr[hinge_joint])
-    hinge_qvel = int(model.jnt_dofadr[hinge_joint])
-    data.qpos[root_qpos : root_qpos + 7] = (
-        *projected.position_m,
-        projected.orientation_xyzw[3],
-        *projected.orientation_xyzw[:3],
-    )
-    data.qvel[root_qvel : root_qvel + 6] = (
-        *projected.linear_velocity_m_per_s,
-        *projected.angular_velocity_rad_per_s,
-    )
-    projected_joints = {joint.joint_id: joint for joint in projected.joints}
-    for joint_id in projected_joints:
-        solver_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
-        data.qpos[int(model.jnt_qposadr[solver_joint])] = projected_joints[joint_id].position_rad
-        data.qvel[int(model.jnt_dofadr[solver_joint])] = projected_joints[joint_id].velocity_rad_per_s
-    # Apply a declared positive hinge torque in N*m for this deterministic fixture.
-    data.qfrc_applied[hinge_qvel] = 0.5
-    pending_step_result: dict[str, object] = {}
-
-    def persist_owners(causal_tick: int) -> tuple[CheckpointReference, ...]:
-        assert causal_tick == 1
-        assert correlation.causal_tick + 1 == causal_tick
-        assert manifest_store.read().status is ManifestStatus.PREPARING
+        model = mujoco.MjModel.from_xml_string(xml)
+        data = mujoco.MjData(model)
+        root_joint = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, "root.free"
+        )
+        hinge_joint = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, "joint.hinge"
+        )
+        root_qpos = int(model.jnt_qposadr[root_joint])
+        root_qvel = int(model.jnt_dofadr[root_joint])
+        hinge_qpos = int(model.jnt_qposadr[hinge_joint])
+        hinge_qvel = int(model.jnt_dofadr[hinge_joint])
+        data.qpos[root_qpos : root_qpos + 7] = (
+            *projected.position_m,
+            projected.orientation_xyzw[3],
+            *projected.orientation_xyzw[:3],
+        )
+        data.qvel[root_qvel : root_qvel + 6] = (
+            *projected.linear_velocity_m_per_s,
+            *projected.angular_velocity_rad_per_s,
+        )
+        projected_joints = {joint.joint_id: joint for joint in projected.joints}
+        for joint_id in projected_joints:
+            solver_joint = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, joint_id
+            )
+            data.qpos[int(model.jnt_qposadr[solver_joint])] = (
+                projected_joints[joint_id].position_rad
+            )
+            data.qvel[int(model.jnt_dofadr[solver_joint])] = (
+                projected_joints[joint_id].velocity_rad_per_s
+            )
+        data.qfrc_applied[hinge_qvel] = 0.5
         mujoco.mj_step(model, data)
-        qpos = tuple(float(value) for value in data.qpos[root_qpos : root_qpos + 7])
-        qvel = tuple(float(value) for value in data.qvel[root_qvel : root_qvel + 6])
+        qpos = tuple(
+            float(value) for value in data.qpos[root_qpos : root_qpos + 7]
+        )
+        qvel = tuple(
+            float(value) for value in data.qvel[root_qvel : root_qvel + 6]
+        )
+        correlation = pending_step_result["correlation"]
+        assert isinstance(correlation, PhysicalStepCorrelation)
         candidate = SolverArticulatedCandidate(
             root=SolverBodyCandidate(
-                correlation, "physics3d.world", "body.root", qpos[:3],
-                (qpos[4], qpos[5], qpos[6], qpos[3]), qvel[:3], qvel[3:6],
+                correlation,
+                "physics3d.world",
+                "body.root",
+                qpos[:3],
+                (qpos[4], qpos[5], qpos[6], qpos[3]),
+                qvel[:3],
+                qvel[3:6],
             ),
-            joints=(JointKinematicState("joint.hinge", float(data.qpos[hinge_qpos]), float(data.qvel[hinge_qvel])),),
+            joints=(
+                JointKinematicState(
+                    "joint.hinge",
+                    float(data.qpos[hinge_qpos]),
+                    float(data.qvel[hinge_qvel]),
+                ),
+            ),
         )
-        # Embodiment returns a candidate state without mutating its prior
-        # value; Environment adoption follows before any references are emitted.
-        world_context = PhysicalStepContext(
-            world_id=correlation.world_id,
-            source_causal_tick=correlation.causal_tick,
-            target_causal_tick=causal_tick,
-            physical_step_id=correlation.physical_step_id,
-            body_id=correlation.body_id,
-            embodiment_episode_id=correlation.embodiment_episode_id,
-            morphology_revision=correlation.morphology_revision,
-            environment_revision=correlation.environment_revision,
-            solver_config_revision=correlation.solver_config_revision,
-        )
-        adopted = owner_state.adopt_candidate(candidate, world_context=world_context)
-        assert adopted.root.causal_tick == causal_tick
         env_correlation = EnvironmentStepCorrelation(
-            WORLD_ID, 0, correlation.physical_step_id, environment.scene.environment_id, ENVIRONMENT_REVISION
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            scene.environment_id,
+            context.environment_revision,
+        )
+        pending_step_result.update(
+            candidate=candidate,
+            env_correlation=env_correlation,
+            xml=xml,
+        )
+        return PhysicalStepCandidate(
+            candidate,
+            StaticSceneCandidate(
+                env_correlation,
+                project_static_scene(scene),
+            ),
+        )
+
+    def adopt_articulated_body(
+        context: PhysicalStepContext,
+        candidate: SolverArticulatedCandidate,
+    ) -> None:
+        adopted = owner_state.adopt_candidate(candidate, world_context=context)
+        assert adopted.root.causal_tick == context.target_causal_tick
+        pending_step_result["adopted"] = adopted
+
+    def adopt_articulated_environment(
+        context: PhysicalStepContext,
+        candidate: StaticSceneCandidate,
+    ) -> None:
+        expected = EnvironmentStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            environment.scene.environment_id,
+            context.environment_revision,
         )
         environment.validate_and_adopt(
-            StaticSceneCandidate(env_correlation, project_static_scene(environment.scene)),
-            expected_correlation=env_correlation,
+            candidate,
+            expected_correlation=expected,
         )
-        pending_step_result.update(adopted=adopted, candidate=candidate, correlation=correlation)
+
+    def write_articulated_checkpoints(
+        context: PhysicalStepContext,
+    ) -> tuple[CheckpointReference, ...]:
+        assert manifest_store.read().status is ManifestStatus.PREPARING
+        adopted = pending_step_result["adopted"]
+        assert isinstance(adopted, ArticulatedEmbodimentPhysicalState)
         return (
             _write_checkpoint(
-                tmp_path / "owners", owner="organism", owner_identity=str(ORGANISM_ID),
-                checkpoint_id="organism-tick-1", schema="organism-action-fixture-v1", encoded=organism_payload,
+                tmp_path / "owners",
+                owner="organism",
+                owner_identity=str(ORGANISM_ID),
+                checkpoint_id="organism-tick-1",
+                schema="organism-action-fixture-v1",
+                encoded=organism_payload,
             ),
             _write_checkpoint(
-                tmp_path / "owners", owner="embodiment", owner_identity=articulated_body_id,
-                checkpoint_id="embodiment-tick-1", schema=articulated_schema, encoded=adopted.checkpoint_bytes(),
+                tmp_path / "owners",
+                owner="embodiment",
+                owner_identity=articulated_body_id,
+                checkpoint_id="embodiment-tick-1",
+                schema=articulated_schema,
+                encoded=adopted.checkpoint_bytes(),
             ),
             _write_checkpoint(
-                tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_OWNER_ID,
-                checkpoint_id="environment-tick-1", schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
+                tmp_path / "owners",
+                owner="environment",
+                owner_identity=ENVIRONMENT_OWNER_ID,
+                checkpoint_id="environment-tick-1",
+                schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
                 encoded=environment.checkpoint_bytes(),
             ),
         )
 
-    world.tick("articulated-physical-step-1", persist_owners)
+    run_physical_step(
+        world,
+        commit_id="articulated-physical-step-1",
+        physical_step_id="physical-step-articulated-1",
+        body_id=articulated_body_id,
+        embodiment_episode_id=articulated_episode,
+        morphology_revision=articulated_revision,
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision=f"mujoco-{mujoco.__version__}-articulated-hinge-euler-dt0.01-r1",
+        ports=PhysicalStepPorts(
+            project_body=project_articulated_body,
+            project_environment=project_articulated_environment,
+            execute_solver=execute_articulated_solver,
+            adopt_body=adopt_articulated_body,
+            adopt_environment=adopt_articulated_environment,
+            write_checkpoints=write_articulated_checkpoints,
+        ),
+    )
+    projected = pending_step_result["projected"]
+    xml = pending_step_result["xml"]
     assert world.status is ManifestStatus.COMMITTED
     assert world.causal_tick == 1
     adopted = pending_step_result["adopted"]
@@ -1417,57 +1538,94 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
     assert isinstance(restored_environment, StaticEnvironmentOwner)
     restored_organism = restored_owners["organism"]
     assert isinstance(restored_organism, dict)
-    next_correlation = replace(
-        correlation,
-        causal_tick=1,
-        physical_step_id="physical-step-articulated-2",
-    )
-    assert next_correlation.causal_tick == restored_body.root.causal_tick == restarted_world.causal_tick
-    next_projection = project_body_physical_input(
-        restored_body,
-        correlation=next_correlation,
-    )
-    assert next_projection.articulated_description == projected.articulated_description
-    resumed_model = mujoco.MjModel.from_xml_string(xml)
-    resumed_data = mujoco.MjData(resumed_model)
-    resumed_root_joint = mujoco.mj_name2id(resumed_model, mujoco.mjtObj.mjOBJ_JOINT, "root.free")
-    resumed_hinge_joint = mujoco.mj_name2id(resumed_model, mujoco.mjtObj.mjOBJ_JOINT, "joint.hinge")
-    resumed_root_qpos = int(resumed_model.jnt_qposadr[resumed_root_joint])
-    resumed_root_qvel = int(resumed_model.jnt_dofadr[resumed_root_joint])
-    resumed_hinge_qpos = int(resumed_model.jnt_qposadr[resumed_hinge_joint])
-    resumed_hinge_qvel = int(resumed_model.jnt_dofadr[resumed_hinge_joint])
-    resumed_data.qpos[resumed_root_qpos : resumed_root_qpos + 7] = (
-        *next_projection.position_m,
-        next_projection.orientation_xyzw[3],
-        *next_projection.orientation_xyzw[:3],
-    )
-    resumed_data.qvel[resumed_root_qvel : resumed_root_qvel + 6] = (
-        *next_projection.linear_velocity_m_per_s,
-        *next_projection.angular_velocity_rad_per_s,
-    )
-    resumed_joints = {joint.joint_id: joint for joint in next_projection.joints}
-    assert "joint.hinge" in resumed_joints
-    resumed_data.qpos[resumed_hinge_qpos] = resumed_joints["joint.hinge"].position_rad
-    resumed_data.qvel[resumed_hinge_qvel] = resumed_joints["joint.hinge"].velocity_rad_per_s
-    next_environment_correlation = EnvironmentStepCorrelation(
-        WORLD_ID,
-        1,
-        next_correlation.physical_step_id,
-        environment.scene.environment_id,
-        ENVIRONMENT_REVISION,
-    )
     pending_continuation: dict[str, object] = {}
 
-    def persist_continued_owners(causal_tick: int) -> tuple[CheckpointReference, ...]:
-        assert causal_tick == 2
-        assert next_correlation.causal_tick + 1 == causal_tick
-        assert manifest_store.read().status is ManifestStatus.PREPARING
-        # The post-restore input is intentionally lower to stay within the
-        # morphology's declared joint-velocity limit.
+    def project_continued_body(context: PhysicalStepContext):
+        next_correlation = PhysicalStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            context.body_id,
+            context.embodiment_episode_id,
+            context.morphology_revision,
+            context.environment_revision,
+            context.solver_config_revision,
+        )
+        assert (
+            next_correlation.causal_tick
+            == restored_body.root.causal_tick
+            == restarted_world.causal_tick
+        )
+        next_projection = project_body_physical_input(
+            restored_body,
+            correlation=next_correlation,
+        )
+        assert next_projection.articulated_description == projected.articulated_description
+        pending_continuation.update(
+            correlation=next_correlation,
+            projection=next_projection,
+        )
+        return next_projection
+
+    def project_continued_environment(context: PhysicalStepContext):
+        assert (
+            context.environment_revision
+            == restored_environment.scene.environment_revision
+        )
+        return restored_environment.scene
+
+    def execute_continued_solver(
+        context: PhysicalStepContext,
+        next_projection,
+        scene,
+    ) -> PhysicalStepCandidate:
+        resumed_model = mujoco.MjModel.from_xml_string(xml)
+        resumed_data = mujoco.MjData(resumed_model)
+        resumed_root_joint = mujoco.mj_name2id(
+            resumed_model, mujoco.mjtObj.mjOBJ_JOINT, "root.free"
+        )
+        resumed_hinge_joint = mujoco.mj_name2id(
+            resumed_model, mujoco.mjtObj.mjOBJ_JOINT, "joint.hinge"
+        )
+        resumed_root_qpos = int(resumed_model.jnt_qposadr[resumed_root_joint])
+        resumed_root_qvel = int(resumed_model.jnt_dofadr[resumed_root_joint])
+        resumed_hinge_qpos = int(resumed_model.jnt_qposadr[resumed_hinge_joint])
+        resumed_hinge_qvel = int(resumed_model.jnt_dofadr[resumed_hinge_joint])
+        resumed_data.qpos[resumed_root_qpos : resumed_root_qpos + 7] = (
+            *next_projection.position_m,
+            next_projection.orientation_xyzw[3],
+            *next_projection.orientation_xyzw[:3],
+        )
+        resumed_data.qvel[resumed_root_qvel : resumed_root_qvel + 6] = (
+            *next_projection.linear_velocity_m_per_s,
+            *next_projection.angular_velocity_rad_per_s,
+        )
+        resumed_joints = {
+            joint.joint_id: joint for joint in next_projection.joints
+        }
+        assert "joint.hinge" in resumed_joints
+        resumed_data.qpos[resumed_hinge_qpos] = (
+            resumed_joints["joint.hinge"].position_rad
+        )
+        resumed_data.qvel[resumed_hinge_qvel] = (
+            resumed_joints["joint.hinge"].velocity_rad_per_s
+        )
         resumed_data.qfrc_applied[resumed_hinge_qvel] = 0.05
         mujoco.mj_step(resumed_model, resumed_data)
-        next_qpos = tuple(float(value) for value in resumed_data.qpos[resumed_root_qpos : resumed_root_qpos + 7])
-        next_qvel = tuple(float(value) for value in resumed_data.qvel[resumed_root_qvel : resumed_root_qvel + 6])
+        next_qpos = tuple(
+            float(value)
+            for value in resumed_data.qpos[
+                resumed_root_qpos : resumed_root_qpos + 7
+            ]
+        )
+        next_qvel = tuple(
+            float(value)
+            for value in resumed_data.qvel[
+                resumed_root_qvel : resumed_root_qvel + 6
+            ]
+        )
+        next_correlation = pending_continuation["correlation"]
+        assert isinstance(next_correlation, PhysicalStepCorrelation)
         next_candidate = SolverArticulatedCandidate(
             root=SolverBodyCandidate(
                 next_correlation,
@@ -1486,53 +1644,114 @@ def test_articulated_mujoco_candidate_is_adopted_and_world_committed(tmp_path: P
                 ),
             ),
         )
-        world_context = PhysicalStepContext(
-            world_id=next_correlation.world_id,
-            source_causal_tick=next_correlation.causal_tick,
-            target_causal_tick=causal_tick,
-            physical_step_id=next_correlation.physical_step_id,
-            body_id=next_correlation.body_id,
-            embodiment_episode_id=next_correlation.embodiment_episode_id,
-            morphology_revision=next_correlation.morphology_revision,
-            environment_revision=next_correlation.environment_revision,
-            solver_config_revision=next_correlation.solver_config_revision,
+        next_environment_correlation = EnvironmentStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            scene.environment_id,
+            context.environment_revision,
         )
-        continued_body = restored_body.adopt_candidate(
-            next_candidate, world_context=world_context
+        pending_continuation.update(
+            candidate=next_candidate,
+            environment_correlation=next_environment_correlation,
         )
-        restored_environment.validate_and_adopt(
+        return PhysicalStepCandidate(
+            next_candidate,
             StaticSceneCandidate(
                 next_environment_correlation,
-                project_static_scene(restored_environment.scene),
+                project_static_scene(scene),
             ),
-            expected_correlation=next_environment_correlation,
         )
+
+    def adopt_continued_body(
+        context: PhysicalStepContext,
+        candidate: SolverArticulatedCandidate,
+    ) -> None:
+        continued_body = restored_body.adopt_candidate(
+            candidate,
+            world_context=context,
+        )
+        pending_continuation["body"] = continued_body
+
+    def adopt_continued_environment(
+        context: PhysicalStepContext,
+        candidate: StaticSceneCandidate,
+    ) -> None:
+        expected = EnvironmentStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            restored_environment.scene.environment_id,
+            context.environment_revision,
+        )
+        restored_environment.validate_and_adopt(
+            candidate,
+            expected_correlation=expected,
+        )
+
+    def write_continued_checkpoints(
+        context: PhysicalStepContext,
+    ) -> tuple[CheckpointReference, ...]:
+        assert manifest_store.read().status is ManifestStatus.PREPARING
+        continued_body = pending_continuation["body"]
+        assert isinstance(continued_body, ArticulatedEmbodimentPhysicalState)
         organism_tick_2 = json.dumps(
-            {**restored_organism, "last_physical_tick": causal_tick},
+            {
+                **restored_organism,
+                "last_physical_tick": context.target_causal_tick,
+            },
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        pending_continuation.update(body=continued_body, candidate=next_candidate)
         return (
             _write_checkpoint(
-                tmp_path / "owners", owner="organism", owner_identity=str(ORGANISM_ID),
-                checkpoint_id="organism-tick-2", schema="organism-action-fixture-v1", encoded=organism_tick_2,
+                tmp_path / "owners",
+                owner="organism",
+                owner_identity=str(ORGANISM_ID),
+                checkpoint_id="organism-tick-2",
+                schema="organism-action-fixture-v1",
+                encoded=organism_tick_2,
             ),
             _write_checkpoint(
-                tmp_path / "owners", owner="embodiment", owner_identity=articulated_body_id,
-                checkpoint_id="embodiment-tick-2", schema=articulated_schema,
+                tmp_path / "owners",
+                owner="embodiment",
+                owner_identity=articulated_body_id,
+                checkpoint_id="embodiment-tick-2",
+                schema=articulated_schema,
                 encoded=continued_body.checkpoint_bytes(),
             ),
             _write_checkpoint(
-                tmp_path / "owners", owner="environment", owner_identity=ENVIRONMENT_OWNER_ID,
-                checkpoint_id="environment-tick-2", schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
+                tmp_path / "owners",
+                owner="environment",
+                owner_identity=ENVIRONMENT_OWNER_ID,
+                checkpoint_id="environment-tick-2",
+                schema=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
                 encoded=restored_environment.checkpoint_bytes(),
             ),
         )
 
-    continued_record = restarted_world.tick(
-        "articulated-physical-step-2", persist_continued_owners
+    continued_record = run_physical_step(
+        restarted_world,
+        commit_id="articulated-physical-step-2",
+        physical_step_id="physical-step-articulated-2",
+        body_id=articulated_body_id,
+        embodiment_episode_id=articulated_episode,
+        morphology_revision=articulated_revision,
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision=f"mujoco-{mujoco.__version__}-articulated-hinge-euler-dt0.01-r1",
+        ports=PhysicalStepPorts(
+            project_body=project_continued_body,
+            project_environment=project_continued_environment,
+            execute_solver=execute_continued_solver,
+            adopt_body=adopt_continued_body,
+            adopt_environment=adopt_continued_environment,
+            write_checkpoints=write_continued_checkpoints,
+        ),
     )
+    next_correlation = pending_continuation["correlation"]
+    next_environment_correlation = pending_continuation[
+        "environment_correlation"
+    ]
     assert restarted_world.status is ManifestStatus.COMMITTED
     assert continued_record.causal_tick == 2
     assert restarted_world.manifest.commit_id == "articulated-physical-step-2"
