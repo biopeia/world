@@ -1848,6 +1848,25 @@ def test_retry_after_recovery_publication_interruption_fsyncs_existing_receipt_d
     assert receipt_dir.is_dir()
     assert tmp_path in fsynced_directories
     assert receipt_dir in fsynced_directories
+    receipt_path = next(receipt_dir.glob("*.json"))
+    first_receipt = receipt_path.read_bytes()
+
+    with pytest.raises(OSError, match="simulated interruption"):
+        DurableWorldRuntime.recover_previous_cut(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=_verifier,
+            owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+            owner_checkpoint_restorer=lambda _refs: None,
+        )
+    assert receipt_path.read_bytes() == first_receipt
+
+    # A retry may record a different diagnostic without changing which
+    # transition or prior cut is being recovered.
+    manifest_store._record_failure("transition-retry", "different failure detail")
+    assert manifest_store.read().failure == "different failure detail"
 
     fsynced_directories.clear()
     monkeypatch.setattr(manifest_store, "_write", original_write)
@@ -1865,6 +1884,152 @@ def test_retry_after_recovery_publication_interruption_fsyncs_existing_receipt_d
     assert receipt_dir in fsynced_directories
     assert fsynced_directories.index(receipt_dir) < len(fsynced_directories) - 1
     assert fsynced_directories[-1] == tmp_path
+    assert receipt_path.read_bytes() == first_receipt
+
+
+def test_recovery_receipts_keep_distinct_transition_identities(tmp_path):
+    world_id = WorldId("world-recovery-distinct-transitions")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    owner_state = tmp_path / "organism.json"
+    owner_state.write_bytes(b"durable")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(owner_state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+
+    for transition_id in ("transition-one", "transition-two"):
+        with pytest.raises(ManifestError, match="owner checkpoint validation"):
+            runtime.tick(
+                transition_id,
+                lambda _tick: (
+                    CheckpointReference(
+                        owner="organism",
+                        owner_identity="organism-identity",
+                        checkpoint_id="missing",
+                        schema_version="v1",
+                        locator=str(tmp_path / f"{transition_id}-missing.json"),
+                        sha256="0" * 64,
+                    ),
+                ),
+            )
+        runtime = DurableWorldRuntime.recover_previous_cut(
+            world_id,
+            "presence-a",
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=_verifier,
+            owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+            owner_checkpoint_restorer=lambda _refs: None,
+        )
+
+    receipt_files = tuple((tmp_path / "recoveries").glob("*.json"))
+    assert len(receipt_files) == 2
+    assert {json.loads(path.read_bytes())["transition_id"] for path in receipt_files} == {
+        "transition-one",
+        "transition-two",
+    }
+
+
+def test_recovered_transition_identity_cannot_be_reused_for_different_proposal(tmp_path):
+    world_id = WorldId("world-recovery-reused-transition")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    owner_state = tmp_path / "organism.json"
+    owner_state.write_bytes(b"durable")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(owner_state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    with pytest.raises(RuntimeError, match="tick callback failed"):
+        runtime.tick(
+            "reused-transition",
+            lambda _tick: (_ for _ in ()).throw(RuntimeError("tick callback failed")),
+        )
+    DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+        owner_checkpoint_restorer=lambda _refs: None,
+    )
+
+    with pytest.raises(ManifestError, match="cannot be reused with different proposed state"):
+        manifest_store._begin_transition(
+            "reused-transition",
+            step_participant_ids=(("modality", "modality-identity"),),
+        )
+    assert manifest_store.read().status is ManifestStatus.COMMITTED
+
+
+def test_same_transition_id_on_later_tick_gets_a_distinct_recovery_receipt(tmp_path):
+    world_id = WorldId("world-recovery-transition-across-ticks")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    owner_state = tmp_path / "organism.json"
+    owner_state.write_bytes(b"durable")
+    owner_reference = _checkpoint(owner_state)
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(owner_reference,),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+
+    with pytest.raises(RuntimeError, match="first failure"):
+        runtime.tick(
+            "reused-transition",
+            lambda _tick: (_ for _ in ()).throw(RuntimeError("first failure")),
+        )
+    runtime = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _refs: None,
+    )
+    runtime.tick("successful-transition", lambda _tick: (owner_reference,))
+
+    with pytest.raises(RuntimeError, match="second failure"):
+        runtime.tick(
+            "reused-transition",
+            lambda _tick: (_ for _ in ()).throw(RuntimeError("second failure")),
+        )
+    DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _refs: None,
+    )
+
+    receipts = [json.loads(path.read_bytes()) for path in (tmp_path / "recoveries").glob("*.json")]
+    assert len(receipts) == 2
+    assert {receipt["transition_id"] for receipt in receipts} == {"reused-transition"}
+    assert {receipt["pending_tick"] for receipt in receipts} == {1, 2}
 
 
 @pytest.mark.parametrize(

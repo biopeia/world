@@ -518,3 +518,12 @@ This verifies World failure handling for an injected directory-fsync-boundary er
 | `README.md` | Target capability/scope documentation | REWRITE | Describes the adapter as a numerical capability, not a Physics authority or complete causal runtime. |
 
 This slice places a low-level optional MuJoCo executor outside World core imports so the pinned solver candidate can be exercised without making MuJoCo a World runtime dependency. It does not establish the repository/owner for a production solver adapter, settle cross-domain authorization/correlation, or implement projection/owner-adoption composition. World issue #29 remains open for those gaps and must not be closed by this executor alone. Broader scene, material, morphology, engine-versioning, or independently versioned adapter contracts are not frozen by this slice.
+
+## Stable recovery retry identity (World #70)
+
+| Target path | Source/provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/manifest.py` | Target-only correction against World base `4d871a3c721f8f3807b9c095a40a8380051ef0f6`, addressing [World issue #70](https://github.com/biopeia/world/issues/70); no historical implementation copied | REWRITE | Recovery receipt identity is scoped by `(world_id, transition_id, pending_tick)`. Its digest binds the proposed causal transition while excluding mutable diagnostic failure text and PREPARING/RECOVERY_REQUIRED status. Reusing an existing identity for a different proposal is rejected before a new pending manifest is published. Receipt schema is versioned, and distinct transition identities remain separate. |
+| `tests/test_durable_runtime.py` | New Biopeia TARGET regression tests for issue #70; no historical tests copied | REWRITE | Covers recovery publication interruption followed by retries with unchanged and changed diagnostics, distinct transition identities, and rejection of the same identity with a different proposal while preserving the committed prior cut. |
+
+This addresses receipt identity and retry behavior at the tested manifest/filesystem boundaries. It does not add automatic recovery, validate owner state beyond existing owner recovery contracts, guarantee behavior under power loss or untested filesystems, or expand the single-logical-writer model. It is not a general crash-consistency proof.
