@@ -18,6 +18,7 @@ from world import (
     ManifestRecoveryRequiredError,
     ManifestStatus,
     OwnerCausalRecord,
+    PresenceLifecycleTransition,
     PresenceId,
     PresenceOwnerLink,
     RecoveryRequiredError,
@@ -86,6 +87,14 @@ class _OwnerContract:
 
 def _contracts(*keys):
     return {key: _OwnerContract() for key in keys}
+
+
+def _presence_lifecycle(transition_type, presence_id):
+    return PresenceLifecycleTransition(
+        transition_type,
+        PresenceId(presence_id),
+        {"source": "test-request", "request_id": f"{transition_type.lower()}-{presence_id}"},
+    )
 
 
 def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_manifest(tmp_path):
@@ -1370,6 +1379,7 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
             "presence-join-without-owner",
             lambda _tick: (_checkpoint(next_owner),),
             register_presence=("presence-b",),
+            presence_lifecycle=_presence_lifecycle("REGISTER", "presence-b"),
         )
     assert runtime.status is ManifestStatus.COMMITTED
     assert runtime.manifest.presence_ids == ("presence-a",)
@@ -1385,6 +1395,7 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
             register_owners=(("embodiment", "embodiment-identity"),),
             presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "embodiment", "embodiment-identity"),),
             register_owner_contracts=_contracts(("embodiment", "embodiment-identity")),
+            presence_lifecycle=_presence_lifecycle("REGISTER", "presence-b"),
         )
     pending = store.read()
     assert pending.status is ManifestStatus.RECOVERY_REQUIRED
@@ -1413,6 +1424,7 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
         register_owners=(("embodiment", "embodiment-identity"),),
         presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "embodiment", "embodiment-identity"),),
         register_owner_contracts=_contracts(("embodiment", "embodiment-identity")),
+        presence_lifecycle=_presence_lifecycle("REGISTER", "presence-b"),
     )
     assert runtime.manifest.presence_ids == ("presence-a", "presence-b")
     assert runtime.manifest.presence_owner_links == (
@@ -1439,12 +1451,203 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
     )
     runtime.tick(
         "presence-leave",
-        lambda _tick: (_checkpoint(next_owner),),
+        lambda _tick: (_checkpoint(next_owner), _checkpoint(body, owner="embodiment")),
         unregister_presence=("presence-b",),
         unregister_owners=(("embodiment", "embodiment-identity"),),
+        step_participants=(("embodiment", "embodiment-identity"),),
+        register_owner_contracts=_contracts(("embodiment", "embodiment-identity")),
+        presence_lifecycle=_presence_lifecycle("TERMINATE", "presence-b"),
     )
     assert runtime.manifest.presence_ids == ("presence-a",)
     assert runtime.manifest.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
+
+
+def test_last_presence_can_terminate_world_remains_active_and_later_registers(tmp_path):
+    world_id = WorldId("world-empty-remains-active")
+    store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial = tmp_path / "organism-0.json"
+    initial.write_bytes(b"organism initial state")
+    contract = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id, "presence-a", store, journal,
+        initial_owner_references=(_checkpoint(initial),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contract,
+    )
+
+    departing = tmp_path / "organism-termination.json"
+    departing.write_bytes(b"owner state adopted for termination")
+    runtime.tick(
+        "terminate-presence-a",
+        lambda tick: (_checkpoint(departing),),
+        unregister_presence=("presence-a",),
+        unregister_owners=(("organism", "organism-identity"),),
+        step_participants=(("organism", "organism-identity"),),
+        register_owner_contracts=contract,
+        presence_lifecycle=_presence_lifecycle("TERMINATE", "presence-a"),
+    )
+    assert runtime.causal_tick == 1
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert runtime.manifest.presence_ids == ()
+    assert runtime.manifest.presence_owner_links == ()
+    assert runtime.manifest.registered_owner_ids == ()
+    assert runtime.manifest.step_participant_ids == (("organism", "organism-identity"),)
+    assert runtime.presence_id is None
+
+    lifecycle = next(
+        record for record in runtime.records
+        if record.record_type == "world.presence.lifecycle.committed"
+    )
+    assert lifecycle.actor_id == "world"
+    assert lifecycle.payload["authority"] == "world"
+    assert lifecycle.payload["trigger_provenance"] == {
+        "source": "test-request", "request_id": "terminate-presence-a"
+    }
+    assert lifecycle.payload["source_tick"] == 0
+    assert lifecycle.payload["target_tick"] == 1
+    assert lifecycle.payload["resulting_active_presence_ids"] == ()
+    assert lifecycle.payload["required_participants"] == (("organism", "organism-identity"),)
+    assert lifecycle.payload["owner_checkpoint_references"][0]["sha256"] == hashlib.sha256(
+        departing.read_bytes()
+    ).hexdigest()
+
+    restored_empty = DurableWorldRuntime.restore(
+        world_id, None, store, journal,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contract,
+        owner_checkpoint_restorer=lambda _references: None,
+    )
+    assert restored_empty.causal_tick == 1
+    assert restored_empty.manifest.presence_ids == ()
+    assert restored_empty.status is ManifestStatus.COMMITTED
+    with pytest.raises(ManifestError, match="at least one participating owner"):
+        restored_empty.tick("empty-world-ordinary-cut", lambda _tick: ())
+    assert restored_empty.status is ManifestStatus.COMMITTED
+    assert restored_empty.causal_tick == 1
+
+    returning = tmp_path / "organism-reentry.json"
+    returning.write_bytes(b"organism state for new presence")
+    restored_empty.tick(
+        "register-presence-b",
+        lambda _tick: (_checkpoint(returning),),
+        register_presence=("presence-b",),
+        register_owners=(("organism", "organism-identity"),),
+        presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "organism", "organism-identity"),),
+        register_owner_contracts=contract,
+        presence_lifecycle=_presence_lifecycle("REGISTER", "presence-b"),
+    )
+    assert restored_empty.causal_tick == 2
+    assert restored_empty.presence_id == "presence-b"
+    assert restored_empty.manifest.presence_ids == ("presence-b",)
+    assert restored_empty.records[0].record_type == "world.causal_tick.committed"
+    retained_lifecycle = next(
+        record for record in restored_empty.records
+        if record.record_type == "world.presence.lifecycle.committed"
+        and record.payload["lifecycle_transition_id"] == "terminate-presence-a"
+    )
+    assert retained_lifecycle.payload["owner_checkpoint_references"][0]["sha256"] == hashlib.sha256(
+        departing.read_bytes()
+    ).hexdigest()
+    assert restored_empty.records[-1].causal_tick == 2
+
+    # Reusing a committed lifecycle identity is rejected before PREPARING,
+    # even if the retried request names a different otherwise-valid presence.
+    callback_called = False
+
+    def should_not_run(_tick):
+        nonlocal callback_called
+        callback_called = True
+        return (_checkpoint(returning),)
+
+    with pytest.raises(ManifestError, match="identity is already committed"):
+        restored_empty.tick(
+            "terminate-presence-a",
+            should_not_run,
+            register_presence=("presence-c",),
+            presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-c"), "organism", "organism-identity"),),
+            presence_lifecycle=_presence_lifecycle("REGISTER", "presence-c"),
+        )
+    assert not callback_called
+    assert restored_empty.status is ManifestStatus.COMMITTED
+    assert restored_empty.causal_tick == 2
+
+    restored_empty.tick(
+        "register-presence-c",
+        lambda _tick: (_checkpoint(returning),),
+        register_presence=("presence-c",),
+        presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-c"), "organism", "organism-identity"),),
+        presence_lifecycle=_presence_lifecycle("REGISTER", "presence-c"),
+    )
+    assert restored_empty.causal_tick == 3
+    assert restored_empty.manifest.presence_ids == ("presence-b", "presence-c")
+
+
+def test_rejected_or_failed_presence_lifecycle_does_not_publish_next_tick(tmp_path):
+    world_id = WorldId("world-lifecycle-failure")
+    store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    owner = tmp_path / "owner-0.json"
+    owner.write_bytes(b"owner")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id, "presence-a", store, journal,
+        initial_owner_references=(_checkpoint(owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    with pytest.raises(ManifestError, match="explicit lifecycle transition"):
+        runtime.tick(
+            "untyped-removal", lambda _tick: (_checkpoint(owner),),
+            unregister_presence=("presence-a",),
+        )
+    assert runtime.causal_tick == 0
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert store.read().presence_ids == ("presence-a",)
+
+    # A successful ordinary tick after the rejected input proves the
+    # pre-PREPARING rejection did not latch the runtime.
+    continued = tmp_path / "owner-continued.json"
+    continued.write_bytes(b"owner after rejected request")
+    runtime.tick("ordinary-after-rejection", lambda _tick: (_checkpoint(continued),))
+    assert runtime.causal_tick == 1
+    assert runtime.status is ManifestStatus.COMMITTED
+
+    def interrupted(_tick):
+        raise RuntimeError("owner did not adopt termination state")
+
+    with pytest.raises(RuntimeError, match="did not adopt"):
+        runtime.tick(
+            "failed-removal", interrupted,
+            unregister_presence=("presence-a",),
+            unregister_owners=(("organism", "organism-identity"),),
+            step_participants=(("organism", "organism-identity"),),
+            register_owner_contracts=contracts,
+            presence_lifecycle=_presence_lifecycle("TERMINATE", "presence-a"),
+        )
+    pending = store.read()
+    assert pending.status is ManifestStatus.RECOVERY_REQUIRED
+    assert pending.causal_tick == 1
+    assert pending.presence_ids == ("presence-a",)
+    assert pending.pending_presence_ids == ()
+    assert not any(
+        record.record_type == "world.presence.lifecycle.committed"
+        for record in runtime.records
+    )
+    recovered = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        store,
+        journal,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _references: None,
+    )
+    assert recovered.status is ManifestStatus.COMMITTED
+    assert recovered.causal_tick == 1
+    assert recovered.manifest.presence_ids == ("presence-a",)
 
 
 def test_failed_registration_keeps_prior_cut_and_pending_roster_for_recovery(tmp_path):

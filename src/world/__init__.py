@@ -5,6 +5,7 @@ from .durable_runtime import (
     DurableWorldRuntime,
     OwnerCausalRecord,
     OwnerCheckpointContract,
+    PresenceLifecycleTransition,
     PresenceOwnerLink,
     WorldGenesisSpec,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "ManifestStatus",
     "OwnerCausalRecord",
     "OwnerCheckpointContract",
+    "PresenceLifecycleTransition",
     "PresenceId",
     "PresenceOwnerLink",
     "RecoveryRequiredError",
