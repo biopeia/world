@@ -19,14 +19,14 @@ from organism.cognition.portable_checkpoint import CognitiveRuntimeCheckpoint
 from organism.cognition.transition import CognitiveTransitionState, advance_cognition
 from organism.cognition.types import EdgeKind, NodeKind
 from organism.identity import OrganismIdentity
-from world.durable_runtime import DurableJournalSnapshotStore, DurableWorldRuntime, WorldGenesisSpec
+from world.durable_runtime import DurableJournalSnapshotStore, DurableWorldRuntime, PresenceOwnerLink, WorldGenesisSpec
 from world.manifest import (
     CheckpointReference,
     ManifestError,
     ManifestStatus,
     WorldCausalManifestStore,
 )
-from world.runtime import WorldId
+from world.runtime import PresenceId, WorldId
 
 
 IDENTITY = OrganismIdentity.parse("12345678-1234-5678-1234-567812345678")
@@ -137,6 +137,7 @@ def test_owner_checkpoints_publish_and_restore_one_bounded_causal_cut(tmp_path: 
             registered_owner_ids=_owner_roster(initial_refs),
             initial_owner_references=initial_refs,
             owner_checkpoint_contracts=_owner_contracts(initial_refs),
+            presence_owner_links=(PresenceOwnerLink(PresenceId(str(IDENTITY)), "organism", str(IDENTITY)),),
         ),
         str(IDENTITY),
         store,
@@ -251,6 +252,7 @@ def test_manifest_stays_recovery_required_when_dependency_is_unverified(tmp_path
             owner_checkpoint_contracts={
                 ("organism", str(IDENTITY)): _FixtureOwnerContract()
             },
+            presence_owner_links=(PresenceOwnerLink(PresenceId(str(IDENTITY)), "organism", str(IDENTITY)),),
         ),
         str(IDENTITY),
         store,
@@ -319,6 +321,7 @@ def test_durable_world_runtime_publishes_and_restores_owner_checkpoint_closure(
         registered_owner_ids=_owner_roster(initial_refs),
         initial_owner_references=initial_refs,
         owner_checkpoint_contracts=_owner_contracts(initial_refs),
+        presence_owner_links=(PresenceOwnerLink(PresenceId(str(IDENTITY)), "organism", str(IDENTITY)),),
     )
     runtime = DurableWorldRuntime.initialize(
         genesis,

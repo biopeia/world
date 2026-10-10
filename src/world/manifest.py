@@ -20,7 +20,7 @@ from typing import Callable
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _JOURNAL_OWNER = "world-journal"
 
 
@@ -70,8 +70,10 @@ class WorldCausalManifest:
     journal_prefix_sha256: str
     commit_id: str = ""
     registered_owner_ids: tuple[tuple[str, str], ...] = ()
+    presence_owner_links: tuple[tuple[str, str, str], ...] = ()
     step_participant_ids: tuple[tuple[str, str], ...] = ()
     pending_registered_owner_ids: tuple[tuple[str, str], ...] = ()
+    pending_presence_owner_links: tuple[tuple[str, str, str], ...] = ()
     pending_step_participant_ids: tuple[tuple[str, str], ...] = ()
     pending_presence_ids: tuple[str, ...] = ()
     status: ManifestStatus = ManifestStatus.COMMITTED
@@ -104,7 +106,7 @@ class WorldCausalManifest:
                 raise ValueError("committed manifest must identify its commit")
             if self.pending_transition_id is not None or self.pending_tick is not None or self.failure is not None:
                 raise ValueError("committed manifest cannot contain pending transition details")
-            if self.pending_registered_owner_ids or self.pending_step_participant_ids or self.pending_presence_ids:
+            if self.pending_registered_owner_ids or self.pending_presence_owner_links or self.pending_step_participant_ids or self.pending_presence_ids:
                 raise ValueError("committed manifest cannot contain pending participant rosters")
         else:
             if not self.pending_transition_id or self.pending_tick != self.causal_tick + 1:
@@ -114,12 +116,25 @@ class WorldCausalManifest:
         if len(keys) != len(set(keys)):
             raise ValueError("manifest cannot contain duplicate owner identity references")
         registered = tuple(tuple(pair) for pair in self.registered_owner_ids)
+        presence_links = tuple(tuple(link) for link in self.presence_owner_links)
         step = tuple(tuple(pair) for pair in self.step_participant_ids)
         pending_registered = tuple(tuple(pair) for pair in self.pending_registered_owner_ids)
+        pending_presence_links = tuple(tuple(link) for link in self.pending_presence_owner_links)
         pending_step = tuple(tuple(pair) for pair in self.pending_step_participant_ids)
         pending_presence = tuple(self.pending_presence_ids)
         if any(len(pair) != 2 or any(not value or not value.strip() for value in pair) for pair in (*registered, *step, *pending_registered, *pending_step)):
             raise ValueError("participant owner identities must contain non-empty owner and identity")
+        for links, presences, owners, label in (
+            (presence_links, presence_ids, registered, "committed"),
+            (pending_presence_links, pending_presence, pending_registered, "pending"),
+        ):
+            if any(len(link) != 3 or any(not value or not value.strip() for value in link) for link in links):
+                raise ValueError(f"{label} presence owner links must contain non-empty presence, owner, and identity")
+            link_presence_ids = tuple(link[0] for link in links)
+            if len(link_presence_ids) != len(set(link_presence_ids)) or set(link_presence_ids) != set(presences):
+                raise ValueError(f"{label} roster must have exactly one owner link per active presence")
+            if any((owner, identity) not in set(owners) for _, owner, identity in links):
+                raise ValueError(f"{label} presence owner links must target registered owners")
         if any(len(set(group)) != len(group) for group in (registered, step, pending_registered, pending_step)):
             raise ValueError("participant owner identities cannot be duplicated")
         if set(registered) & set(step) or set(pending_registered) & set(pending_step):
@@ -133,8 +148,10 @@ class WorldCausalManifest:
         object.__setattr__(self, "checkpoint_references", refs)
         object.__setattr__(self, "presence_ids", presence_ids)
         object.__setattr__(self, "registered_owner_ids", registered)
+        object.__setattr__(self, "presence_owner_links", presence_links)
         object.__setattr__(self, "step_participant_ids", step)
         object.__setattr__(self, "pending_registered_owner_ids", pending_registered)
+        object.__setattr__(self, "pending_presence_owner_links", pending_presence_links)
         object.__setattr__(self, "pending_step_participant_ids", pending_step)
         object.__setattr__(self, "pending_presence_ids", pending_presence)
 
@@ -195,8 +212,10 @@ class WorldCausalManifestStore:
                     journal_prefix_sha256=manifest.journal_prefix_sha256,
                     commit_id=manifest.commit_id,
                     registered_owner_ids=manifest.registered_owner_ids,
+                    presence_owner_links=manifest.presence_owner_links,
                     step_participant_ids=manifest.step_participant_ids,
                     pending_registered_owner_ids=manifest.pending_registered_owner_ids,
+                    pending_presence_owner_links=manifest.pending_presence_owner_links,
                     pending_step_participant_ids=manifest.pending_step_participant_ids,
                     pending_presence_ids=manifest.pending_presence_ids,
                     status=ManifestStatus.RECOVERY_REQUIRED,
@@ -216,6 +235,7 @@ class WorldCausalManifestStore:
         transition_id: str,
         *,
         registered_owner_ids: tuple[tuple[str, str], ...] | None = None,
+        presence_owner_links: tuple[tuple[str, str, str], ...] | None = None,
         step_participant_ids: tuple[tuple[str, str], ...] = (),
         presence_ids: tuple[str, ...] | None = None,
     ) -> WorldCausalManifest:
@@ -236,11 +256,17 @@ class WorldCausalManifestStore:
                 journal_prefix_sha256=current.journal_prefix_sha256,
                 commit_id=current.commit_id,
                 registered_owner_ids=current.registered_owner_ids,
+                presence_owner_links=current.presence_owner_links,
                 step_participant_ids=current.step_participant_ids,
                 pending_registered_owner_ids=(
                     current.registered_owner_ids
                     if registered_owner_ids is None
                     else registered_owner_ids
+                ),
+                pending_presence_owner_links=(
+                    current.presence_owner_links
+                    if presence_owner_links is None
+                    else presence_owner_links
                 ),
                 pending_step_participant_ids=step_participant_ids,
                 pending_presence_ids=current.presence_ids if presence_ids is None else presence_ids,
@@ -267,8 +293,10 @@ class WorldCausalManifestStore:
                 journal_prefix_sha256=pending.journal_prefix_sha256,
                 commit_id=pending.commit_id,
                 registered_owner_ids=pending.registered_owner_ids,
+                presence_owner_links=pending.presence_owner_links,
                 step_participant_ids=pending.step_participant_ids,
                 pending_registered_owner_ids=pending.pending_registered_owner_ids,
+                pending_presence_owner_links=pending.pending_presence_owner_links,
                 pending_step_participant_ids=pending.pending_step_participant_ids,
                 pending_presence_ids=pending.pending_presence_ids,
                 status=ManifestStatus.RECOVERY_REQUIRED,
@@ -302,6 +330,8 @@ class WorldCausalManifestStore:
                 raise ManifestError("committed participant roster differs from the World-prepared roster")
             if manifest.presence_ids != pending.pending_presence_ids:
                 raise ManifestError("committed presence roster differs from the World-prepared roster")
+            if manifest.presence_owner_links != pending.pending_presence_owner_links:
+                raise ManifestError("committed presence-owner roster differs from the World-prepared roster")
             if not dependency_verifier(manifest.checkpoint_references):
                 raise ManifestError("causal cut checkpoint dependency closure is not verified")
             self._write(manifest)
@@ -337,6 +367,7 @@ class WorldCausalManifestStore:
             journal_prefix_sha256=pending.journal_prefix_sha256,
             commit_id=pending.commit_id,
             registered_owner_ids=pending.registered_owner_ids,
+            presence_owner_links=pending.presence_owner_links,
             step_participant_ids=pending.step_participant_ids,
         )
         pending_bytes = _canonical_bytes(_manifest_to_data(pending))
@@ -433,8 +464,10 @@ def _manifest_to_data(manifest: WorldCausalManifest) -> dict:
         "journal_prefix_sha256": manifest.journal_prefix_sha256,
         "commit_id": manifest.commit_id,
         "registered_owner_ids": [list(pair) for pair in manifest.registered_owner_ids],
+        "presence_owner_links": [list(link) for link in manifest.presence_owner_links],
         "step_participant_ids": [list(pair) for pair in manifest.step_participant_ids],
         "pending_registered_owner_ids": [list(pair) for pair in manifest.pending_registered_owner_ids],
+        "pending_presence_owner_links": [list(link) for link in manifest.pending_presence_owner_links],
         "pending_step_participant_ids": [list(pair) for pair in manifest.pending_step_participant_ids],
         "pending_presence_ids": list(manifest.pending_presence_ids),
         "status": manifest.status.value,
@@ -448,7 +481,7 @@ def _manifest_from_data(data: dict) -> WorldCausalManifest:
     expected = {
         "schema_version", "world_id", "causal_tick", "presence_ids", "checkpoint_references",
         "journal_last_sequence", "journal_prefix_sha256", "commit_id",
-        "registered_owner_ids", "step_participant_ids", "pending_registered_owner_ids", "pending_step_participant_ids", "pending_presence_ids", "status",
+        "registered_owner_ids", "presence_owner_links", "step_participant_ids", "pending_registered_owner_ids", "pending_presence_owner_links", "pending_step_participant_ids", "pending_presence_ids", "status",
         "pending_transition_id", "pending_tick", "failure",
     }
     if not isinstance(data, dict) or set(data) != expected:
@@ -471,8 +504,10 @@ def _manifest_from_data(data: dict) -> WorldCausalManifest:
         journal_prefix_sha256=data["journal_prefix_sha256"],
         commit_id=data["commit_id"],
         registered_owner_ids=tuple(tuple(pair) for pair in data["registered_owner_ids"]),
+        presence_owner_links=tuple(tuple(link) for link in data["presence_owner_links"]),
         step_participant_ids=tuple(tuple(pair) for pair in data["step_participant_ids"]),
         pending_registered_owner_ids=tuple(tuple(pair) for pair in data["pending_registered_owner_ids"]),
+        pending_presence_owner_links=tuple(tuple(link) for link in data["pending_presence_owner_links"]),
         pending_step_participant_ids=tuple(tuple(pair) for pair in data["pending_step_participant_ids"]),
         pending_presence_ids=tuple(data["pending_presence_ids"]),
         status=ManifestStatus(data["status"]),

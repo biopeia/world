@@ -36,11 +36,7 @@ _JOURNAL_SCHEMA = "event-journal-v1"
 
 @dataclass(frozen=True, slots=True)
 class PresenceOwnerLink:
-    """Validate an explicit World-genesis presence-to-owner association.
-
-    This association is currently a genesis input only; the durable manifest
-    does not preserve it for later lifecycle transitions or restoration.
-    """
+    """Identify the one registered causal owner responsible for a presence."""
 
     presence_id: PresenceId
     owner_id: str
@@ -85,12 +81,11 @@ class WorldGenesisSpec:
         object.__setattr__(self, "owner_checkpoint_contracts", MappingProxyType(dict(self.owner_checkpoint_contracts)))
         links = tuple(self.presence_owner_links)
         link_presence_values = tuple(link.presence_id.value for link in links)
-        if links:
-            if set(link_presence_values) != set(presences) or len(link_presence_values) != len(set(link_presence_values)):
-                raise ValueError("presence owner links must cover each genesis presence exactly once")
-            owner_keys = set(owners)
-            if any((link.owner_id, link.owner_identity) not in owner_keys for link in links):
-                raise ValueError("presence owner link must target a registered genesis owner")
+        if set(link_presence_values) != set(presences) or len(link_presence_values) != len(set(link_presence_values)):
+            raise ValueError("presence owner links must cover each genesis presence exactly once")
+        owner_keys = set(owners)
+        if any((link.owner_id, link.owner_identity) not in owner_keys for link in links):
+            raise ValueError("presence owner link must target a registered genesis owner")
         object.__setattr__(self, "presence_owner_links", links)
 
 
@@ -321,6 +316,10 @@ class DurableWorldRuntime:
             journal_prefix_sha256="",
             commit_id=f"genesis:{world_id.value}",
             registered_owner_ids=registered_owner_ids,
+            presence_owner_links=tuple(
+                (link.presence_id.value, link.owner_id, link.owner_identity)
+                for link in genesis.presence_owner_links
+            ),
         )
         manifest_store._initialize(manifest)
         return cls(
@@ -475,6 +474,7 @@ class DurableWorldRuntime:
         step_participants: Iterable[tuple[str, str]] = (),
         register_presence: Iterable[str] = (),
         unregister_presence: Iterable[str] = (),
+        presence_owner_updates: Iterable[PresenceOwnerLink] = (),
         register_owner_contracts: Mapping[tuple[str, str], OwnerCheckpointContract] | None = None,
     ) -> CausalRecord:
         if not self._tick_guard.acquire(blocking=False):
@@ -519,6 +519,24 @@ class DurableWorldRuntime:
             active_presence = (active_presence | presence_additions) - presence_removals
             if self.presence_id not in active_presence:
                 raise ManifestError("the current runtime presence cannot be unregistered by its own tick")
+            active_links = {
+                presence: (owner, identity)
+                for presence, owner, identity in current.presence_owner_links
+                if presence not in presence_removals
+            }
+            updates = tuple(presence_owner_updates)
+            updated_presence_ids = tuple(link.presence_id.value for link in updates)
+            if len(updated_presence_ids) != len(set(updated_presence_ids)):
+                raise ManifestError("presence owner updates contain duplicate presences")
+            for link in updates:
+                presence = link.presence_id.value
+                if presence not in active_presence:
+                    raise ManifestError("presence owner update must target an active presence")
+                active_links[presence] = (link.owner_id, link.owner_identity)
+            if set(active_links) != active_presence:
+                raise ManifestError("each active presence must retain exactly one registered causal owner")
+            if any(owner_key not in registered for owner_key in active_links.values()):
+                raise ManifestError("each active presence owner must be in the proposed registered owner roster")
             registered_tuple = tuple(sorted(registered))
             step_tuple = tuple(sorted(step_only))
             expected_owners = frozenset(registered | step_only)
@@ -532,6 +550,10 @@ class DurableWorldRuntime:
             pending = self._manifest_store._begin_transition(
                 transition_id,
                 registered_owner_ids=registered_tuple,
+                presence_owner_links=tuple(
+                    (presence, owner, identity)
+                    for presence, (owner, identity) in sorted(active_links.items())
+                ),
                 step_participant_ids=step_tuple,
                 presence_ids=tuple(sorted(active_presence)),
             )
@@ -614,6 +636,10 @@ class DurableWorldRuntime:
                     journal_prefix_sha256=candidate_journal.prefix_digest(),
                     commit_id=transition_id,
                     registered_owner_ids=registered_tuple,
+                    presence_owner_links=tuple(
+                        (presence, owner, identity)
+                        for presence, (owner, identity) in sorted(active_links.items())
+                    ),
                     step_participant_ids=step_tuple,
                 )
                 self._manifest_store._commit_transition(
