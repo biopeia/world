@@ -19,7 +19,7 @@ from threading import Lock
 from types import MappingProxyType
 from typing import Protocol
 
-from .journal import CausalRecord, EventJournal
+from .journal import CausalRecord, EventJournal, _freeze_json, _thaw_json
 from .manifest import (
     CheckpointReference,
     DependencyVerifier,
@@ -47,6 +47,25 @@ class PresenceOwnerLink:
             raise ValueError("presence linkage requires a typed PresenceId")
         if not self.owner_id or not self.owner_id.strip() or not self.owner_identity or not self.owner_identity.strip():
             raise ValueError("presence linkage owner identity must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class PresenceLifecycleTransition:
+    """World-owned lifecycle intent and separately attributed trigger data."""
+
+    transition_type: str
+    presence_id: PresenceId
+    trigger_provenance: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if self.transition_type not in {"REGISTER", "TERMINATE"}:
+            raise ValueError("presence lifecycle type must be REGISTER or TERMINATE")
+        if not isinstance(self.presence_id, PresenceId):
+            raise ValueError("presence lifecycle requires a typed PresenceId")
+        if not isinstance(self.trigger_provenance, Mapping) or not self.trigger_provenance:
+            raise ValueError("presence lifecycle requires explicit trigger provenance")
+        _validate_json_object(self.trigger_provenance)
+        object.__setattr__(self, "trigger_provenance", _freeze_json(self.trigger_provenance))
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,7 +268,7 @@ class DurableWorldRuntime:
     def __init__(
         self,
         world_id: WorldId,
-        presence_id: str,
+        presence_id: str | None,
         manifest_store: WorldCausalManifestStore,
         journal_store: DurableJournalSnapshotStore,
         manifest: WorldCausalManifest,
@@ -258,12 +277,14 @@ class DurableWorldRuntime:
         owner_checkpoint_verifier: OwnerCheckpointVerifier,
         owner_checkpoint_contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
     ) -> None:
-        if not presence_id or not presence_id.strip():
+        if presence_id is not None and (not presence_id or not presence_id.strip()):
             raise ValueError("presence id must not be empty")
         if manifest.world_id != world_id.value:
             raise ValueError("manifest World identity does not match runtime")
-        if presence_id not in manifest.presence_ids:
+        if presence_id is not None and presence_id not in manifest.presence_ids:
             raise ValueError("runtime presence is not part of the durable World cut")
+        if presence_id is None and manifest.presence_ids:
+            raise ValueError("a World with active presences requires an active runtime presence")
         if journal_store.world_id != world_id.value:
             raise ValueError("journal store World identity does not match runtime")
         if manifest.status is not ManifestStatus.COMMITTED:
@@ -337,7 +358,7 @@ class DurableWorldRuntime:
     def restore(
         cls,
         world_id: WorldId,
-        presence_id: str,
+        presence_id: str | None,
         manifest_store: WorldCausalManifestStore,
         journal_store: DurableJournalSnapshotStore,
         *,
@@ -348,7 +369,10 @@ class DurableWorldRuntime:
         manifest = manifest_store._require_active()
         if manifest.world_id != world_id.value:
             raise ManifestError("stored World identity does not match requested World")
-        if presence_id not in manifest.presence_ids:
+        if presence_id is None:
+            if manifest.presence_ids:
+                raise ManifestError("active World cut requires an explicit runtime presence")
+        elif presence_id not in manifest.presence_ids:
             raise ManifestError("requested presence is not part of the stored World cut")
         references = manifest.checkpoint_references
         cls._require_owner_references(references, "stored causal cut")
@@ -386,7 +410,7 @@ class DurableWorldRuntime:
     def recover_previous_cut(
         cls,
         world_id: WorldId,
-        presence_id: str,
+        presence_id: str | None,
         manifest_store: WorldCausalManifestStore,
         journal_store: DurableJournalSnapshotStore,
         *,
@@ -410,7 +434,10 @@ class DurableWorldRuntime:
             raise ManifestError("pending World identity does not match requested World")
         if not pending.pending_transition_id or pending.pending_tick != pending.causal_tick + 1:
             raise ManifestError("pending transition metadata is incomplete or inconsistent")
-        if presence_id not in pending.presence_ids:
+        if presence_id is None:
+            if pending.presence_ids:
+                raise ManifestError("active World cut requires an explicit runtime presence")
+        elif presence_id not in pending.presence_ids:
             raise ManifestError("requested presence is not part of the pending World cut")
 
         references = pending.checkpoint_references
@@ -476,6 +503,7 @@ class DurableWorldRuntime:
         unregister_presence: Iterable[str] = (),
         presence_owner_updates: Iterable[PresenceOwnerLink] = (),
         register_owner_contracts: Mapping[tuple[str, str], OwnerCheckpointContract] | None = None,
+        presence_lifecycle: PresenceLifecycleTransition | None = None,
     ) -> CausalRecord:
         if not self._tick_guard.acquire(blocking=False):
             raise TickInProgressError("a World causal tick is already in progress")
@@ -502,12 +530,29 @@ class DurableWorldRuntime:
             if registered & step_only:
                 raise ManifestError("step participants must not duplicate registered World owners")
             if not registered and not step_only:
-                raise ManifestError("a committed causal cut requires at least one registered or step owner")
+                raise ManifestError("a committed causal cut requires at least one participating owner")
             presence_additions_input = tuple(register_presence)
             presence_removals_input = tuple(unregister_presence)
             presence_additions = set(presence_additions_input)
             presence_removals = set(presence_removals_input)
             active_presence = set(current.presence_ids)
+            changed_presences = presence_additions | presence_removals
+            if bool(changed_presences) != (presence_lifecycle is not None):
+                raise ManifestError("World presence roster changes require an explicit lifecycle transition")
+            if presence_lifecycle is not None:
+                lifecycle_presence = presence_lifecycle.presence_id.value
+                expected_set = (
+                    presence_additions
+                    if presence_lifecycle.transition_type == "REGISTER"
+                    else presence_removals
+                )
+                other_set = (
+                    presence_removals
+                    if presence_lifecycle.transition_type == "REGISTER"
+                    else presence_additions
+                )
+                if expected_set != {lifecycle_presence} or other_set:
+                    raise ManifestError("one lifecycle transition must change exactly its declared presence")
             if (
                 len(presence_additions) != len(presence_additions_input)
                 or len(presence_removals) != len(presence_removals_input)
@@ -517,8 +562,10 @@ class DurableWorldRuntime:
             ):
                 raise ManifestError("World presence lifecycle input is inconsistent with the current roster")
             active_presence = (active_presence | presence_additions) - presence_removals
-            if self.presence_id not in active_presence:
+            if self.presence_id is not None and self.presence_id not in active_presence and presence_lifecycle is None:
                 raise ManifestError("the current runtime presence cannot be unregistered by its own tick")
+            if self.presence_id is None and presence_lifecycle is None:
+                raise ManifestError("a World without active presence requires an explicit lifecycle transition")
             active_links = {
                 presence: (owner, identity)
                 for presence, owner, identity in current.presence_owner_links
@@ -533,10 +580,30 @@ class DurableWorldRuntime:
                 if presence not in active_presence:
                     raise ManifestError("presence owner update must target an active presence")
                 active_links[presence] = (link.owner_id, link.owner_identity)
+            lifecycle_owner: tuple[str, str] | None = None
+            if presence_lifecycle is not None:
+                if presence_lifecycle.transition_type == "TERMINATE":
+                    lifecycle_owner = next(
+                        (owner, identity)
+                        for presence, owner, identity in current.presence_owner_links
+                        if presence == presence_lifecycle.presence_id.value
+                    )
+                else:
+                    lifecycle_owner = active_links.get(presence_lifecycle.presence_id.value)
             if set(active_links) != active_presence:
                 raise ManifestError("each active presence must retain exactly one registered causal owner")
+            if presence_lifecycle is not None and lifecycle_owner is None:
+                raise ManifestError("registered presence must have exactly one declared owner")
             if any(owner_key not in registered for owner_key in active_links.values()):
                 raise ManifestError("each active presence owner must be in the proposed registered owner roster")
+            if lifecycle_owner is not None and lifecycle_owner not in registered and lifecycle_owner not in step_only:
+                raise ManifestError("presence lifecycle owner must participate in the lifecycle commit")
+            if presence_lifecycle is not None and any(
+                item.record_type == "world.presence.lifecycle.committed"
+                and item.payload.get("lifecycle_transition_id") == transition_id
+                for item in self._journal.replay()
+            ):
+                raise ManifestError("presence lifecycle transition identity is already committed")
             registered_tuple = tuple(sorted(registered))
             step_tuple = tuple(sorted(step_only))
             expected_owners = frozenset(registered | step_only)
@@ -546,7 +613,8 @@ class DurableWorldRuntime:
                 raise ManifestError("each newly registered or step-only owner requires its owner checkpoint contract")
             proposed_contracts.update(new_contracts)
             for key in removals:
-                proposed_contracts.pop(key, None)
+                if key not in step_only:
+                    proposed_contracts.pop(key, None)
             pending = self._manifest_store._begin_transition(
                 transition_id,
                 registered_owner_ids=registered_tuple,
@@ -589,7 +657,7 @@ class DurableWorldRuntime:
                     world_id=self.world_id.value,
                     causal_tick=proposed_tick,
                     record_type="world.causal_tick.committed",
-                    actor_id=self.presence_id,
+                    actor_id="world" if presence_lifecycle is not None else self.presence_id,
                     payload={"presence_id": self.presence_id},
                 )
                 candidate_journal = EventJournal.from_snapshot(self._journal.snapshot())
@@ -599,6 +667,50 @@ class DurableWorldRuntime:
                 if existing_owner_record_keys.intersection(owner_record_keys):
                     raise ManifestError("owner causal record identity was already committed in this World")
                 candidate_journal.append(record)
+                if presence_lifecycle is not None:
+                    owner_refs = tuple(
+                        {
+                            "owner_id": reference.owner,
+                            "owner_identity": reference.owner_identity,
+                            "checkpoint_id": reference.checkpoint_id,
+                            "schema_version": reference.schema_version,
+                            "locator": reference.locator,
+                            "sha256": reference.sha256,
+                        }
+                        for reference in owner_references
+                        if (reference.owner, reference.owner_identity) == lifecycle_owner
+                    )
+                    if not owner_refs:
+                        raise ManifestError("lifecycle owner must contribute a checkpoint reference to the commit")
+                    candidate_journal.append(
+                        CausalRecord(
+                            record_id=f"{self.world_id.value}:presence-lifecycle:{proposed_tick}:{transition_id}",
+                            world_id=self.world_id.value,
+                            causal_tick=proposed_tick,
+                            record_type="world.presence.lifecycle.committed",
+                            actor_id="world",
+                            payload={
+                                "authority": "world",
+                                "lifecycle_transition_id": transition_id,
+                                "transition_type": presence_lifecycle.transition_type,
+                                "affected_presence_id": presence_lifecycle.presence_id.value,
+                                "affected_owner": {
+                                    "owner_id": lifecycle_owner[0],
+                                    "owner_identity": lifecycle_owner[1],
+                                },
+                                "source_tick": current.causal_tick,
+                                "target_tick": proposed_tick,
+                                "trigger_provenance": _thaw_json(presence_lifecycle.trigger_provenance),
+                                "required_participants": [list(key) for key in sorted(expected_owners)],
+                                "owner_checkpoint_references": list(owner_refs),
+                                "resulting_active_presence_ids": sorted(active_presence),
+                                "resulting_presence_owner_links": [
+                                    [presence, owner, identity]
+                                    for presence, (owner, identity) in sorted(active_links.items())
+                                ],
+                            },
+                        )
+                    )
                 for owner_record in owner_records:
                     encoded_identity = json.dumps(
                         [owner_record.owner_id, owner_record.owner_identity, owner_record.owner_record_id],
@@ -655,6 +767,18 @@ class DurableWorldRuntime:
                 self._owner_checkpoint_contracts = {
                     key: proposed_contracts[key] for key in registered
                 }
+                if (
+                    presence_lifecycle is not None
+                    and presence_lifecycle.transition_type == "REGISTER"
+                    and self.presence_id is None
+                ):
+                    self.presence_id = presence_lifecycle.presence_id.value
+                elif (
+                    presence_lifecycle is not None
+                    and presence_lifecycle.transition_type == "TERMINATE"
+                    and self.presence_id == presence_lifecycle.presence_id.value
+                ):
+                    self.presence_id = None
                 return record
             except Exception as exc:
                 self._latched_failure = f"{type(exc).__name__}: {exc}"
