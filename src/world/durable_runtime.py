@@ -340,7 +340,7 @@ class DurableJournalSnapshotStore:
                 actual_tick = -1
                 while stream.tell() < offset:
                     line = stream.readline()
-                    if not line or stream.tell() > offset:
+                    if not line or not line.endswith(b"\n") or stream.tell() > offset:
                         return False
                     data = json.loads(line)
                     if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
@@ -479,7 +479,7 @@ class DurableJournalSnapshotStore:
                 previous_tick = -1
                 while stream.tell() < offset:
                     line = stream.readline()
-                    if not line or stream.tell() > offset:
+                    if not line or not line.endswith(b"\n") or stream.tell() > offset:
                         raise ManifestError("World journal committed prefix is truncated")
                     data = json.loads(line)
                     if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
