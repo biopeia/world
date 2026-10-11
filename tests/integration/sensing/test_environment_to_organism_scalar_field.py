@@ -22,18 +22,16 @@ from embodiment.physics3d.physical_transition import (
     PhysicalStepCorrelation as EmbodimentStepCorrelation,
     SolverBodyCandidate,
 )
-from embodiment.physics3d.receptor import EmbodimentReceptor, project_receptor_sample_point
+from embodiment.physics3d.receptor import EmbodimentReceptor
 from environment import (
     FiniteResourceState,
     FrameDescriptor,
     IdentifiedFiniteScalarField,
-    PhysicalStepCorrelation as EnvironmentStepCorrelation,
 )
 from modality import DimensionlessScalarFieldIdentityV1
 from organism.cognition.graph import CognitiveGraph, PlasticNode
 from organism.cognition.limits import KernelLimits
 from organism.cognition.sense_input import (
-    OpaqueSenseSignal,
     SenseChannelBinding,
     SenseProvenance,
 )
@@ -64,7 +62,10 @@ from world.physical_step import (
     PhysicalStepPorts,
     run_physical_step,
 )
-from world.organism_transition import advance_organism_for_physical_step
+from world.organism_transition import (
+    advance_organism_for_physical_step,
+    advance_organism_from_scalar_field_for_physical_step,
+)
 from world.runtime import PresenceId, WorldId
 
 
@@ -238,28 +239,32 @@ def _run_fixture(tmp_path: Path, *, stale_receptor: bool = False):
     runtime, artifacts, field, body, organism_state, receptor = _runtime(
         tmp_path, stale_receptor=stale_receptor
     )
-    graph = _graph()
     pending: dict[str, object] = {"initial_organism_state": organism_state}
 
     def project_body(context: PhysicalStepContext):
-        point = project_receptor_sample_point(receptor, body, context)
-        pending["receptor_point"] = point
-        return point
+        assert context.body_id == body.body_id
+        pending["body_projection"] = body
+        return pending["body_projection"]
 
     def project_environment(context: PhysicalStepContext):
-        # Correlation is derived from the independently issued World context,
-        # before any Environment sample or solver candidate exists.
-        correlation = EnvironmentStepCorrelation(
-            world_id=context.world_id,
-            causal_tick=context.source_causal_tick,
-            physical_step_id=context.physical_step_id,
-            environment_id=ENVIRONMENT_ID,
-            environment_revision=ENVIRONMENT_REVISION,
+        # World production composition invokes Embodiment, Environment,
+        # Modality, and Organism owner contracts; this callback only supplies
+        # configured participants and records the returned evidence.
+        body_projection = pending["body_projection"]
+        assert isinstance(body_projection, EmbodimentPhysicalState)
+        composed = advance_organism_from_scalar_field_for_physical_step(
+            context,
+            organism_state,
+            receptor=receptor,
+            embodiment_state=body_projection,
+            environment_field=field,
+            sampling_frame=_frame(),
+            transduction=DimensionlessScalarFieldIdentityV1(),
+            binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque-input"),
+            kernel_limits=KernelLimits(),
         )
-        point = pending["receptor_point"]
-        sample = field.sample_field(
-            point.position_m, frame=_frame(), correlation=correlation
-        )
+        point = composed.receptor_point
+        sample = composed.sample
         assert sample.resource_id == RESOURCE_ID
         assert sample.field_revision == FIELD_REVISION
         assert sample.world_id == context.world_id
@@ -269,52 +274,10 @@ def _run_fixture(tmp_path: Path, *, stale_receptor: bool = False):
         assert sample.environment_revision == ENVIRONMENT_REVISION
         assert sample.frame_id == FRAME_ID
         assert 0.0 <= sample.value <= 1.0
-        expected_provenance = SenseProvenance(
-            world_id=context.world_id,
-            causal_tick=context.source_causal_tick,
-            physical_step_id=context.physical_step_id,
-            environment_id=ENVIRONMENT_ID,
-            environment_revision=ENVIRONMENT_REVISION,
-            sample_frame_id=point.frame_id,
-            sample_position_m=point.position_m,
-            body_id=context.body_id,
-            embodiment_episode_id=context.embodiment_episode_id,
-            morphology_revision=context.morphology_revision,
-        )
-        provenance = SenseProvenance(
-            world_id=sample.world_id,
-            causal_tick=sample.causal_tick,
-            physical_step_id=sample.physical_step_id,
-            environment_id=sample.environment_id,
-            environment_revision=sample.environment_revision,
-            sample_frame_id=sample.frame_id,
-            sample_position_m=sample.point_m,
-            body_id=context.body_id,
-            embodiment_episode_id=context.embodiment_episode_id,
-            morphology_revision=context.morphology_revision,
-        )
-        assert provenance == expected_provenance
-        signal = OpaqueSenseSignal(
-            channel_id=CHANNEL_ID,
-            receptor_id=RECEPTOR_ID,
-            value=DimensionlessScalarFieldIdentityV1().transduce(sample.value),
-            provenance=provenance,
-            contract_id=DimensionlessScalarFieldIdentityV1.CONTRACT_ID,
-            contract_revision=DimensionlessScalarFieldIdentityV1.REVISION,
-            quantity_kind=DimensionlessScalarFieldIdentityV1.QUANTITY_KIND,
-            unit=DimensionlessScalarFieldIdentityV1.UNIT,
-        )
-        accepted = advance_organism_for_physical_step(
-            context,
-            organism_state,
-            (SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque-input"),),
-            (signal,),
-            expected_provenance=expected_provenance,
-            kernel_limits=KernelLimits(),
-        )
-        pending["signal"] = signal
-        pending["organism_state"] = accepted
+        pending["signal"] = composed.signal
+        pending["organism_state"] = composed.state
         pending["sample"] = sample
+        pending["receptor_point"] = point
         return sample
 
     def execute_solver(context: PhysicalStepContext, _body_projection, sample):
@@ -430,12 +393,18 @@ def test_environment_scalar_field_reaches_organism_as_opaque_signal_and_commits(
 def test_stale_receptor_morphology_is_rejected_without_next_committed_cut(
     tmp_path: Path,
 ) -> None:
-    runtime, *_ = _runtime(tmp_path, stale_receptor=True)
-    body = _body_state(0)
+    runtime, _, field, body, organism_state, _ = _runtime(
+        tmp_path, stale_receptor=True
+    )
 
     def project_body(context: PhysicalStepContext):
-        return project_receptor_sample_point(
-            EmbodimentReceptor(
+        return body
+
+    def reject_stale_receptor(context: PhysicalStepContext):
+        advance_organism_from_scalar_field_for_physical_step(
+            context,
+            organism_state,
+            receptor=EmbodimentReceptor(
                 receptor_id=RECEPTOR_ID,
                 body_id=BODY_ID,
                 embodiment_episode_id=EPISODE_ID,
@@ -443,8 +412,12 @@ def test_stale_receptor_morphology_is_rejected_without_next_committed_cut(
                 body_frame="body-root",
                 position_in_body_frame_m=(0.0, 0.0, 0.0),
             ),
-            body,
-            context,
+            embodiment_state=body,
+            environment_field=field,
+            sampling_frame=_frame(),
+            transduction=DimensionlessScalarFieldIdentityV1(),
+            binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque-input"),
+            kernel_limits=KernelLimits(),
         )
 
     def unused(*_args):
@@ -462,7 +435,7 @@ def test_stale_receptor_morphology_is_rejected_without_next_committed_cut(
             solver_config_revision="deterministic-sensing-solver-v1",
             ports=PhysicalStepPorts(
                 project_body=project_body,
-                project_environment=unused,
+                project_environment=reject_stale_receptor,
                 execute_solver=unused,
                 adopt_body=unused,
                 adopt_environment=unused,
