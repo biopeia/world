@@ -3,6 +3,7 @@
 from .durable_runtime import (
     DurableJournalSnapshotStore,
     DurableWorldRuntime,
+    CommittedWorldCut,
     OwnerCausalRecord,
     OwnerCheckpointContract,
     PresenceLifecycleTransition,
@@ -33,6 +34,7 @@ from .runtime import (
 __all__ = [
     "CausalRecord",
     "CheckpointReference",
+    "CommittedWorldCut",
     "DurableJournalSnapshotStore",
     "DurableWorldRuntime",
     "EventJournal",

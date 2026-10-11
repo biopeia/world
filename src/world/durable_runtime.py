@@ -523,6 +523,24 @@ OwnerCheckpointRestorer = Callable[[tuple[CheckpointReference, ...]], None]
 
 
 @dataclass(frozen=True, slots=True)
+class CommittedWorldCut:
+    """World-verified identity and opaque owner references for one committed cut.
+
+    This is a correlation receipt for post-commit consumers, not an owner-state
+    decoder or a semantic observation. Only ``DurableWorldRuntime`` creates it
+    after matching the requested identity against the durable manifest and
+    journal.
+    """
+
+    world_id: str
+    causal_tick: int
+    commit_id: str
+    participant_ids: tuple[tuple[str, str], ...]
+    presence_owner_links: tuple[tuple[str, str, str], ...]
+    owner_checkpoint_references: tuple[CheckpointReference, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class OwnerCausalRecord:
     """Opaque owner-authored record committed in a World causal journal.
 
@@ -848,6 +866,86 @@ class DurableWorldRuntime:
     @property
     def manifest(self) -> WorldCausalManifest:
         return self._manifest
+
+    def committed_cut_for(
+        self,
+        *,
+        world_id: str,
+        causal_tick: int,
+        commit_id: str,
+        expected_owner_references: Iterable[CheckpointReference] | None = None,
+    ) -> CommittedWorldCut:
+        """Verify an exact current cut against durable World-owned history.
+
+        This is intended for post-commit publication joins. It checks the active
+        committed manifest against this already-validated runtime snapshot and
+        returns the exact opaque owner references World committed. Full journal
+        integrity validation occurs on commit and restore, not on every receipt
+        lookup; this keeps publication lookup bounded as the journal grows. It
+        never opens or decodes owner checkpoint bytes. A pending/recovery state,
+        stale identity, or stale owner reference fails closed.
+        """
+        with self._tick_guard:
+            # Unlike startup restore, a receipt lookup must not reinterpret a
+            # live PREPARING transition as abandoned work. _read_for_tick rejects
+            # that state without mutating the manifest.
+            manifest = self._manifest_store._read_for_tick()
+            if manifest != self._manifest:
+                raise SingleWriterPreconditionError(
+                    "World runtime is stale relative to the active committed cut"
+                )
+            if (
+                world_id != manifest.world_id
+                or type(causal_tick) is not int
+                or causal_tick != manifest.causal_tick
+                or commit_id != manifest.commit_id
+            ):
+                raise ManifestError("requested identity does not match the current committed World cut")
+            journal_references = tuple(
+                reference
+                for reference in manifest.checkpoint_references
+                if reference.owner == _JOURNAL_OWNER
+            )
+            if len(journal_references) != 1:
+                raise ManifestError("committed World cut must identify exactly one journal prefix")
+            journal_reference = journal_references[0]
+            journal_tick, journal_sequence, _offset = self._journal_store._position(journal_reference)
+            if (
+                journal_tick != manifest.causal_tick
+                or journal_sequence != manifest.journal_last_sequence
+                or journal_reference.sha256 != manifest.journal_prefix_sha256
+                or self._journal.prefix_digest() != manifest.journal_prefix_sha256
+            ):
+                raise ManifestError("committed World manifest and validated runtime journal identity differ")
+            owner_references = tuple(
+                sorted(
+                    (
+                        reference
+                        for reference in manifest.checkpoint_references
+                        if reference.owner != _JOURNAL_OWNER
+                    ),
+                    key=lambda reference: (reference.owner, reference.owner_identity),
+                )
+            )
+            if expected_owner_references is not None:
+                expected = tuple(
+                    sorted(
+                        tuple(expected_owner_references),
+                        key=lambda reference: (reference.owner, reference.owner_identity),
+                    )
+                )
+                if expected != owner_references:
+                    raise ManifestError(
+                        "owner checkpoint references do not match the committed World cut"
+                    )
+            return CommittedWorldCut(
+                world_id=manifest.world_id,
+                causal_tick=manifest.causal_tick,
+                commit_id=manifest.commit_id,
+                participant_ids=tuple(sorted((*manifest.registered_owner_ids, *manifest.step_participant_ids))),
+                presence_owner_links=manifest.presence_owner_links,
+                owner_checkpoint_references=owner_references,
+            )
 
     def tick(
         self,
