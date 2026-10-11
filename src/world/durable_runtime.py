@@ -13,11 +13,12 @@ import os
 import re
 import tempfile
 import fcntl
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from threading import Lock
+from threading import Lock, get_ident
 from types import MappingProxyType
 from typing import Protocol
 
@@ -660,6 +661,8 @@ class DurableWorldRuntime:
         self._owner_checkpoint_verifier = owner_checkpoint_verifier
         self._owner_checkpoint_contracts = dict(owner_checkpoint_contracts)
         self._tick_guard = Lock()
+        self._publication_guard_thread_id: int | None = None
+        self._publication_guard_tick_used = False
         self._latched_failure: str | None = None
         self._validate_cut(manifest, journal)
 
@@ -868,6 +871,29 @@ class DurableWorldRuntime:
     def manifest(self) -> WorldCausalManifest:
         return self._manifest
 
+    @contextmanager
+    def committed_cut_publication_guard(self) -> Iterator[None]:
+        """Keep a committed cut current while its post-commit publication runs.
+
+        Physical-step composition holds this scope across commit receipt
+        verification, owner projection, and Observation delivery. Reentrancy
+        permits that same thread to perform the World tick and receipt lookup,
+        but a second tick from that thread is rejected until publication leaves
+        the scope. Competing threads fail with ``TickInProgressError``.
+        """
+        if self._publication_guard_thread_id is not None:
+            raise TickInProgressError("a World causal publication is already in progress")
+        if not self._tick_guard.acquire(blocking=False):
+            raise TickInProgressError("a World causal tick is already in progress")
+        self._publication_guard_thread_id = get_ident()
+        self._publication_guard_tick_used = False
+        try:
+            yield
+        finally:
+            self._publication_guard_thread_id = None
+            self._publication_guard_tick_used = False
+            self._tick_guard.release()
+
     def committed_cut_for(
         self,
         *,
@@ -886,7 +912,8 @@ class DurableWorldRuntime:
         never opens or decodes owner checkpoint bytes. A pending/recovery state,
         stale identity, or stale owner reference fails closed.
         """
-        with self._tick_guard:
+        publication_owner = self._publication_guard_thread_id == get_ident()
+        with nullcontext() if publication_owner else self._tick_guard:
             # Unlike startup restore, a receipt lookup must not reinterpret a
             # live PREPARING transition as abandoned work. _read_for_tick rejects
             # that state without mutating the manifest.
@@ -963,7 +990,14 @@ class DurableWorldRuntime:
         register_owner_contracts: Mapping[tuple[str, str], OwnerCheckpointContract] | None = None,
         presence_lifecycle: PresenceLifecycleTransition | None = None,
     ) -> CausalRecord:
-        if not self._tick_guard.acquire(blocking=False):
+        publication_owner = self._publication_guard_thread_id == get_ident()
+        if publication_owner:
+            if self._publication_guard_tick_used:
+                raise TickInProgressError(
+                    "a World causal publication cannot start another tick before delivery completes"
+                )
+            self._publication_guard_tick_used = True
+        elif not self._tick_guard.acquire(blocking=False):
             raise TickInProgressError("a World causal tick is already in progress")
         try:
             if self._latched_failure is not None:
@@ -1271,7 +1305,8 @@ class DurableWorldRuntime:
                     pass
                 raise
         finally:
-            self._tick_guard.release()
+            if not publication_owner:
+                self._tick_guard.release()
 
     @staticmethod
     def _verify_references(
