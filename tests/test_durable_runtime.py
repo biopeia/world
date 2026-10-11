@@ -2400,3 +2400,79 @@ def test_presence_lifecycle_detaches_and_deep_freezes_trigger_provenance():
     assert transition.trigger_provenance["source"]["labels"] == ("manual",)
     with pytest.raises(TypeError):
         transition.trigger_provenance["source"]["principal"] = "mutated"
+
+
+def test_recovery_required_error_hierarchy_is_unified():
+    """Verify that ManifestRecoveryRequiredError is a subclass of runtime RecoveryRequiredError."""
+    from world.manifest import RecoveryRequiredError as ManifestRecoveryError
+    from world.runtime import RecoveryRequiredError as RuntimeRecoveryError
+
+    err = ManifestRecoveryError("manifest failed")
+    assert isinstance(err, RuntimeRecoveryError)
+    assert isinstance(err, ManifestError)
+    assert issubclass(ManifestRecoveryError, RuntimeRecoveryError)
+
+
+def test_durable_runtime_status_consistent_with_external_store_recovery_required(tmp_path):
+    """Ensure runtime.status cannot report COMMITTED when the authoritative store is RECOVERY_REQUIRED.
+
+    Also tests:
+    - Reading status does not mutate the store file.
+    - Subsequent tick() fails with unified RecoveryRequiredError.
+    - Explicit recover_previous_cut completes recovery and restores COMMITTED status.
+    """
+    world_id = WorldId("world-store-consistency")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_store = WorldCausalManifestStore(manifest_path)
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    owner_state = tmp_path / "owner-0.json"
+    owner_state.write_bytes(b"initial owner 0")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(owner_state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+
+    assert runtime.status is ManifestStatus.COMMITTED
+
+    # Simulate another actor or process marking the authoritative store as RECOVERY_REQUIRED
+    # (e.g. after a crash during a transition or startup detecting interrupted state).
+    manifest_store._begin_transition("external-transition")
+    manifest_store._record_failure("external-transition", "external failure recorded")
+
+    store_manifest = manifest_store.read()
+    assert store_manifest.status is ManifestStatus.RECOVERY_REQUIRED
+    store_file_mtime_before = manifest_path.stat().st_mtime_ns
+
+    # Runtime status MUST NOT report COMMITTED when the authoritative store is RECOVERY_REQUIRED
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+
+    # Reading status must not mutate the store file
+    assert manifest_path.stat().st_mtime_ns == store_file_mtime_before
+
+    # Attempting to tick on this runtime raises RecoveryRequiredError
+    with pytest.raises(RecoveryRequiredError, match="outside this runtime|explicit recovery"):
+        runtime.tick("transition-should-fail", lambda _t: ())
+
+    # The runtime latched failure and remains RECOVERY_REQUIRED
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+
+    # Explicit recovery restores the cut and returns a runtime with COMMITTED status
+    recovered = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _refs: None,
+    )
+
+    assert recovered.status is ManifestStatus.COMMITTED
+    assert manifest_store.read().status is ManifestStatus.COMMITTED

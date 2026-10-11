@@ -832,6 +832,12 @@ class DurableWorldRuntime:
     def status(self) -> ManifestStatus:
         if self._latched_failure is not None:
             return ManifestStatus.RECOVERY_REQUIRED
+        try:
+            store_manifest = self._manifest_store.read()
+            if store_manifest.status is ManifestStatus.RECOVERY_REQUIRED:
+                return ManifestStatus.RECOVERY_REQUIRED
+        except ManifestError:
+            pass
         return self._manifest.status
 
     @property
