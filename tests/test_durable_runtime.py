@@ -367,6 +367,64 @@ print(json.dumps({
     assert manifest_store.read().commit_id == "transition-visible-to-second-process"
 
 
+def test_durable_tick_stage_sequence_transitions_from_preparing_to_committed_or_recovery_required(tmp_path):
+    """Enforce stage ordering: PREPARING before owner writer runs, then COMMITTED on success, or RECOVERY_REQUIRED on failure.
+
+    This test prevents regression of the stage lifecycle guidance:
+    1. During owner checkpoint writer execution, the durable manifest is PREPARING (not RECOVERY_REQUIRED).
+    2. Upon successful completion of writer callbacks, dependency verification, and journal flush, it transitions to COMMITTED.
+    3. If an owner writer fails or an interrupted prepare is detected, it transitions to RECOVERY_REQUIRED and requires explicit recovery.
+    """
+    world_id = WorldId("world-stage-sequence")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "owner-0.json"
+    initial_owner.write_bytes(b"initial owner state")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+
+    observed_stages = []
+
+    def writer_success(tick: int):
+        observed = manifest_store.read()
+        observed_stages.append(observed.status)
+        assert observed.status is ManifestStatus.PREPARING
+        assert observed.pending_tick == tick
+        assert observed.causal_tick == 0
+        state = tmp_path / "owner-1.json"
+        state.write_bytes(b"owner state tick 1")
+        return (_checkpoint(state),)
+
+    runtime.tick("transition-stage-success", writer_success)
+    assert observed_stages == [ManifestStatus.PREPARING]
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert manifest_store.read().status is ManifestStatus.COMMITTED
+
+    # On post-prepare callback failure, the stage must latch to RECOVERY_REQUIRED,
+    # refusing subsequent ticks until explicit recover_previous_cut is performed.
+    def writer_failure(tick: int):
+        observed = manifest_store.read()
+        observed_stages.append(observed.status)
+        assert observed.status is ManifestStatus.PREPARING
+        raise RuntimeError("simulated owner writer failure")
+
+    with pytest.raises(RuntimeError, match="simulated owner writer failure"):
+        runtime.tick("transition-stage-fail", writer_failure)
+
+    assert observed_stages == [ManifestStatus.PREPARING, ManifestStatus.PREPARING]
+    assert manifest_store.read().status is ManifestStatus.RECOVERY_REQUIRED
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+
+
 def test_owner_causal_record_survives_later_tick_and_restore(tmp_path):
     world_id = WorldId("world-owner-record-history")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
