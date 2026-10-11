@@ -479,8 +479,10 @@ class DurableJournalSnapshotStore:
                 previous_tick = -1
                 while stream.tell() < offset:
                     line = stream.readline()
-                    if not line or not line.endswith(b"\n") or stream.tell() > offset:
+                    if not line or stream.tell() > offset:
                         raise ManifestError("World journal committed prefix is truncated")
+                    if not line.endswith(b"\n"):
+                        raise ManifestError("World journal committed record is not LF-terminated")
                     data = json.loads(line)
                     if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
                         raise ManifestError("World journal record envelope is invalid")

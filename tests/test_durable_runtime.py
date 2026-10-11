@@ -204,7 +204,7 @@ def test_non_lf_committed_record_terminator_blocks_append_without_mutation(tmp_p
     journal_path.write_bytes(corrupted_log)
 
     assert not journal_store.verify(journal_ref)
-    with pytest.raises(ManifestError, match="committed prefix is truncated"):
+    with pytest.raises(ManifestError, match="not LF-terminated"):
         journal_store.read(journal_ref)
 
     with pytest.raises(ManifestError, match="previous committed World journal reference is invalid"):
