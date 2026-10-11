@@ -89,8 +89,9 @@ class _FixtureOwnerContract:
     def validate_checkpoint(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool:
         return bool(encoded and owner_identity and schema_version)
 
-    def verify_restoration(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool:
-        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+    def verify_restoration(self, reference: CheckpointReference) -> bool:
+        encoded = Path(reference.locator).read_bytes()
+        return self.validate_checkpoint(encoded, reference.owner_identity, reference.schema_version)
 
 
 def _graph() -> CognitiveGraph:

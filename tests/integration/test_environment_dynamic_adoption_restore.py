@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,6 @@ from environment import (
     DynamicEnvironmentOwner,
     DynamicObjectState,
     FrameDescriptor,
-    OwnerRestorationReference,
     PhysicalStepCorrelation,
 )
 from world.durable_runtime import (
@@ -20,8 +20,9 @@ from world.durable_runtime import (
     PresenceOwnerLink,
     WorldGenesisSpec,
 )
-from world.manifest import CheckpointReference, ManifestStatus, WorldCausalManifestStore
+from world.manifest import CheckpointReference, ManifestError, ManifestStatus, WorldCausalManifestStore
 from world.physical_step import PhysicalStepContext
+from world.integrations.environment_checkpoint import DynamicEnvironmentCheckpointContract
 from world.runtime import PresenceId, WorldId
 
 
@@ -32,29 +33,6 @@ OWNER_ID = "environment.dynamic-owner-fixture"
 OBJECT_ID = "object.movable-fixture"
 FRAME_ID = "environment-frame.fixture"
 REVISION = "environment-revision.fixture-r1"
-
-
-class _EnvironmentCheckpointContract:
-    def __init__(self) -> None:
-        self.restored_owner: DynamicEnvironmentOwner | None = None
-        self.restoration_reference: OwnerRestorationReference | None = None
-
-    def validate_checkpoint(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool:
-        return DynamicEnvironmentOwner.validate_checkpoint(encoded, owner_identity, schema_version)
-
-    def verify_restoration(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool:
-        if (
-            self.restored_owner is None
-            or self.restoration_reference is None
-            or self.restored_owner.owner_id != owner_identity
-            or self.restoration_reference.schema_version != schema_version
-        ):
-            return False
-        try:
-            self.restored_owner.verify_restoration(self.restoration_reference)
-        except ValueError:
-            return False
-        return True
 
 
 def _reference(directory: Path, *, tick: int, encoded: bytes) -> CheckpointReference:
@@ -72,7 +50,7 @@ def _reference(directory: Path, *, tick: int, encoded: bytes) -> CheckpointRefer
 
 
 def _runtime(root: Path, environment: DynamicEnvironmentOwner):
-    contract = _EnvironmentCheckpointContract()
+    contract = DynamicEnvironmentCheckpointContract()
     contracts = {("environment", OWNER_ID): contract}
     reference = _reference(root / "owners", tick=0, encoded=environment.checkpoint_bytes())
     world_id = WorldId(WORLD_ID)
@@ -203,18 +181,11 @@ def test_dynamic_environment_transition_is_adopted_committed_restored_and_contin
             ref for ref in references
             if ref.owner == "environment" and ref.owner_identity == OWNER_ID
         )
-        contract.restoration_reference = OwnerRestorationReference(
-            owner_identity=reference.owner_identity,
-            schema_version=reference.schema_version,
-            checkpoint_sha256=reference.sha256,
-            environment_id=ENVIRONMENT_ID,
-            environment_revision=REVISION,
-            world_id=world_id.value,
-        )
-        contract.restored_owner = DynamicEnvironmentOwner.from_checkpoint_bytes(
+        restored_owner = DynamicEnvironmentOwner.from_checkpoint_bytes(
             Path(reference.locator).read_bytes()
         )
-        restored["environment"] = contract.restored_owner
+        contract.attach_restored_owner(restored_owner)
+        restored["environment"] = restored_owner
 
     world_id = WorldId(WORLD_ID)
     restored_runtime = DurableWorldRuntime.restore(
@@ -244,6 +215,153 @@ def test_dynamic_environment_transition_is_adopted_committed_restored_and_contin
     assert DynamicEnvironmentOwner.from_checkpoint_bytes(
         Path(second_reference.locator).read_bytes()
     ).object_state.position_m == (0.5, 0.0, 0.0)
+
+
+def test_environment_restoration_contract_requires_independent_reference_identity_schema_and_digest(
+    tmp_path: Path,
+):
+    environment = _initial_owner()
+    reference = _reference(
+        tmp_path / "owners", tick=0, encoded=environment.checkpoint_bytes()
+    )
+    restored_owner = DynamicEnvironmentOwner.from_checkpoint_bytes(
+        Path(reference.locator).read_bytes()
+    )
+    contract = DynamicEnvironmentCheckpointContract()
+    contract.attach_restored_owner(restored_owner)
+
+    assert contract.verify_restoration(reference)
+    assert not contract.verify_restoration(
+        replace(reference, owner_identity="environment.other-owner")
+    )
+    assert not contract.verify_restoration(
+        replace(reference, schema_version="environment-dynamic-object-v1")
+    )
+    assert not contract.verify_restoration(
+        replace(reference, sha256="0" * 64)
+    )
+
+
+def test_restore_rejects_environment_state_that_differs_from_committed_reference(tmp_path: Path):
+    environment = _initial_owner()
+    runtime, contracts, contract = _runtime(tmp_path, environment)
+    _step(runtime, environment, tmp_path, target_tick=1)
+    world_id = WorldId(WORLD_ID)
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+
+    def restore_then_corrupt(references):
+        reference = next(ref for ref in references if ref.owner == "environment")
+        checkpoint_owner = DynamicEnvironmentOwner.from_checkpoint_bytes(
+            Path(reference.locator).read_bytes()
+        )
+        restored_owner = DynamicEnvironmentOwner(
+            owner_id=OWNER_ID,
+            world_id=WORLD_ID,
+            environment_id=ENVIRONMENT_ID,
+            environment_revision=REVISION,
+            frame=checkpoint_owner.frame,
+            object_state=DynamicObjectState(OBJECT_ID, FRAME_ID, (999.0, 0.0, 0.0)),
+        )
+        contract.attach_restored_owner(restored_owner)
+
+    with pytest.raises(ManifestError, match="owner restoration validation"):
+        DurableWorldRuntime.restore(
+            world_id,
+            PRESENCE_ID,
+            manifest_store,
+            journal_store,
+            owner_checkpoint_verifier=lambda refs: all(
+                contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                    Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+                )
+                for ref in refs if ref.owner != "world-journal"
+            ),
+            owner_checkpoint_contracts=contracts,
+            owner_checkpoint_restorer=restore_then_corrupt,
+        )
+
+    assert manifest_store.read().status is ManifestStatus.COMMITTED
+    assert manifest_store.read().causal_tick == 1
+
+
+def test_explicit_recovery_restores_environment_owner_against_prior_cut(tmp_path: Path):
+    environment = _initial_owner()
+    runtime, contracts, contract = _runtime(tmp_path, environment)
+    _step(runtime, environment, tmp_path, target_tick=1)
+    _step(runtime, environment, tmp_path, target_tick=2, reject=True)
+
+    restored: dict[str, DynamicEnvironmentOwner] = {}
+
+    def restore_owner(references):
+        reference = next(ref for ref in references if ref.owner == "environment")
+        owner = DynamicEnvironmentOwner.from_checkpoint_bytes(
+            Path(reference.locator).read_bytes()
+        )
+        contract.attach_restored_owner(owner)
+        restored["environment"] = owner
+
+    world_id = WorldId(WORLD_ID)
+    recovered = DurableWorldRuntime.recover_previous_cut(
+        world_id,
+        PRESENCE_ID,
+        WorldCausalManifestStore(tmp_path / "manifest.json"),
+        DurableJournalSnapshotStore(tmp_path / "journal", world_id),
+        owner_checkpoint_verifier=lambda refs: all(
+            contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+            )
+            for ref in refs if ref.owner != "world-journal"
+        ),
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=restore_owner,
+    )
+
+    assert recovered.status is ManifestStatus.COMMITTED
+    assert recovered.causal_tick == 1
+    assert restored["environment"].object_state.position_m == (0.25, 0.0, 0.0)
+
+
+def test_explicit_recovery_rejects_environment_owner_mismatch(tmp_path: Path):
+    environment = _initial_owner()
+    runtime, contracts, contract = _runtime(tmp_path, environment)
+    _step(runtime, environment, tmp_path, target_tick=1)
+    _step(runtime, environment, tmp_path, target_tick=2, reject=True)
+
+    def restore_wrong_owner(references):
+        reference = next(ref for ref in references if ref.owner == "environment")
+        checkpoint_owner = DynamicEnvironmentOwner.from_checkpoint_bytes(
+            Path(reference.locator).read_bytes()
+        )
+        contract.attach_restored_owner(DynamicEnvironmentOwner(
+            owner_id=OWNER_ID,
+            world_id=WORLD_ID,
+            environment_id=ENVIRONMENT_ID,
+            environment_revision=REVISION,
+            frame=checkpoint_owner.frame,
+            object_state=DynamicObjectState(OBJECT_ID, FRAME_ID, (999.0, 0.0, 0.0)),
+        ))
+
+    world_id = WorldId(WORLD_ID)
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    with pytest.raises(ManifestError, match="owner restoration validation"):
+        DurableWorldRuntime.recover_previous_cut(
+            world_id,
+            PRESENCE_ID,
+            manifest_store,
+            DurableJournalSnapshotStore(tmp_path / "journal", world_id),
+            owner_checkpoint_verifier=lambda refs: all(
+                contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                    Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+                )
+                for ref in refs if ref.owner != "world-journal"
+            ),
+            owner_checkpoint_contracts=contracts,
+            owner_checkpoint_restorer=restore_wrong_owner,
+        )
+
+    assert manifest_store.read().status is ManifestStatus.RECOVERY_REQUIRED
+    assert manifest_store.read().causal_tick == 1
 
 
 def test_identical_fixture_input_produces_same_owner_state_and_committed_cut(tmp_path: Path):
