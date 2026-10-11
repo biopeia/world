@@ -241,8 +241,9 @@ class _OwnerContract:
     def validate_checkpoint(self, encoded, owner_identity, schema_version):
         return self.valid and bool(encoded) and bool(owner_identity) and bool(schema_version)
 
-    def verify_restoration(self, encoded, owner_identity, schema_version):
-        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+    def verify_restoration(self, reference):
+        encoded = Path(reference.locator).read_bytes()
+        return self.validate_checkpoint(encoded, reference.owner_identity, reference.schema_version)
 
 
 def _contracts(*keys):
@@ -612,8 +613,9 @@ def verify(references):
 class Contract:
     def validate_checkpoint(self, encoded, owner_identity, schema_version):
         return bool(encoded) and owner_identity == "organism-identity" and schema_version == "v1"
-    def verify_restoration(self, encoded, owner_identity, schema_version):
-        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+    def verify_restoration(self, reference):
+        encoded = Path(reference.locator).read_bytes()
+        return self.validate_checkpoint(encoded, reference.owner_identity, reference.schema_version)
 
 runtime = DurableWorldRuntime.restore(
     world_id,
@@ -756,8 +758,9 @@ def verify(references):
 class Contract:
     def validate_checkpoint(self, encoded, owner_identity, schema_version):
         return bool(encoded) and owner_identity == "organism-identity" and schema_version == "v1"
-    def verify_restoration(self, encoded, owner_identity, schema_version):
-        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+    def verify_restoration(self, reference):
+        encoded = Path(reference.locator).read_bytes()
+        return self.validate_checkpoint(encoded, reference.owner_identity, reference.schema_version)
 
 runtime = DurableWorldRuntime.restore(
     world_id,
@@ -971,8 +974,9 @@ def verify(references):
 class Contract:
     def validate_checkpoint(self, encoded, owner_identity, schema_version):
         return bool(encoded) and owner_identity == "organism-identity" and schema_version == "v1"
-    def verify_restoration(self, encoded, owner_identity, schema_version):
-        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+    def verify_restoration(self, reference):
+        encoded = Path(reference.locator).read_bytes()
+        return self.validate_checkpoint(encoded, reference.owner_identity, reference.schema_version)
 
 runtime = DurableWorldRuntime.restore(
     world_id,
@@ -1076,8 +1080,9 @@ def verify(refs):
 class Contract:
     def validate_checkpoint(self, encoded, owner_identity, schema_version):
         return bool(encoded) and owner_identity == "organism-identity" and schema_version == "v1"
-    def verify_restoration(self, encoded, owner_identity, schema_version):
-        return self.validate_checkpoint(encoded, owner_identity, schema_version)
+    def verify_restoration(self, reference):
+        encoded = Path(reference.locator).read_bytes()
+        return self.validate_checkpoint(encoded, reference.owner_identity, reference.schema_version)
 runtime = DurableWorldRuntime.restore(world_id, "presence-a", manifest_store, DurableJournalSnapshotStore(root / "journal", world_id), owner_checkpoint_verifier=verify, owner_checkpoint_contracts={("organism", "organism-identity"): Contract()}, owner_checkpoint_restorer=lambda _refs: None)
 original_fsync = os.fsync
 def exit_after_append(fd):

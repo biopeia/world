@@ -589,7 +589,7 @@ class OwnerCheckpointContract(Protocol):
 
     def validate_checkpoint(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool: ...
 
-    def verify_restoration(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool: ...
+    def verify_restoration(self, reference: CheckpointReference) -> bool: ...
 
 
 class DurableWorldRuntime:
@@ -739,9 +739,10 @@ class DurableWorldRuntime:
             raise ManifestError("restore requires registered owner recoverability contracts for the stored roster")
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("causal cut checkpoint dependency closure is not verified")
-        owner_checkpoint_restorer(tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER))
+        owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
+        owner_checkpoint_restorer(owner_references)
         if not cls._validate_owner_checkpoints(
-            tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER),
+            owner_references,
             contracts,
             method="verify_restoration",
         ):
@@ -1205,9 +1206,12 @@ class DurableWorldRuntime:
                 encoded = Path(reference.locator).read_bytes()
                 if hashlib.sha256(encoded).hexdigest() != reference.sha256:
                     return False
-                validated = getattr(contract, method)(
-                    encoded, reference.owner_identity, reference.schema_version
-                )
+                if method == "verify_restoration":
+                    validated = contract.verify_restoration(reference)
+                else:
+                    validated = contract.validate_checkpoint(
+                        encoded, reference.owner_identity, reference.schema_version
+                    )
             except Exception:
                 return False
             if validated is not True:
