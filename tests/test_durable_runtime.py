@@ -122,6 +122,105 @@ def test_journal_v3_appends_fixed_size_records_and_recovers_exact_prefix(tmp_pat
         store.read(reference)
 
 
+def test_corrupted_earlier_committed_prefix_blocks_next_causal_commit(tmp_path):
+    world_id = WorldId("world-prefix-integrity-before-commit")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+
+    def write_owner(tick: int):
+        state = tmp_path / f"organism-{tick}.json"
+        state.write_bytes(f"organism at tick {tick}".encode())
+        return (_checkpoint(state),)
+
+    runtime.tick("transition-1", write_owner)
+    runtime.tick("transition-2", write_owner)
+    committed_manifest = runtime.manifest
+    journal_ref = next(ref for ref in committed_manifest.checkpoint_references if ref.owner == "world-journal")
+
+    # Preserve line length while invalidating an earlier committed record.
+    journal_path = Path(journal_ref.locator)
+    corrupted = bytearray(journal_path.read_bytes())
+    marker = corrupted.index(b"transition-1") + len(b"transition-")
+    corrupted[marker] = ord("9")
+    journal_path.write_bytes(corrupted)
+
+    with pytest.raises(ManifestError, match="previous committed World journal reference is invalid"):
+        runtime.tick("transition-3", write_owner)
+
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+    assert runtime.manifest.causal_tick == committed_manifest.causal_tick == 2
+    assert not journal_store.verify(journal_ref)
+
+
+def test_non_lf_committed_record_terminator_blocks_append_without_mutation(tmp_path):
+    world_id = WorldId("world-prefix-framing-before-commit")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+
+    def write_owner(tick: int):
+        state = tmp_path / f"organism-{tick}.json"
+        state.write_bytes(f"organism at tick {tick}".encode())
+        return (_checkpoint(state),)
+
+    runtime.tick("transition-1", write_owner)
+    runtime.tick("transition-2", write_owner)
+    committed_manifest = runtime.manifest
+    journal_ref = next(ref for ref in committed_manifest.checkpoint_references if ref.owner == "world-journal")
+    journal_path = Path(journal_ref.locator)
+    valid_log = journal_path.read_bytes()
+    offset = DurableJournalSnapshotStore._position(journal_ref)[2]
+    prior_record_ids = [record.record_id for record in journal_store.read(journal_ref).replay()]
+    assert valid_log[offset - 1:offset] == b"\n"
+
+    # JSON accepts trailing spaces, but the journal format requires LF framing.
+    # Keep the byte length unchanged to target framing rather than truncation.
+    corrupted = bytearray(valid_log)
+    corrupted[offset - 1] = ord(" ")
+    corrupted_log = bytes(corrupted)
+    journal_path.write_bytes(corrupted_log)
+
+    assert not journal_store.verify(journal_ref)
+    with pytest.raises(ManifestError, match="not LF-terminated"):
+        journal_store.read(journal_ref)
+
+    with pytest.raises(ManifestError, match="previous committed World journal reference is invalid"):
+        runtime.tick("transition-3", write_owner)
+
+    assert journal_path.read_bytes() == corrupted_log
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+    assert runtime.manifest.causal_tick == committed_manifest.causal_tick == 2
+
+    # The rejected append did not mutate the bytes. Restoring the test's saved
+    # valid prefix demonstrates that the prior committed cut remains readable.
+    journal_path.write_bytes(valid_log)
+    restored = journal_store.read(journal_ref)
+    assert [record.record_id for record in restored.replay()] == prior_record_ids
+
+
 def _verifier(references: tuple[CheckpointReference, ...]) -> bool:
     return all(
         Path(reference.locator).is_file()

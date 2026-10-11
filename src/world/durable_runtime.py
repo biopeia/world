@@ -217,7 +217,9 @@ class DurableJournalSnapshotStore:
     candidate never rewrites that prefix, so a failed candidate can be
     discarded by truncating only bytes beyond the last committed reference.
     The reference digest is the EventJournal prefix-chain digest, not a hash
-    of the entire physical log; ``read`` verifies every retained record.
+    of the entire physical log. Before extending a committed reference, World
+    verifies every record in that committed prefix. This keeps append bytes
+    bounded for fixed-size records, while prefix validation costs O(n) reads.
     """
 
     def __init__(self, directory: str | Path, world_id: WorldId) -> None:
@@ -316,7 +318,7 @@ class DurableJournalSnapshotStore:
         return stream.read(offset - start)
 
     @classmethod
-    def _verify_tail(cls, reference: CheckpointReference) -> bool:
+    def _verify_prefix(cls, reference: CheckpointReference) -> bool:
         if reference.owner != _JOURNAL_OWNER or reference.schema_version != _JOURNAL_SCHEMA:
             return False
         try:
@@ -331,26 +333,38 @@ class DurableJournalSnapshotStore:
                     return False
                 if sequence == -1:
                     return offset == len(header) and reference.sha256 == hashlib.sha256(b"").hexdigest()
-                line = cls._read_line_ending_at(stream, offset)
-                data = json.loads(line)
-                if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
-                    return False
-                record = cls._record_from_data(data["record"])
-                encoded = EventJournal._encode(record)
-                if sequence == 0:
-                    previous = ""
-                else:
-                    previous_line = cls._read_line_ending_at(stream, offset - len(line))
-                    previous_data = json.loads(previous_line)
-                    previous = previous_data["prefix_sha256"]
-                    if not isinstance(previous, str) or not re.fullmatch(r"[0-9a-f]{64}", previous):
+                stream.seek(len(header))
+                previous = ""
+                previous_tick = -1
+                actual_sequence = 0
+                actual_tick = -1
+                while stream.tell() < offset:
+                    line = stream.readline()
+                    if not line or not line.endswith(b"\n") or stream.tell() > offset:
                         return False
-                actual = hashlib.sha256(previous.encode("ascii") + b"\0" + encoded).hexdigest()
+                    data = json.loads(line)
+                    if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
+                        return False
+                    record = cls._record_from_data(data["record"])
+                    if (
+                        record.world_id != reference.owner_identity
+                        or record.causal_tick < previous_tick
+                        or record.causal_tick > tick
+                    ):
+                        return False
+                    encoded = EventJournal._encode(record)
+                    actual = hashlib.sha256(previous.encode("ascii") + b"\0" + encoded).hexdigest()
+                    if data["prefix_sha256"] != actual:
+                        return False
+                    previous = actual
+                    previous_tick = record.causal_tick
+                    actual_tick = record.causal_tick
+                    actual_sequence += 1
                 return (
-                    data["prefix_sha256"] == actual
-                    and reference.sha256 == actual
-                    and record.world_id == reference.owner_identity
-                    and record.causal_tick == tick
+                    stream.tell() == offset
+                    and actual_sequence == sequence + 1
+                    and actual_tick == tick
+                    and previous == reference.sha256
                 )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, ManifestError):
             return False
@@ -378,7 +392,7 @@ class DurableJournalSnapshotStore:
                 or previous_reference.owner_identity != self.world_id
                 or previous_reference.schema_version != _JOURNAL_SCHEMA
                 or Path(previous_reference.locator) != target
-                or not self._verify_tail(previous_reference)
+                or not self._verify_prefix(previous_reference)
             ):
                 raise ManifestError("previous committed World journal reference is invalid")
             _, previous_sequence, previous_offset = self._position(previous_reference)
@@ -467,6 +481,8 @@ class DurableJournalSnapshotStore:
                     line = stream.readline()
                     if not line or stream.tell() > offset:
                         raise ManifestError("World journal committed prefix is truncated")
+                    if not line.endswith(b"\n"):
+                        raise ManifestError("World journal committed record is not LF-terminated")
                     data = json.loads(line)
                     if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
                         raise ManifestError("World journal record envelope is invalid")
@@ -496,8 +512,8 @@ class DurableJournalSnapshotStore:
 
     @staticmethod
     def verify(reference: CheckpointReference) -> bool:
-        """Check the referenced tail quickly; ``read`` verifies the full prefix."""
-        return DurableJournalSnapshotStore._verify_tail(reference)
+        """Verify the complete committed prefix, including its hash chain."""
+        return DurableJournalSnapshotStore._verify_prefix(reference)
 
 
 OwnerCheckpointWriter = Callable[[int], Iterable[CheckpointReference]]
