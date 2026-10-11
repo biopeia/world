@@ -227,6 +227,30 @@ class DurableJournalSnapshotStore:
     def __init__(self, directory: str | Path, world_id: WorldId) -> None:
         self.directory = Path(directory)
         self.world_id = world_id.value
+        # A live single-writer can reuse a prefix it just verified and wrote.
+        # The cache is deliberately process-local: restore/new store instances
+        # still perform a complete hash-chain verification before extending.
+        # File metadata is only an optimization witness under the declared
+        # local-filesystem/single-writer model, not a cryptographic tamper proof.
+        self._verified_reference: CheckpointReference | None = None
+        self._verified_file_signature: tuple[int, int, int, int, int] | None = None
+
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int, int, int, int]:
+        stat = path.stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _previous_prefix_is_cached(self, reference: CheckpointReference, path: Path) -> bool:
+        if self._verified_reference != reference or self._verified_file_signature is None:
+            return False
+        try:
+            return self._file_signature(path) == self._verified_file_signature
+        except OSError:
+            return False
+
+    def _cache_verified_prefix(self, reference: CheckpointReference, path: Path) -> None:
+        self._verified_reference = reference
+        self._verified_file_signature = self._file_signature(path)
 
     @staticmethod
     def _position(reference: CheckpointReference) -> tuple[int, int, int]:
@@ -394,9 +418,16 @@ class DurableJournalSnapshotStore:
                 or previous_reference.owner_identity != self.world_id
                 or previous_reference.schema_version != _JOURNAL_SCHEMA
                 or Path(previous_reference.locator) != target
-                or not self._verify_prefix(previous_reference)
             ):
                 raise ManifestError("previous committed World journal reference is invalid")
+            # Sequential writes through this store have already validated and
+            # fsynced the exact committed prefix. Avoid rescanning the entire
+            # history on every tick, but reverify whenever this store instance
+            # is new or the backing file's identity/metadata changed.
+            if not self._previous_prefix_is_cached(previous_reference, target):
+                if not self._verify_prefix(previous_reference):
+                    raise ManifestError("previous committed World journal reference is invalid")
+                self._cache_verified_prefix(previous_reference, target)
             _, previous_sequence, previous_offset = self._position(previous_reference)
             previous_count = previous_sequence + 1
             if previous_count < 0 or previous_count > record_count:
@@ -454,7 +485,7 @@ class DurableJournalSnapshotStore:
                 os.fsync(stream.fileno())
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         offset = previous_offset + len(encoded_delta)
-        return CheckpointReference(
+        reference = CheckpointReference(
             owner=_JOURNAL_OWNER,
             owner_identity=self.world_id,
             checkpoint_id=f"journal-cut-{causal_tick}-sequence-{record_count - 1}-offset-{offset}",
@@ -462,6 +493,8 @@ class DurableJournalSnapshotStore:
             locator=str(target),
             sha256=digest,
         )
+        self._cache_verified_prefix(reference, target)
+        return reference
 
     def read(self, reference: CheckpointReference) -> EventJournal:
         try:
