@@ -436,11 +436,17 @@ def test_durable_world_runtime_publishes_and_restores_owner_checkpoint_closure(
     assert restored_world.manifest.status is ManifestStatus.COMMITTED
     assert restored_world.manifest.journal_last_sequence == 4
     assert restored_world.manifest.presence_ids == (str(IDENTITY),)
-    assert {reference.checkpoint_id for reference in restored_world.manifest.checkpoint_references} == {
-        "organism-tick-2",
-        "embodiment-tick-2",
-        "journal-prefix-2",
+    restored_references = {
+        reference.owner: reference
+        for reference in restored_world.manifest.checkpoint_references
     }
+    assert set(restored_references) == {"organism", "embodiment", "world-journal"}
+    assert restored_references["organism"].checkpoint_id == "organism-tick-2"
+    assert restored_references["embodiment"].checkpoint_id == "embodiment-tick-2"
+    assert restored_references["world-journal"].schema_version == "event-journal-v3"
+    assert restored_references["world-journal"].checkpoint_id.startswith(
+        "journal-cut-2-sequence-4-offset-"
+    )
 
     second_restore: dict[str, object] = {}
 

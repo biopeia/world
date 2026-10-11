@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
+import fcntl
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from math import isfinite
@@ -31,7 +33,7 @@ from .manifest import (
 from .runtime import PresenceId, RecoveryRequiredError, TickInProgressError, WorldId
 
 _JOURNAL_OWNER = "world-journal"
-_JOURNAL_SCHEMA = "event-journal-v2"
+_JOURNAL_SCHEMA = "event-journal-v3"
 _CAUSAL_CUT_RECORD_TYPE = "world.causal_cut.committed"
 
 
@@ -209,68 +211,293 @@ class WorldGenesisSpec:
 
 
 class DurableJournalSnapshotStore:
-    """Persist immutable journal prefixes and return opaque World references."""
+    """Persist committed journal deltas in one append-oriented World log.
+
+    A reference identifies a committed byte prefix. Appending a later
+    candidate never rewrites that prefix, so a failed candidate can be
+    discarded by truncating only bytes beyond the last committed reference.
+    The reference digest is the EventJournal prefix-chain digest, not a hash
+    of the entire physical log; ``read`` verifies every retained record.
+    """
 
     def __init__(self, directory: str | Path, world_id: WorldId) -> None:
         self.directory = Path(directory)
         self.world_id = world_id.value
 
-    def write(self, journal: EventJournal, *, causal_tick: int) -> CheckpointReference:
-        records = journal.snapshot()
-        encoded = (json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
-        digest = hashlib.sha256(encoded).hexdigest()
+    @staticmethod
+    def _position(reference: CheckpointReference) -> tuple[int, int, int]:
+        match = re.fullmatch(r"journal-cut-(\d+)-sequence-(-?\d+)-offset-(\d+)", reference.checkpoint_id)
+        if match is None:
+            raise ManifestError("World journal reference has an invalid checkpoint identity")
+        tick, sequence, offset = (int(value) for value in match.groups())
+        if sequence < -1 or offset < 1:
+            raise ManifestError("World journal reference has an invalid prefix position")
+        return tick, sequence, offset
+
+    @staticmethod
+    def _header(world_id: str) -> bytes:
+        return (json.dumps(
+            {"schema": _JOURNAL_SCHEMA, "world_id": world_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n").encode("utf-8")
+
+    @staticmethod
+    def _record_line(record: CausalRecord, previous: str) -> tuple[bytes, str]:
+        encoded = EventJournal._encode(record)
+        digest = hashlib.sha256(previous.encode("ascii") + b"\0" + encoded).hexdigest()
+        line = (json.dumps(
+            {"record": EventJournal._snapshot_record(record), "prefix_sha256": digest},
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n").encode("utf-8")
+        return line, digest
+
+    @staticmethod
+    def _record_from_data(value: object) -> CausalRecord:
+        fields = {
+            "record_id",
+            "world_id",
+            "causal_tick",
+            "record_type",
+            "actor_id",
+            "payload",
+            "causal_parent_ids",
+            "contributing_record_ids",
+        }
+        if not isinstance(value, dict) or set(value) != fields:
+            raise ManifestError("World journal record does not match the closed v3 schema")
+        if any(not isinstance(value[key], str) for key in ("record_id", "world_id", "record_type")):
+            raise ManifestError("World journal record identity fields must be strings")
+        tick = value["causal_tick"]
+        if isinstance(tick, bool) or not isinstance(tick, int):
+            raise ManifestError("World journal causal_tick must be an integer")
+        actor_id = value["actor_id"]
+        payload = value["payload"]
+        parent_ids = value["causal_parent_ids"]
+        contributing_ids = value["contributing_record_ids"]
+        if actor_id is not None and not isinstance(actor_id, str):
+            raise ManifestError("World journal actor_id must be a string or null")
+        if not isinstance(payload, dict):
+            raise ManifestError("World journal payload must be an object")
+        if not isinstance(parent_ids, list) or not all(isinstance(item, str) for item in parent_ids):
+            raise ManifestError("World journal causal_parent_ids must be a string array")
+        if not isinstance(contributing_ids, list) or not all(isinstance(item, str) for item in contributing_ids):
+            raise ManifestError("World journal contributing_record_ids must be a string array")
+        try:
+            return CausalRecord(
+                record_id=value["record_id"],
+                world_id=value["world_id"],
+                causal_tick=tick,
+                record_type=value["record_type"],
+                actor_id=actor_id,
+                payload=payload,
+                causal_parent_ids=tuple(parent_ids),
+                contributing_record_ids=tuple(contributing_ids),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ManifestError("World journal record is invalid") from exc
+
+    @staticmethod
+    def _read_line_ending_at(stream, offset: int) -> bytes:
+        if offset <= 0:
+            raise ManifestError("World journal reference has an invalid byte offset")
+        stream.seek(offset - 1)
+        if stream.read(1) != b"\n":
+            raise ManifestError("World journal committed prefix is not line-aligned")
+        start = offset - 1
+        while start > 0:
+            stream.seek(start - 1)
+            if stream.read(1) == b"\n":
+                break
+            start -= 1
+        stream.seek(start)
+        return stream.read(offset - start)
+
+    @classmethod
+    def _verify_tail(cls, reference: CheckpointReference) -> bool:
+        if reference.owner != _JOURNAL_OWNER or reference.schema_version != _JOURNAL_SCHEMA:
+            return False
+        try:
+            tick, sequence, offset = cls._position(reference)
+            path = Path(reference.locator)
+            with path.open("rb") as stream:
+                if path.stat().st_size < offset:
+                    return False
+                header = stream.readline()
+                expected_header = cls._header(reference.owner_identity)
+                if header != expected_header or len(header) >= offset:
+                    return False
+                if sequence == -1:
+                    return offset == len(header) and reference.sha256 == hashlib.sha256(b"").hexdigest()
+                line = cls._read_line_ending_at(stream, offset)
+                data = json.loads(line)
+                if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
+                    return False
+                record = cls._record_from_data(data["record"])
+                encoded = EventJournal._encode(record)
+                if sequence == 0:
+                    previous = ""
+                else:
+                    previous_line = cls._read_line_ending_at(stream, offset - len(line))
+                    previous_data = json.loads(previous_line)
+                    previous = previous_data["prefix_sha256"]
+                    if not isinstance(previous, str) or not re.fullmatch(r"[0-9a-f]{64}", previous):
+                        return False
+                actual = hashlib.sha256(previous.encode("ascii") + b"\0" + encoded).hexdigest()
+                return (
+                    data["prefix_sha256"] == actual
+                    and reference.sha256 == actual
+                    and record.world_id == reference.owner_identity
+                    and record.causal_tick == tick
+                )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, ManifestError):
+            return False
+
+    def write(
+        self,
+        journal: EventJournal,
+        *,
+        causal_tick: int,
+        previous_reference: CheckpointReference | None = None,
+    ) -> CheckpointReference:
+        record_count = len(journal)
         self.directory.mkdir(parents=True, exist_ok=True)
-        target = self.directory / f"journal-{causal_tick}-{digest}.json"
-        if target.exists():
-            if target.read_bytes() != encoded:
-                raise ManifestError("existing immutable journal snapshot differs from candidate")
+        target = self.directory / "world-causal-journal-v3.jsonl"
+        if previous_reference is None:
+            if target.exists():
+                raise ManifestError("World journal already exists without its committed reference")
+            previous_count = 0
+            previous_offset = 0
+            previous_digest = ""
+            prefix = self._header(self.world_id)
         else:
+            if (
+                previous_reference.owner != _JOURNAL_OWNER
+                or previous_reference.owner_identity != self.world_id
+                or previous_reference.schema_version != _JOURNAL_SCHEMA
+                or Path(previous_reference.locator) != target
+                or not self._verify_tail(previous_reference)
+            ):
+                raise ManifestError("previous committed World journal reference is invalid")
+            _, previous_sequence, previous_offset = self._position(previous_reference)
+            previous_count = previous_sequence + 1
+            if previous_count < 0 or previous_count > record_count:
+                raise ManifestError("candidate journal does not extend its committed prefix")
+            previous_digest = "" if previous_sequence == -1 else previous_reference.sha256
+            if journal.prefix_digest(previous_count) != previous_digest:
+                raise ManifestError("candidate journal differs from its committed prefix")
+            prefix = b""
+
+        delta_records = tuple(journal.record_at(index) for index in range(previous_count, record_count))
+        previous_tick = journal.record_at(previous_count - 1).causal_tick if previous_count else -1
+        for record in delta_records:
+            if record.world_id != self.world_id:
+                raise ManifestError("candidate journal contains a record for another World")
+            if record.causal_tick < previous_tick or record.causal_tick > causal_tick:
+                raise ManifestError("candidate journal causal order is invalid")
+            previous_tick = record.causal_tick
+        if delta_records and delta_records[-1].causal_tick != causal_tick:
+            raise ManifestError("candidate journal tail does not match the requested causal tick")
+        appended: list[bytes] = []
+        digest = previous_digest
+        for record in delta_records:
+            line, digest = self._record_line(record, digest)
+            appended.append(line)
+        if not delta_records:
+            digest = hashlib.sha256(b"").hexdigest() if not record_count else journal.prefix_digest()
+        encoded_delta = prefix + b"".join(appended)
+        if previous_reference is None:
             fd, temporary_name = tempfile.mkstemp(prefix=".journal-", dir=self.directory)
             try:
                 with os.fdopen(fd, "wb") as stream:
-                    stream.write(encoded)
+                    stream.write(encoded_delta)
                     stream.flush()
                     os.fsync(stream.fileno())
                 try:
                     os.link(temporary_name, target)
-                except FileExistsError:
-                    if target.read_bytes() != encoded:
-                        raise ManifestError("journal snapshot path collision")
+                except FileExistsError as exc:
+                    raise ManifestError("World journal was concurrently initialized") from exc
                 _fsync_directory(self.directory)
             finally:
                 try:
                     os.unlink(temporary_name)
                 except FileNotFoundError:
                     pass
-
+            previous_offset = 0
+        else:
+            with target.open("r+b") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                if target.stat().st_size < previous_offset:
+                    raise ManifestError("World journal is shorter than its committed reference")
+                stream.truncate(previous_offset)
+                stream.seek(previous_offset)
+                stream.write(encoded_delta)
+                stream.flush()
+                os.fsync(stream.fileno())
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        offset = previous_offset + len(encoded_delta)
         return CheckpointReference(
             owner=_JOURNAL_OWNER,
             owner_identity=self.world_id,
-            checkpoint_id=f"journal-prefix-{causal_tick}",
+            checkpoint_id=f"journal-cut-{causal_tick}-sequence-{record_count - 1}-offset-{offset}",
             schema_version=_JOURNAL_SCHEMA,
             locator=str(target),
             sha256=digest,
         )
 
     def read(self, reference: CheckpointReference) -> EventJournal:
-        self.verify(reference)
         try:
-            records = json.loads(Path(reference.locator).read_bytes())
-            if not isinstance(records, list):
-                raise ValueError("journal snapshot must be a list")
-            return EventJournal.from_snapshot(records)
+            if (
+                reference.owner != _JOURNAL_OWNER
+                or reference.owner_identity != self.world_id
+                or reference.schema_version != _JOURNAL_SCHEMA
+                or Path(reference.locator) != self.directory / "world-causal-journal-v3.jsonl"
+            ):
+                raise ManifestError("journal reference belongs to another World")
+            expected_tick, expected_sequence, offset = self._position(reference)
+            with Path(reference.locator).open("rb") as stream:
+                if stream.readline() != self._header(self.world_id):
+                    raise ManifestError("World journal header is invalid")
+                journal = EventJournal()
+                previous = ""
+                previous_tick = -1
+                while stream.tell() < offset:
+                    line = stream.readline()
+                    if not line or stream.tell() > offset:
+                        raise ManifestError("World journal committed prefix is truncated")
+                    data = json.loads(line)
+                    if not isinstance(data, dict) or set(data) != {"record", "prefix_sha256"}:
+                        raise ManifestError("World journal record envelope is invalid")
+                    record = self._record_from_data(data["record"])
+                    if record.world_id != self.world_id:
+                        raise ManifestError("World journal contains a record for another World")
+                    if record.causal_tick < previous_tick or record.causal_tick > expected_tick:
+                        raise ManifestError("World journal causal order is invalid")
+                    _, actual = self._record_line(record, previous)
+                    if data["prefix_sha256"] != actual:
+                        raise ManifestError("World journal integrity verification failed")
+                    journal.append(record)
+                    if journal.prefix_digest() != actual:
+                        raise ManifestError("World journal prefix digest is inconsistent")
+                    previous = actual
+                    previous_tick = record.causal_tick
+                if stream.tell() != offset or len(journal) != expected_sequence + 1:
+                    raise ManifestError("World journal reference does not identify its exact prefix")
+                if journal and journal.tail(1)[0].causal_tick != expected_tick:
+                    raise ManifestError("World journal reference causal tick does not match its prefix")
+                expected_digest = hashlib.sha256(b"").hexdigest() if not len(journal) else journal.prefix_digest()
+                if reference.sha256 != expected_digest:
+                    raise ManifestError("World journal reference digest does not match its prefix")
+                return journal
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise ManifestError("cannot read valid World journal snapshot") from exc
 
     @staticmethod
     def verify(reference: CheckpointReference) -> bool:
-        if reference.owner != _JOURNAL_OWNER or reference.schema_version != _JOURNAL_SCHEMA:
-            return False
-        path = Path(reference.locator)
-        try:
-            return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == reference.sha256
-        except OSError:
-            return False
+        """Check the referenced tail quickly; ``read`` verifies the full prefix."""
+        return DurableJournalSnapshotStore._verify_tail(reference)
 
 
 OwnerCheckpointWriter = Callable[[int], Iterable[CheckpointReference]]
@@ -854,7 +1081,18 @@ class DurableWorldRuntime:
                             },
                         )
                     )
-                journal_reference = self._journal_store.write(candidate_journal, causal_tick=proposed_tick)
+                committed_journal_refs = tuple(
+                    reference
+                    for reference in current.checkpoint_references
+                    if reference.owner == _JOURNAL_OWNER
+                )
+                if len(committed_journal_refs) != 1:
+                    raise ManifestError("committed World cut must identify exactly one journal prefix")
+                journal_reference = self._journal_store.write(
+                    candidate_journal,
+                    causal_tick=proposed_tick,
+                    previous_reference=committed_journal_refs[0],
+                )
                 references = (*owner_references, journal_reference)
                 candidate = WorldCausalManifest(
                     world_id=self.world_id.value,
