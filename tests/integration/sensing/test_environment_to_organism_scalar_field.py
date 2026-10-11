@@ -126,9 +126,9 @@ def _body_state(causal_tick: int, *, physical_step: EmbodimentStepCorrelation | 
     )
 
 
-def _frame() -> FrameDescriptor:
+def _frame(frame_id: str = FRAME_ID) -> FrameDescriptor:
     return FrameDescriptor(
-        frame_id=FRAME_ID,
+        frame_id=frame_id,
         parent_frame_id="world-frame",
         origin_m=(0.0, 0.0, 0.0),
         x_axis_in_parent=(1.0, 0.0, 0.0),
@@ -235,7 +235,11 @@ def _runtime(tmp_path: Path, *, stale_receptor: bool = False):
     return runtime, artifacts, field, body, initial_organism_state, receptor
 
 
-def _run_fixture(tmp_path: Path, *, stale_receptor: bool = False):
+def _run_fixture(
+    tmp_path: Path,
+    *,
+    stale_receptor: bool = False,
+):
     runtime, artifacts, field, body, organism_state, receptor = _runtime(
         tmp_path, stale_receptor=stale_receptor
     )
@@ -447,6 +451,57 @@ def test_stale_receptor_morphology_is_rejected_without_next_committed_cut(
     assert runtime.causal_tick == 0
     assert runtime.manifest.causal_tick == 0
     assert runtime.manifest.pending_tick == 1
+
+
+def test_receptor_frame_mismatch_is_rejected_before_solver_or_commit(
+    tmp_path: Path,
+) -> None:
+    runtime, _, field, body, organism_state, receptor = _runtime(tmp_path)
+
+    def project_body(context: PhysicalStepContext):
+        return body
+
+    def reject_frame_mismatch(context: PhysicalStepContext):
+        advance_organism_from_scalar_field_for_physical_step(
+            context,
+            organism_state,
+            receptor=receptor,
+            embodiment_state=body,
+            environment_field=field,
+            sampling_frame=_frame("unrelated-frame"),
+            transduction=DimensionlessScalarFieldIdentityV1(),
+            binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque-input"),
+            kernel_limits=KernelLimits(),
+        )
+
+    def unused(*_args):
+        raise AssertionError("frame mismatch must fail before solver/adoption")
+
+    with pytest.raises(ValueError, match="receptor sample frame does not match"):
+        run_physical_step(
+            runtime,
+            commit_id="commit-scalar-sensing-frame-mismatch",
+            physical_step_id="physical-step-scalar-sensing-frame-mismatch",
+            body_id=BODY_ID,
+            embodiment_episode_id=EPISODE_ID,
+            morphology_revision=MORPHOLOGY_REVISION,
+            environment_revision=ENVIRONMENT_REVISION,
+            solver_config_revision="deterministic-sensing-solver-v1",
+            ports=PhysicalStepPorts(
+                project_body=project_body,
+                project_environment=reject_frame_mismatch,
+                execute_solver=unused,
+                adopt_body=unused,
+                adopt_environment=unused,
+                write_checkpoints=unused,
+            ),
+        )
+
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+    assert runtime.causal_tick == 0
+    assert runtime.manifest.causal_tick == 0
+    assert runtime.manifest.pending_tick == 1
+    assert organism_state.organism_step == 0
 
 
 def test_organism_transition_rejects_provenance_for_another_physical_step(

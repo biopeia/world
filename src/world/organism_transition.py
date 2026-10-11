@@ -89,6 +89,10 @@ def advance_organism_from_scalar_field_for_physical_step(
     receptor_point = project_receptor_sample_point(
         receptor, embodiment_state, context
     )
+    if receptor_point.frame_id != sampling_frame.frame_id:
+        raise ValueError(
+            "receptor sample frame does not match the Environment sampling frame"
+        )
     correlation = EnvironmentPhysicalStepCorrelation(
         world_id=context.world_id,
         causal_tick=context.source_causal_tick,
