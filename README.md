@@ -42,9 +42,20 @@ control vector is mandatory; this API does not infer commands for omitted
 channels. MuJoCo remains an optional numerical substrate, not a semantic
 authority. No calibration or physical-equivalence claim is made.
 
+## World-to-Organism runtime boundary
+
+`world.organism_transition.advance_organism_for_physical_step` is an optional
+cross-repository runtime boundary (`pip install 'world[runtime]'`). It checks
+that supplied sensory provenance agrees with World physical-step correlation,
+invokes Organism's public accepted transition, and returns the accepted
+Organism-owned state. It does not authenticate the provenance producer, build
+Environment or Embodiment projections, create sensory meaning, own cognition,
+persist the returned checkpoint, or commit a World cut; those responsibilities
+remain at their respective domain/runtime boundaries.
+
 ## Cross-repository integration tests
 
-`tests/integration` holds the versioned evidence that World coordinates the other authorities in one causal step: the first causal tick, publication and restore of an owner-checkpoint closure, and the first end-to-end physical causal step (`tests/integration/physical_step`). They import `organism`, `embodiment`, `environment` and `observation`; the World package itself depends on none of them.
+`tests/integration` holds versioned bounded evidence that World coordinates other authorities: causal tick, publication and restore of an owner-checkpoint closure, and a deterministic physical causal-step fixture (`tests/integration/physical_step`). These fixtures do not establish the migration's required production end-to-end causal cycle. They import `organism`, `embodiment`, `environment` and `observation`; the World package itself depends on none of them unless an optional capability is selected.
 
 ```sh
 python -m pip install -e '.[integration]'   # pinned revisions of the other repositories
