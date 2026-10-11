@@ -296,6 +296,160 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
     assert manifest_store._require_active() == runtime.manifest
 
 
+def test_committed_cut_receipt_is_bound_to_durable_manifest_and_owner_references(tmp_path):
+    world_id = WorldId("world-observation-receipt")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    next_owner = tmp_path / "organism-1.json"
+    next_owner.write_bytes(b"organism at tick one")
+    runtime.tick("transition-1", lambda _tick: (_checkpoint(next_owner),))
+    committed_refs = tuple(
+        reference
+        for reference in runtime.manifest.checkpoint_references
+        if reference.owner != "world-journal"
+    )
+
+    # The publisher lookup must remain bounded; full journal validation already
+    # occurred when this runtime restored/committed the cut.
+    journal_store.read = lambda _reference: pytest.fail("receipt lookup rescanned the full journal")
+
+    cut = runtime.committed_cut_for(
+        world_id=world_id.value,
+        causal_tick=1,
+        commit_id="transition-1",
+        expected_owner_references=committed_refs,
+    )
+
+    assert cut.world_id == world_id.value
+    assert cut.causal_tick == 1
+    assert cut.commit_id == "transition-1"
+    assert cut.participant_ids == (("organism", "organism-identity"),)
+    assert cut.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
+    assert cut.owner_checkpoint_references == committed_refs
+
+    with pytest.raises(ManifestError, match="requested identity"):
+        runtime.committed_cut_for(
+            world_id="another-world",
+            causal_tick=1,
+            commit_id="transition-1",
+        )
+    with pytest.raises(ManifestError, match="requested identity"):
+        runtime.committed_cut_for(
+            world_id=world_id.value,
+            causal_tick=0,
+            commit_id="transition-1",
+        )
+    with pytest.raises(ManifestError, match="requested identity"):
+        runtime.committed_cut_for(
+            world_id=world_id.value,
+            causal_tick=1,
+            commit_id="wrong-commit",
+        )
+    stale_ref = replace(committed_refs[0], checkpoint_id="stale-checkpoint")
+    with pytest.raises(ManifestError, match="do not match"):
+        runtime.committed_cut_for(
+            world_id=world_id.value,
+            causal_tick=1,
+            commit_id="transition-1",
+            expected_owner_references=(stale_ref,),
+        )
+
+
+def test_receipt_lookup_does_not_convert_live_preparing_transition_to_recovery_required(tmp_path):
+    world_id = WorldId("world-observation-live-preparing")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    contracts = _contracts(("organism", "organism-identity"))
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    # This second already-restored runtime models an observer that existed
+    # before the writer began its transition.
+    observer_runtime = DurableWorldRuntime.restore(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _references: None,
+    )
+
+    def inspect_while_preparing(tick: int):
+        assert tick == 1
+        with pytest.raises(SingleWriterPreconditionError, match="preparing"):
+            observer_runtime.committed_cut_for(
+                world_id=world_id.value,
+                causal_tick=0,
+                commit_id=f"genesis:{world_id.value}",
+            )
+        assert manifest_store.read().status is ManifestStatus.PREPARING
+        next_owner = tmp_path / "organism-1.json"
+        next_owner.write_bytes(b"organism at tick one")
+        return (_checkpoint(next_owner),)
+
+    runtime.tick("transition-live-preparing", inspect_while_preparing)
+
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert runtime.manifest.causal_tick == 1
+    assert manifest_store.read().status is ManifestStatus.COMMITTED
+
+
+def test_committed_cut_receipt_is_unavailable_after_rejected_transition(tmp_path):
+    world_id = WorldId("world-observation-rejected-transition")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+
+    def reject_transition(_tick):
+        raise ValueError("owner rejected candidate")
+
+    with pytest.raises(ValueError, match="owner rejected"):
+        runtime.tick("transition-rejected", reject_transition)
+
+    assert runtime.manifest.causal_tick == 0
+    assert runtime.manifest.commit_id == "genesis:world-observation-rejected-transition"
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+    with pytest.raises(ManifestRecoveryRequiredError):
+        runtime.committed_cut_for(
+            world_id=world_id.value,
+            causal_tick=0,
+            commit_id=runtime.manifest.commit_id,
+        )
+
+
 def test_second_process_can_observe_preparing_manifest_while_writer_callback_is_open(tmp_path):
     """A separate process can read the pending cut without joining the write.
 

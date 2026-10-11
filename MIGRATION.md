@@ -557,6 +557,34 @@ This slice preserves stable references for each retained committed cut; it does 
 
 This is a bounded invocation/persistence slice only. It does not satisfy World #86 or Organism #29/#30/#39/#43 by itself, and no migration-closure or learning-efficacy claim follows from its tests.
 
+### World-issued committed-cut receipt — issue #103 / PR #104
+
+`DurableWorldRuntime.committed_cut_for()` is the World-owned precondition for
+post-commit publication. It accepts an expected World/tick/commit identity,
+requires that the runtime still matches the active `COMMITTED` manifest, and
+returns the exact opaque owner checkpoint references, participant identities,
+and presence-to-owner links recorded for that cut. When provided, expected
+owner references must match exactly. The method compares the manifest's
+journal position/digest to the runtime journal snapshot already validated at
+restore or commit; it does not rescan the full journal per publication. This
+keeps receipt lookup bounded rather than making repeated publications
+quadratic in retained history. Full journal-prefix validation remains part of
+restore and durable commit validation. A receipt lookup encountering a live
+`PREPARING` transition rejects it without mutating the manifest to
+`RECOVERY_REQUIRED`.
+
+The receipt does not revalidate owner checkpoint bytes, guarantee their later
+availability, or authenticate the semantic correctness of owner projections.
+It correlates projections with the World-committed references and roster only.
+
+This is only the commit-verification primitive; it does not construct semantic
+claims, validate owner projection semantics, publish through Observation, or
+complete issue #103. It also does not detect external post-commit mutation of
+the journal bytes on each receipt lookup; retained-history integrity is
+verified through the explicit restore/verification paths. Owner projections
+and the production World-to-Observation join remain required before the
+end-to-end acceptance cycle can pass.
+
 ## Owner restoration reference boundary (World #101)
 
 | Target path | Source/provenance | Disposition | Notes |
