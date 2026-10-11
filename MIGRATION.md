@@ -557,7 +557,7 @@ This slice preserves stable references for each retained committed cut; it does 
 
 This is a bounded invocation/persistence slice only. It does not satisfy World #86 or Organism #29/#30/#39/#43 by itself, and no migration-closure or learning-efficacy claim follows from its tests.
 
-### World-issued committed-cut receipt — issue #103
+### World-issued committed-cut receipt — issue #103 / PR #104
 
 `DurableWorldRuntime.committed_cut_for()` is the World-owned precondition for
 post-commit publication. It accepts an expected World/tick/commit identity,
