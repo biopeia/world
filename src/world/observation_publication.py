@@ -117,8 +117,10 @@ def _validate_owner_observation(cut: CommittedWorldCut, item: OwnerObservation) 
 
     parents = getattr(observation.lineage, "parents", ())
     if not any(
-        getattr(parent, "namespace", None) == "owner_checkpoint_sha256"
-        and getattr(parent, "reference", None) == reference.sha256
+        # The namespace is owned by the semantic source family (for example,
+        # ``embodiment_state_sha256``). World verifies the opaque digest link
+        # to its committed checkpoint without rewriting that domain lineage.
+        getattr(parent, "reference", None) == reference.sha256
         for parent in parents
     ):
         raise ManifestError(
@@ -128,7 +130,8 @@ def _validate_owner_observation(cut: CommittedWorldCut, item: OwnerObservation) 
     context_time = getattr(observation, "context_time", ())
     if not any(
         getattr(getattr(time_ref, "domain", None), "value", None) == "world"
-        and getattr(time_ref, "kind", None) == "world_target_causal_tick"
+        and getattr(time_ref, "kind", None)
+        in {"world_target_causal_tick", "world_causal_tick"}
         and getattr(time_ref, "value", None) == cut.causal_tick
         for time_ref in context_time
     ):
