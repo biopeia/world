@@ -79,6 +79,30 @@ def test_transition_failure_requires_recovery_and_publishes_no_failed_record():
     assert runtime.records == ()
 
 
+def test_keyboard_interrupt_after_transition_starts_marks_runtime_unusable():
+    runtime = WorldRuntime(WorldId("world-test"), presence_id="presence-a")
+    callback_calls = []
+
+    def interrupt(tick):
+        callback_calls.append(tick)
+        raise KeyboardInterrupt("synthetic interruption")
+
+    with pytest.raises(KeyboardInterrupt, match="synthetic interruption"):
+        runtime.tick(interrupt)
+
+    assert runtime.status is RuntimeStatus.RECOVERY_REQUIRED
+    assert runtime.failed_tick == 1
+    assert runtime.failure == "KeyboardInterrupt: synthetic interruption"
+    assert runtime.causal_tick == 0
+    assert runtime.records == ()
+
+    with pytest.raises(RecoveryRequiredError):
+        runtime.tick(lambda tick: callback_calls.append(tick))
+
+    assert callback_calls == [1]
+    assert runtime.records == ()
+
+
 def test_invalid_world_and_presence_ids_are_rejected():
     with pytest.raises(ValueError):
         WorldId(" ")

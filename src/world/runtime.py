@@ -140,6 +140,14 @@ class WorldRuntime:
                 self._failed_tick = proposed_tick
                 self._failure = f"{type(exc).__name__}: {exc}"
                 raise
+            except KeyboardInterrupt as exc:
+                # An interrupted callback may already have changed owner state.
+                # Do not leave this in-memory coordinator usable as though the
+                # transition had not started; preserve the interruption signal.
+                self._status = RuntimeStatus.RECOVERY_REQUIRED
+                self._failed_tick = proposed_tick
+                self._failure = f"{type(exc).__name__}: {exc}"
+                raise
 
             self._causal_tick = proposed_tick
             return record
