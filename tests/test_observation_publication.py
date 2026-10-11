@@ -63,11 +63,16 @@ def _cut(reference=None):
 
 
 def _observation(
-    reference=None, *, tick=4, world_id="world-1", authority="environment"
+    reference=None,
+    *,
+    tick=4,
+    world_id="world-1",
+    authority="environment",
+    lineage_namespace="owner_checkpoint_sha256",
 ):
     reference = reference or _reference()
     parent = SimpleNamespace(
-        namespace="owner_checkpoint_sha256", reference=reference.sha256
+        namespace=lineage_namespace, reference=reference.sha256
     )
     transformation = SimpleNamespace(effective_configuration=(("world_id", world_id),))
     return SimpleNamespace(
@@ -98,6 +103,27 @@ def test_publishes_only_after_receipt_and_owner_provenance_match():
     )
 
     assert result.committed_cut == cut
+    assert result.delivery_sequences == (1,)
+    assert plane.observations == [observation]
+
+
+def test_preserves_owner_specific_lineage_namespace_when_digest_matches_cut():
+    reference = _reference(owner="embodiment", identity="body-1")
+    cut = _cut(reference)
+    plane = _Plane()
+    observation = _observation(
+        reference,
+        authority="embodiment",
+        lineage_namespace="embodiment_state_sha256",
+    )
+
+    result = publish_committed_owner_observations(
+        _World(cut),  # type: ignore[arg-type]
+        plane,
+        committed_cut=cut,
+        owner_observations=(OwnerObservation(reference, observation),),
+    )
+
     assert result.delivery_sequences == (1,)
     assert plane.observations == [observation]
 
@@ -140,6 +166,32 @@ def test_rejects_stale_owner_reference_without_publication():
             owner_observations=(
                 OwnerObservation(stale_reference, _observation(stale_reference)),
             ),
+        )
+
+    assert plane.observations == []
+
+
+def test_rejects_owner_lineage_digest_mismatch_without_publication():
+    reference = _reference(owner="embodiment", identity="body-1")
+    cut = _cut(reference)
+    observation = _observation(
+        reference,
+        authority="embodiment",
+        lineage_namespace="embodiment_state_sha256",
+    )
+    observation.lineage.parents = (
+        SimpleNamespace(
+            namespace="embodiment_state_sha256", reference="b" * 64
+        ),
+    )
+    plane = _Plane()
+
+    with pytest.raises(ManifestError, match="provenance"):
+        publish_committed_owner_observations(
+            _World(cut),  # type: ignore[arg-type]
+            plane,
+            committed_cut=cut,
+            owner_observations=(OwnerObservation(reference, observation),),
         )
 
     assert plane.observations == []

@@ -127,6 +127,67 @@ def test_journal_v3_appends_fixed_size_records_and_recovers_exact_prefix(tmp_pat
         store.read(reference)
 
 
+def test_sequential_appends_reuse_owned_prefix_but_new_store_revalidates(tmp_path, monkeypatch):
+    world_id = WorldId("world-journal-verified-prefix-cache")
+    journal = EventJournal()
+    store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    journal.append(CausalRecord("record-0", world_id.value, 0, "test.event", payload={"v": 0}))
+    reference = store.write(journal, causal_tick=0)
+
+    verify_prefix = DurableJournalSnapshotStore._verify_prefix
+    verified_references = []
+
+    def count_verification(candidate):
+        verified_references.append(candidate)
+        return verify_prefix(candidate)
+
+    monkeypatch.setattr(
+        DurableJournalSnapshotStore,
+        "_verify_prefix",
+        staticmethod(count_verification),
+    )
+
+    for tick in range(1, 21):
+        journal.append(
+            CausalRecord(f"record-{tick}", world_id.value, tick, "test.event", payload={"v": tick})
+        )
+        reference = store.write(journal, causal_tick=tick, previous_reference=reference)
+
+    # The store extends only the exact reference and file revision it
+    # produced itself, without rescanning the complete prefix per append.
+    assert verified_references == []
+
+    restored_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    previous_reference = reference
+    journal.append(CausalRecord("record-21", world_id.value, 21, "test.event", payload={"v": 21}))
+    reference = restored_store.write(journal, causal_tick=21, previous_reference=previous_reference)
+    assert verified_references == [previous_reference]
+
+    journal.append(CausalRecord("record-22", world_id.value, 22, "test.event", payload={"v": 22}))
+    restored_store.write(journal, causal_tick=22, previous_reference=reference)
+    assert verified_references == [previous_reference]
+
+
+def test_changed_backing_file_invalidates_cached_prefix_and_rejects_tampering(tmp_path):
+    world_id = WorldId("world-journal-cache-tamper")
+    journal = EventJournal()
+    store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    journal.append(CausalRecord("record-0", world_id.value, 0, "test.event", payload={"v": 0}))
+    reference = store.write(journal, causal_tick=0)
+    journal.append(CausalRecord("record-1", world_id.value, 1, "test.event", payload={"v": 1}))
+    reference = store.write(journal, causal_tick=1, previous_reference=reference)
+
+    journal_path = Path(reference.locator)
+    corrupted = bytearray(journal_path.read_bytes())
+    marker = corrupted.index(b'"v":0') + len(b'"v":')
+    corrupted[marker] = ord("9")
+    journal_path.write_bytes(corrupted)
+    journal.append(CausalRecord("record-2", world_id.value, 2, "test.event", payload={"v": 2}))
+
+    with pytest.raises(ManifestError, match="previous committed World journal reference is invalid"):
+        store.write(journal, causal_tick=2, previous_reference=reference)
+
+
 def test_corrupted_earlier_committed_prefix_blocks_next_causal_commit(tmp_path):
     world_id = WorldId("world-prefix-integrity-before-commit")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")

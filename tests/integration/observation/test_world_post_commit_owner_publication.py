@@ -22,6 +22,13 @@ from environment import (
     FrameDescriptor,
     IdentifiedFiniteScalarField,
 )
+from embodiment.observation import BodyPoseSample
+from embodiment.physics3d.physical_transition import (
+    EmbodimentPhysicalState,
+    PhysicalStepCorrelation as EmbodimentStepCorrelation,
+    SolverBodyCandidate,
+)
+from observation.embodiment import embodiment_body_pose_observation
 from observation.environment import environment_finite_scalar_field_observation
 from observation.plane import ObservationPlane
 
@@ -326,3 +333,186 @@ def test_stale_owner_reference_after_commit_is_rejected_without_publication(tmp_
 
     assert world.causal_tick == 1
     assert plane.latest_sequence == 0
+
+
+def test_real_body_pose_projection_uses_committed_checkpoint_digest(tmp_path):
+    body_id = "body.publication"
+    episode_id = "episode.publication"
+    morphology_revision = "morphology.publication-r1"
+    world_id = WorldId("world.body-pose-publication")
+    field = _field()
+    initial = EmbodimentPhysicalState(
+        world_id=world_id.value,
+        causal_tick=0,
+        body_id=body_id,
+        embodiment_episode_id=episode_id,
+        morphology_revision=morphology_revision,
+        pose=BodyPoseSample(
+            body_id=body_id,
+            reference_frame="world-frame",
+            body_frame="body-root",
+            position_m=(0.0, 0.0, 0.5),
+            orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+            sample_kind="genesis",
+            sample_value=0,
+        ),
+        linear_velocity_m_per_s=(0.0, 0.0, 0.0),
+        angular_velocity_rad_per_s=(0.0, 0.0, 0.0),
+    )
+
+    class BodyContract:
+        def validate_checkpoint(self, encoded, owner_identity, schema_version):
+            restored = EmbodimentPhysicalState.restore_checkpoint(encoded)
+            return (
+                owner_identity == body_id
+                and schema_version == "embodiment-physical-state-v2"
+                and restored.body_id == body_id
+                and restored.embodiment_episode_id == episode_id
+            )
+
+        def verify_restoration(self, reference):
+            return Path(reference.locator).is_file()
+
+    body_contract = BodyContract()
+    field_contract = _FieldCheckpointContract()
+    owner_contracts = {
+        ("embodiment", body_id): body_contract,
+        ("environment", RESOURCE_ID): field_contract,
+    }
+
+    def store_reference(owner, identity, schema, tick, encoded):
+        directory = tmp_path / "body-pose-owners"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{owner}-{tick}.checkpoint"
+        path.write_bytes(encoded)
+        return CheckpointReference(
+            owner=owner,
+            owner_identity=identity,
+            checkpoint_id=f"{owner}-cut-{tick}",
+            schema_version=schema,
+            locator=str(path),
+            sha256=hashlib.sha256(encoded).hexdigest(),
+        )
+
+    initial_references = (
+        store_reference(
+            "embodiment", body_id, "embodiment-physical-state-v2", 0,
+            initial.checkpoint_bytes(),
+        ),
+        store_reference(
+            "environment", RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA, 0,
+            field.checkpoint_bytes(),
+        ),
+    )
+    world = DurableWorldRuntime.initialize(
+        WorldGenesisSpec(
+            world_id=world_id,
+            initial_presence_ids=("presence.body", "presence.environment"),
+            registered_owner_ids=tuple(sorted(owner_contracts)),
+            initial_owner_references=initial_references,
+            owner_checkpoint_contracts=owner_contracts,
+            presence_owner_links=(
+                PresenceOwnerLink(PresenceId("presence.body"), "embodiment", body_id),
+                PresenceOwnerLink(PresenceId("presence.environment"), "environment", RESOURCE_ID),
+            ),
+        ),
+        "presence.body",
+        WorldCausalManifestStore(tmp_path / "body-pose-manifest.json"),
+        DurableJournalSnapshotStore(tmp_path / "body-pose-journal", world_id),
+        owner_checkpoint_verifier=lambda refs: all(
+            owner_contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+            )
+            for ref in refs
+        ),
+    )
+    staged = {"body": initial}
+
+    def execute(context, body_projection, _environment_projection):
+        assert body_projection is initial
+        correlation = EmbodimentStepCorrelation(
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            body_id=context.body_id,
+            embodiment_episode_id=context.embodiment_episode_id,
+            morphology_revision=context.morphology_revision,
+            environment_revision=context.environment_revision,
+            solver_config_revision=context.solver_config_revision,
+        )
+        return PhysicalStepCandidate(
+            SolverBodyCandidate(
+                correlation=correlation,
+                reference_frame="world-frame",
+                body_frame="body-root",
+                position_m=(0.1, 0.0, 0.5),
+                orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_velocity_m_per_s=(0.1, 0.0, 0.0),
+                angular_velocity_rad_per_s=(0.0, 0.0, 0.0),
+            ),
+            None,
+        )
+
+    def write_checkpoints(context):
+        body_state = staged["body"]
+        return (
+            store_reference(
+                "embodiment", body_id, "embodiment-physical-state-v2",
+                context.target_causal_tick, body_state.checkpoint_bytes(),
+            ),
+            store_reference(
+                "environment", RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA,
+                context.target_causal_tick, field.checkpoint_bytes(),
+            ),
+        )
+
+    def project_body_pose(_context, cut):
+        reference = next(
+            ref for ref in cut.owner_checkpoint_references
+            if ref.owner == "embodiment" and ref.owner_identity == body_id
+        )
+        encoded = Path(reference.locator).read_bytes()
+        assert hashlib.sha256(encoded).hexdigest() == reference.sha256
+        restored = EmbodimentPhysicalState.restore_checkpoint(encoded)
+        observation = embodiment_body_pose_observation(
+            restored.body_pose_observation_projection()
+        )
+        return (OwnerObservation(reference, observation),)
+
+    plane = ObservationPlane()
+    result = run_physical_step_and_publish(
+        world,
+        plane,
+        commit_id="body-pose-commit-1",
+        physical_step_id="body-pose-step-1",
+        body_id=body_id,
+        embodiment_episode_id=episode_id,
+        morphology_revision=morphology_revision,
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision="solver.publication-r1",
+        ports=PhysicalStepPorts(
+            project_body=lambda _context: initial,
+            project_environment=lambda _context: field,
+            execute_solver=execute,
+            adopt_body=lambda context, candidate: staged.update(
+                body=initial.adopt_candidate(candidate, world_context=context)
+            ),
+            adopt_environment=lambda _context, _candidate: None,
+            write_checkpoints=write_checkpoints,
+        ),
+        project_owner_observations=project_body_pose,
+    )
+
+    reference = next(
+        ref for ref in result.committed_cut.owner_checkpoint_references
+        if ref.owner == "embodiment" and ref.owner_identity == body_id
+    )
+    messages = plane.current_messages()
+    assert world.causal_tick == result.committed_cut.causal_tick == 1
+    assert len(messages) == 1
+    observation = messages[0].observation
+    assert observation.claim.authority.value == "embodiment"
+    assert observation.context_time[0].value == result.committed_cut.causal_tick
+    assert observation.lineage.parents[0].namespace == "embodiment_state_sha256"
+    assert observation.lineage.parents[0].reference == reference.sha256
+    assert reference.sha256 == hashlib.sha256(Path(reference.locator).read_bytes()).hexdigest()
