@@ -395,26 +395,40 @@ class WorldCausalManifestStore:
             self._write(manifest)
             return manifest
 
-    def _complete_recovery(self, transition_id: str) -> WorldCausalManifest:
+    def _complete_recovery(
+        self,
+        transition_id: str,
+        *,
+        before_publish: Callable[[], None] | None = None,
+    ) -> WorldCausalManifest:
         """Publish the prior coherent cut after caller-validated restoration.
 
         The runtime calls this only after restoring every non-World checkpoint
         through its semantic owner's recovery contract and verifying references.
         This method records a durable receipt before clearing
         ``RECOVERY_REQUIRED`` so an interrupted publication can be retried
-        without losing which transition was recovered.
+        without losing which transition was recovered. An optional finalization
+        callback runs only after the pending transition is revalidated under
+        the manifest writer lock and immediately before recovery publication.
         """
         if not transition_id or not transition_id.strip():
             raise ValueError("transition_id must not be empty")
         with self._writer_lock():
-            return self._complete_recovery_locked(transition_id)
+            return self._complete_recovery_locked(transition_id, before_publish=before_publish)
 
-    def _complete_recovery_locked(self, transition_id: str) -> WorldCausalManifest:
+    def _complete_recovery_locked(
+        self,
+        transition_id: str,
+        *,
+        before_publish: Callable[[], None] | None = None,
+    ) -> WorldCausalManifest:
         pending = self.read()
         if pending.status is not ManifestStatus.RECOVERY_REQUIRED:
             raise ValueError("recovery requires a durable pending transition")
         if pending.pending_transition_id != transition_id:
             raise ValueError("recovery transition_id does not match pending transition")
+        if before_publish is not None:
+            before_publish()
 
         recovered = WorldCausalManifest(
             world_id=pending.world_id,

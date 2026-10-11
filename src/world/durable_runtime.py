@@ -545,6 +545,39 @@ class DurableJournalSnapshotStore:
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise ManifestError("cannot read valid World journal snapshot") from exc
 
+    def _discard_uncommitted_tail(self, committed_reference: CheckpointReference) -> int:
+        """Truncate World-owned journal bytes beyond a verified committed cut.
+
+        Owner checkpoint artifacts are deliberately outside this cleanup
+        boundary. This recovery-only helper must be called under the manifest
+        writer lock after owner restoration and verification.
+        """
+        target = self.directory / "world-causal-journal-v3.jsonl"
+        if (
+            committed_reference.owner != _JOURNAL_OWNER
+            or committed_reference.owner_identity != self.world_id
+            or committed_reference.schema_version != _JOURNAL_SCHEMA
+            or Path(committed_reference.locator) != target
+            or not self._verify_prefix(committed_reference)
+        ):
+            raise ManifestError("cannot clean journal tail without a valid committed World reference")
+        _, _, committed_offset = self._position(committed_reference)
+        try:
+            with target.open("r+b") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                current_size = os.fstat(stream.fileno()).st_size
+                if current_size < committed_offset:
+                    raise ManifestError("World journal is shorter than its committed reference")
+                discarded_bytes = current_size - committed_offset
+                if discarded_bytes:
+                    stream.truncate(committed_offset)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                return discarded_bytes
+        except OSError as exc:
+            raise ManifestError("cannot discard uncommitted World journal tail") from exc
+
     @staticmethod
     def verify(reference: CheckpointReference) -> bool:
         """Verify the complete committed prefix, including its hash chain."""
@@ -868,7 +901,13 @@ class DurableWorldRuntime:
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("previous causal cut dependency closure changed during recovery")
 
-        recovered = manifest_store._complete_recovery(pending.pending_transition_id)
+        # Finalization and tail cleanup are serialized under the manifest
+        # writer lock. A stale concurrent recovery must not truncate journal
+        # bytes from a later committed transition.
+        recovered = manifest_store._complete_recovery(
+            pending.pending_transition_id,
+            before_publish=lambda: journal_store._discard_uncommitted_tail(journal_refs[0]),
+        )
         return cls(
             world_id,
             presence_id,
