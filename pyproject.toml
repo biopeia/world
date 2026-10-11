@@ -11,13 +11,19 @@ dependencies = []
 
 [project.optional-dependencies]
 mujoco = ["mujoco==3.14.0"]
+# Production World -> Organism transition invocation. This remains optional so
+# the causal runtime primitives can still be installed independently.
+runtime = [
+    "organism @ git+https://github.com/biopeia/organism.git@48726e7640ed3fbce15b792966f7082e3c9756ae",
+]
 # Cross-repository integration tests only. The package itself has no runtime
-# dependency on any other Biopeia repository. Each pin is the exact revision
-# the tests under tests/integration were verified against.
+# dependency on other Biopeia repositories unless its optional runtime or
+# integration capability is selected. Each pin is the exact revision the
+# integration tests were verified against.
 integration = [
     "pytest>=8",
     "mujoco==3.14.0",
-    "organism @ git+https://github.com/biopeia/organism.git@b19a39079b57a65f00eaecbe2c5cee3427a54f80",
+    "organism @ git+https://github.com/biopeia/organism.git@48726e7640ed3fbce15b792966f7082e3c9756ae",
     "embodiment @ git+https://github.com/biopeia/embodiment.git@b5714f985d0aa970d3a412a7d29e43fa0bcb89d6",
     "environment @ git+https://github.com/biopeia/environment.git@caa885a11ec0170717bb4b71d271ab171807197e",
     "modality @ git+https://github.com/biopeia/modality.git@79b779152d4bff2ab4191dc6601c8f1640e4cae3",

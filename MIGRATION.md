@@ -546,3 +546,13 @@ This slice does not implement World termination, biological death, ownerless aut
 | `tests/test_durable_runtime.py`, `tests/integration/test_durable_checkpoint_restore_slice.py` | New Biopeia TARGET tests for World issue #72; no source tests copied | REWRITE | Verifies exact genesis/tick reference identities, two-tick historical discovery after restore, and the existing publication/recovery failure boundaries with the additional journal records. |
 
 This slice preserves stable references for each retained committed cut; it does not preserve or own the referenced checkpoint bytes, guarantee their continued availability, add arbitrary historical state restoration, or define compaction/retention policy. Journal complexity and retention policy remain separate from this identity/provenance contract.
+
+## World-to-Organism accepted transition invocation (World #86)
+
+| Target path | Source/provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/organism_transition.py` | New Biopeia TARGET integration boundary based on the ratified World/Organism authority contract and [World issue #86](https://github.com/biopeia/world/issues/86); Organism dependency pinned to `48726e7640ed3fbce15b792966f7082e3c9756ae`; no Symbiont implementation or API copied | REWRITE | Checks supplied sensory provenance against World physical-step correlation, invokes Organism's public accepted transition, and returns the accepted Organism-owned state. It does not authenticate provenance production, create sensing semantics, construct owner projections, compose cognition/agency/action, persist state, or commit a World cut. |
+| `tests/integration/sensing/test_environment_to_organism_scalar_field.py` | Existing bounded World/Environment/Embodiment/Modality/Organism integration fixture, updated to exercise the accepted transition and persist its returned state in the fixture's owner checkpoint | REWRITE | Verifies accepted Organism state advances and is the state referenced by the fixture's committed cut, plus stale-provenance and morphology rejection. The test remains a fixture, not the production end-to-end causal cycle required for migration closure. |
+| `pyproject.toml`, `README.md` | Target package metadata and scope documentation | REWRITE | Adds an optional pinned `runtime` dependency and refreshes the pinned integration dependency; documents the narrow invocation boundary and explicitly distinguishes the fixture from end-to-end acceptance. |
+
+This is a bounded invocation/persistence slice only. It does not satisfy World #86 or Organism #29/#30/#39/#43 by itself, and no migration-closure or learning-efficacy claim follows from its tests.

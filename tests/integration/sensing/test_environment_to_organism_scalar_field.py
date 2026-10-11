@@ -4,9 +4,10 @@ This exercises a narrow target contract, not scientific learning or a
 production sensor/solver adapter. Environment owns the field, Embodiment owns
 the receiver, Modality owns the declared numerical mapping, Organism receives
 only an opaque signal, and World supplies the causal step and commit boundary.
-The computed cognition transition is a candidate observation of delivery; this
-fixture does not claim that candidate was adopted into the committed Organism
-continuation.
+The canonical Organism-owned transition is invoked through World's runtime
+boundary and its accepted state is included in the committed owner checkpoint.
+The fixture still does not prove a production sensor adapter, a physical
+solver adapter, learned behavior, or end-to-end migration acceptance.
 """
 
 from __future__ import annotations
@@ -35,9 +36,14 @@ from organism.cognition.sense_input import (
     OpaqueSenseSignal,
     SenseChannelBinding,
     SenseProvenance,
-    advance_cognition_from_sense_signals,
 )
+from organism.cognition import CognitiveRuntimeCheckpoint
 from organism.cognition.transition import CognitiveTransitionState
+from organism.transition import (
+    EmbodimentContextRef,
+    OrganismLifecycle,
+    OrganismTransitionState,
+)
 from organism.cognition.types import NodeKind
 from organism.identity import OrganismIdentity
 
@@ -58,6 +64,7 @@ from world.physical_step import (
     PhysicalStepPorts,
     run_physical_step,
 )
+from world.organism_transition import advance_organism_for_physical_step
 from world.runtime import PresenceId, WorldId
 
 
@@ -172,8 +179,18 @@ def _runtime(tmp_path: Path, *, stale_receptor: bool = False):
     field = _field()
     body = _body_state(0)
     cognition = CognitiveTransitionState.initial(ORGANISM_ID)
+    initial_organism_state = OrganismTransitionState(
+        owner_checkpoint=CognitiveRuntimeCheckpoint(
+            state=cognition, graph=_graph()
+        ).to_organism_checkpoint(),
+        organism_step=0,
+        embodiment=EmbodimentContextRef(
+            BODY_ID, EPISODE_ID, MORPHOLOGY_REVISION
+        ),
+        lifecycle=OrganismLifecycle.ACTIVE,
+    )
     initial_refs = (
-        _reference("organism", str(ORGANISM_ID), 0, cognition.checkpoint_bytes(), artifacts),
+        _reference("organism", str(ORGANISM_ID), 0, initial_organism_state.to_bytes(), artifacts),
         _reference("embodiment", BODY_ID, 0, body.checkpoint_bytes(), artifacts),
         _reference("environment", RESOURCE_ID, 0, field.checkpoint_bytes(), artifacts),
     )
@@ -213,15 +230,15 @@ def _runtime(tmp_path: Path, *, stale_receptor: bool = False):
         body_frame="body-root",
         position_in_body_frame_m=(0.0, 0.0, 0.0),
     )
-    return runtime, artifacts, field, body, cognition, receptor
+    return runtime, artifacts, field, body, initial_organism_state, receptor
 
 
 def _run_fixture(tmp_path: Path, *, stale_receptor: bool = False):
-    runtime, artifacts, field, body, cognition, receptor = _runtime(
+    runtime, artifacts, field, body, organism_state, receptor = _runtime(
         tmp_path, stale_receptor=stale_receptor
     )
     graph = _graph()
-    pending: dict[str, object] = {}
+    pending: dict[str, object] = {"initial_organism_state": organism_state}
 
     def project_body(context: PhysicalStepContext):
         point = project_receptor_sample_point(receptor, body, context)
@@ -286,16 +303,16 @@ def _run_fixture(tmp_path: Path, *, stale_receptor: bool = False):
             quantity_kind=DimensionlessScalarFieldIdentityV1.QUANTITY_KIND,
             unit=DimensionlessScalarFieldIdentityV1.UNIT,
         )
-        next_cognition, frame = advance_cognition_from_sense_signals(
-            cognition,
-            _graph(),
+        accepted = advance_organism_for_physical_step(
+            context,
+            organism_state,
             (SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque-input"),),
             (signal,),
             expected_provenance=expected_provenance,
+            kernel_limits=KernelLimits(),
         )
         pending["signal"] = signal
-        pending["cognition_candidate"] = next_cognition
-        pending["cognition_frame"] = frame
+        pending["organism_state"] = accepted
         pending["sample"] = sample
         return sample
 
@@ -345,7 +362,7 @@ def _run_fixture(tmp_path: Path, *, stale_receptor: bool = False):
         assert isinstance(next_body, EmbodimentPhysicalState)
         return (
             _reference("organism", str(ORGANISM_ID), context.target_causal_tick,
-                       cognition.checkpoint_bytes(), artifacts),
+                       pending["organism_state"].to_bytes(), artifacts),
             _reference("embodiment", BODY_ID, context.target_causal_tick,
                        next_body.checkpoint_bytes(), artifacts),
             _reference("environment", RESOURCE_ID, context.target_causal_tick,
@@ -389,12 +406,23 @@ def test_environment_scalar_field_reaches_organism_as_opaque_signal_and_commits(
     assert signal.channel_id == CHANNEL_ID
     assert signal.receptor_id == RECEPTOR_ID
     assert signal.value == pytest.approx(0.25)
-    frame = pending["cognition_frame"]
-    assert frame.tick == 0
-    assert set(frame.activations) == {"opaque-input"}
-    assert frame.activations["opaque-input"] == pytest.approx(0.25)
-    assert "resource" not in frame.activations
-    assert "field" not in frame.activations
+    accepted = pending["organism_state"]
+    assert isinstance(accepted, OrganismTransitionState)
+    assert accepted.organism_step == 1
+    assert accepted.world_correlation.causal_tick == 0
+    assert accepted.owner_checkpoint != pending["initial_organism_state"].owner_checkpoint
+    organism_ref = next(
+        reference
+        for reference in runtime.manifest.checkpoint_references
+        if reference.owner == "organism"
+    )
+    persisted = OrganismTransitionState.from_bytes(Path(organism_ref.locator).read_bytes())
+    assert persisted == accepted
+    cognition = CognitiveRuntimeCheckpoint.from_organism_checkpoint(
+        persisted.owner_checkpoint, kernel_limits=KernelLimits()
+    )
+    assert cognition.state.last_causal_tick == 0
+    assert cognition.graph.node_by_id("opaque-input") is not None
     assert len(runtime.manifest.checkpoint_references) == 4  # three owners + World journal
 
 
@@ -445,3 +473,44 @@ def test_stale_receptor_morphology_is_rejected_without_next_committed_cut(
     assert runtime.causal_tick == 0
     assert runtime.manifest.causal_tick == 0
     assert runtime.manifest.pending_tick == 1
+
+
+def test_organism_transition_rejects_provenance_for_another_physical_step(
+    tmp_path: Path,
+) -> None:
+    _, _, _, _, organism_state, _ = _runtime(tmp_path)
+    context = PhysicalStepContext(
+        world_id=WORLD_ID,
+        source_causal_tick=0,
+        target_causal_tick=1,
+        physical_step_id="physical-step-expected",
+        body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision="deterministic-sensing-solver-v1",
+    )
+    mismatched_provenance = SenseProvenance(
+        world_id=WORLD_ID,
+        causal_tick=0,
+        physical_step_id="physical-step-stale",
+        environment_id=ENVIRONMENT_ID,
+        environment_revision=ENVIRONMENT_REVISION,
+        sample_frame_id=FRAME_ID,
+        sample_position_m=(0.0, 0.0, 0.0),
+        body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+    )
+
+    with pytest.raises(ValueError, match="does not match the World physical step"):
+        advance_organism_for_physical_step(
+            context,
+            organism_state,
+            (),
+            (),
+            expected_provenance=mismatched_provenance,
+            kernel_limits=KernelLimits(),
+        )
+
+    assert organism_state.organism_step == 0
