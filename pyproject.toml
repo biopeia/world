@@ -17,8 +17,8 @@ mujoco = ["mujoco==3.14.0"]
 integration = [
     "pytest>=8",
     "mujoco==3.14.0",
-    "organism @ git+https://github.com/biopeia/organism.git@ba0011797a6a3b4d48c7731651e50560c4043f18",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@597cc4a09f4a5c94095b17ad0f2ba510df6d02c3",
+    "organism @ git+https://github.com/biopeia/organism.git@b19a39079b57a65f00eaecbe2c5cee3427a54f80",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@b5714f985d0aa970d3a412a7d29e43fa0bcb89d6",
     "environment @ git+https://github.com/biopeia/environment.git@caa885a11ec0170717bb4b71d271ab171807197e",
     "modality @ git+https://github.com/biopeia/modality.git@79b779152d4bff2ab4191dc6601c8f1640e4cae3",
     "observation @ git+https://github.com/biopeia/observation.git@6aac3c76684834722440f53c9d8604ac4c16b138",
