@@ -27,6 +27,7 @@ from .manifest import (
     DependencyVerifier,
     ManifestError,
     ManifestStatus,
+    SingleWriterPreconditionError,
     WorldCausalManifest,
     WorldCausalManifestStore,
 )
@@ -868,10 +869,13 @@ class DurableWorldRuntime:
         try:
             if self._latched_failure is not None:
                 raise RecoveryRequiredError("World runtime requires explicit recovery")
-            current = self._manifest_store._require_active()
+            current = self._manifest_store._read_for_tick()
             if current != self._manifest:
-                self._latched_failure = "durable manifest changed outside this runtime"
-                raise RecoveryRequiredError(self._latched_failure)
+                raise SingleWriterPreconditionError(
+                    "runtime is stale relative to the current committed World cut "
+                    f"(runtime tick {self._manifest.causal_tick} commit {self._manifest.commit_id!r}; "
+                    f"stored tick {current.causal_tick} commit {current.commit_id!r})"
+                )
             proposed_tick = current.causal_tick + 1
             registered = set(current.registered_owner_ids)
             additions_input = tuple(tuple(item) for item in register_owners)
@@ -975,6 +979,7 @@ class DurableWorldRuntime:
                     proposed_contracts.pop(key, None)
             pending = self._manifest_store._begin_transition(
                 transition_id,
+                expected_manifest=current,
                 registered_owner_ids=registered_tuple,
                 presence_owner_links=tuple(
                     (presence, owner, identity)

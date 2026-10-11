@@ -3,7 +3,11 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
+from shutil import copyfile
+from threading import Event
 
 import pytest
 
@@ -23,6 +27,7 @@ from world import (
     PresenceId,
     PresenceOwnerLink,
     RecoveryRequiredError,
+    SingleWriterPreconditionError,
     WorldCausalManifest,
     WorldCausalManifestStore,
     WorldGenesisSpec,
@@ -2411,6 +2416,195 @@ def test_recovery_required_error_hierarchy_is_unified():
     assert isinstance(err, RuntimeRecoveryError)
     assert isinstance(err, ManifestError)
     assert issubclass(ManifestRecoveryError, RuntimeRecoveryError)
+
+
+def _restored_runtime(world_id, manifest_path, journal_path, contracts):
+    return DurableWorldRuntime.restore(
+        world_id,
+        "presence-a",
+        WorldCausalManifestStore(manifest_path),
+        DurableJournalSnapshotStore(journal_path, world_id),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=lambda _references: None,
+    )
+
+
+def test_stale_writer_loses_compare_and_commit_without_invalidating_winner(tmp_path, monkeypatch):
+    world_id = WorldId("world-single-writer-stale-cut")
+    manifest_path = tmp_path / "manifest.json"
+    journal_path = tmp_path / "journal"
+    manifest_store = WorldCausalManifestStore(manifest_path)
+    journal_store = DurableJournalSnapshotStore(journal_path, world_id)
+    owner_state = tmp_path / "organism-0.json"
+    owner_state.write_bytes(b"initial owner state")
+    contracts = _contracts(("organism", "organism-identity"))
+    _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(owner_state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+
+    winner = _restored_runtime(world_id, manifest_path, journal_path, contracts)
+    loser = _restored_runtime(world_id, manifest_path, journal_path, contracts)
+    loser_at_compare = Event()
+    allow_loser_compare = Event()
+    original_begin = loser._manifest_store._begin_transition
+
+    def pause_before_compare(*args, **kwargs):
+        loser_at_compare.set()
+        assert allow_loser_compare.wait(timeout=5), "test did not release stale writer"
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(loser._manifest_store, "_begin_transition", pause_before_compare)
+
+    def winner_checkpoints(tick):
+        path = tmp_path / f"winner-owner-{tick}.json"
+        path.write_bytes(f"winner tick {tick}".encode())
+        return (_checkpoint(path),)
+
+    def forbidden_loser_callback(_tick):
+        pytest.fail("stale writer must fail before writing owner checkpoints")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        loser_attempt = executor.submit(loser.tick, "stale-loser", forbidden_loser_callback)
+        assert loser_at_compare.wait(timeout=5), "loser did not reach compare-and-commit boundary"
+        winner_record = winner.tick("winner", winner_checkpoints)
+        assert winner_record.causal_tick == 1
+        allow_loser_compare.set()
+        with pytest.raises(SingleWriterPreconditionError, match="cut changed"):
+            loser_attempt.result(timeout=5)
+
+    committed = manifest_store.read()
+    assert committed.status is ManifestStatus.COMMITTED
+    assert committed.causal_tick == 1
+    assert committed.commit_id == "winner"
+    assert winner.manifest == committed
+
+    restored = _restored_runtime(world_id, manifest_path, journal_path, contracts)
+    assert restored.manifest == committed
+    assert restored.causal_tick == 1
+    assert [record.record_id for record in restored.records] == [
+        f"{world_id.value}:causal-cut:0",
+        f"{world_id.value}:tick:1",
+        f"{world_id.value}:causal-cut:1",
+    ]
+
+
+def test_second_writer_observing_preparing_does_not_mark_active_writer_as_recovery(tmp_path):
+    world_id = WorldId("world-single-writer-preparing")
+    manifest_path = tmp_path / "manifest.json"
+    journal_path = tmp_path / "journal"
+    manifest_store = WorldCausalManifestStore(manifest_path)
+    journal_store = DurableJournalSnapshotStore(journal_path, world_id)
+    owner_state = tmp_path / "organism-0.json"
+    owner_state.write_bytes(b"initial owner state")
+    contracts = _contracts(("organism", "organism-identity"))
+    _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(owner_state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    winner = _restored_runtime(world_id, manifest_path, journal_path, contracts)
+    contender = _restored_runtime(world_id, manifest_path, journal_path, contracts)
+    callback_entered = Event()
+    allow_winner_finish = Event()
+
+    def winner_checkpoints(tick):
+        callback_entered.set()
+        assert allow_winner_finish.wait(timeout=5), "test did not release active writer"
+        path = tmp_path / f"winner-owner-{tick}.json"
+        path.write_bytes(f"winner tick {tick}".encode())
+        return (_checkpoint(path),)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        winner_attempt = executor.submit(winner.tick, "winner", winner_checkpoints)
+        assert callback_entered.wait(timeout=5), "winner did not publish PREPARING"
+        preparing = manifest_store.read()
+        assert preparing.status is ManifestStatus.PREPARING
+
+        with pytest.raises(SingleWriterPreconditionError, match="already preparing"):
+            contender.tick("contender", lambda _tick: pytest.fail("contender callback must not run"))
+
+        assert manifest_store.read() == preparing
+        allow_winner_finish.set()
+        assert winner_attempt.result(timeout=5).causal_tick == 1
+
+    committed = manifest_store.read()
+    assert committed.status is ManifestStatus.COMMITTED
+    assert committed.commit_id == "winner"
+    restored = _restored_runtime(world_id, manifest_path, journal_path, contracts)
+    assert restored.manifest == committed
+
+
+def test_copied_stores_with_same_world_id_can_diverge_independently(tmp_path):
+    world_id = WorldId("world-single-writer-independent-copies")
+    source_manifest_path = tmp_path / "source" / "manifest.json"
+    source_journal_path = tmp_path / "source" / "journal"
+    source_manifest_path.parent.mkdir(parents=True)
+    owner_state = tmp_path / "owner-0.json"
+    owner_state.write_bytes(b"same genesis owner state")
+    contracts = _contracts(("organism", "organism-identity"))
+    _initialize(
+        world_id,
+        "presence-a",
+        WorldCausalManifestStore(source_manifest_path),
+        DurableJournalSnapshotStore(source_journal_path, world_id),
+        initial_owner_references=(_checkpoint(owner_state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=contracts,
+    )
+    source_manifest = WorldCausalManifestStore(source_manifest_path).read()
+    source_journal_reference = next(
+        reference for reference in source_manifest.checkpoint_references
+        if reference.owner == "world-journal"
+    )
+
+    copies = []
+    for copy_name in ("copy-a", "copy-b"):
+        root = tmp_path / copy_name
+        journal_path = root / "journal"
+        journal_path.mkdir(parents=True)
+        copied_journal_path = journal_path / "world-causal-journal-v3.jsonl"
+        copyfile(source_journal_reference.locator, copied_journal_path)
+        copied_references = tuple(
+            replace(reference, locator=str(copied_journal_path))
+            if reference.owner == "world-journal"
+            else reference
+            for reference in source_manifest.checkpoint_references
+        )
+        manifest_path = root / "manifest.json"
+        WorldCausalManifestStore(manifest_path)._initialize(
+            replace(source_manifest, checkpoint_references=copied_references)
+        )
+        copies.append(_restored_runtime(world_id, manifest_path, journal_path, contracts))
+
+    for runtime, writer_name in zip(copies, ("writer-a", "writer-b"), strict=True):
+        def write_owner(tick, name=writer_name):
+            path = tmp_path / f"{name}-owner-{tick}.json"
+            path.write_bytes(f"{name} tick {tick}".encode())
+            return (_checkpoint(path),)
+
+        runtime.tick(writer_name, write_owner)
+
+    copy_manifests = tuple(
+        WorldCausalManifestStore(tmp_path / copy_name / "manifest.json").read()
+        for copy_name in ("copy-a", "copy-b")
+    )
+    assert all(manifest.status is ManifestStatus.COMMITTED for manifest in copy_manifests)
+    assert all(manifest.causal_tick == 1 for manifest in copy_manifests)
+    assert {manifest.commit_id for manifest in copy_manifests} == {"writer-a", "writer-b"}
 
 
 def test_durable_runtime_status_consistent_with_external_store_recovery_required(tmp_path):
