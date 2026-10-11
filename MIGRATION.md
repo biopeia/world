@@ -584,3 +584,14 @@ the journal bytes on each receipt lookup; retained-history integrity is
 verified through the explicit restore/verification paths. Owner projections
 and the production World-to-Observation join remain required before the
 end-to-end acceptance cycle can pass.
+
+## Owner restoration reference boundary (World #101)
+
+| Target path | Source/provenance | Disposition | Notes |
+| --- | --- | --- | --- |
+| `src/world/durable_runtime.py` | Biopeia World base `a481cdf7913d15c8efba693fb59ad95e9c273d8f`; bounded work for [World issue #101](https://github.com/biopeia/world/issues/101), with Environment owner contract at `caa885a11ec0170717bb4b71d271ab171807197e`; no historical implementation copied | REWRITE | Changes owner restoration verification to receive the original committed `CheckpointReference`, retaining owner identity, schema, locator and independent digest through both normal restore and explicit recovery. World continues to verify bytes against the committed digest before and after delegated restoration. |
+| `src/world/integrations/environment_checkpoint.py` | New explicit Biopeia cross-domain composition against Environment's native `DynamicEnvironmentOwner.verify_restoration`; no test-local compatibility wrapper retained | REWRITE | Adapts the generic World reference to Environment's native `OwnerRestorationReference`. The Environment owner remains responsible for verifying its restored state; World retains causal and checkpoint-reference authority. This module is part of the optional integration surface and requires the Environment integration dependency. |
+| `tests/test_durable_runtime.py`, `tests/integration/test_environment_dynamic_adoption_restore.py`, other World restore-contract tests | New/update Biopeia TARGET tests for World #101 | REWRITE | Covers generic owner contract changes, successful Environment restore and continued progression, explicit recovery, mismatched restored state, and owner identity/schema/digest rejection. No test-only wrapper bridges the production API. |
+| `README.md` | Target capability documentation | REWRITE | Documents the independent-reference restoration boundary and its trust/power-loss limitations. |
+
+This slice proves restoration against a committed reference for the tested in-process Environment owner and World restore/recovery paths. It does not establish malicious-adapter resistance, general storage durability, power-loss behavior, or full World #86 end-to-end migration acceptance. Exact-head validation is required before merge; World #86 and Environment #41 remain open until their broader acceptance criteria are independently met.
