@@ -12,12 +12,13 @@ import json
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from contextlib import contextmanager
 from typing import Callable
 
+from .runtime import RecoveryRequiredError as _BaseRecoveryRequiredError
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SCHEMA_VERSION = 4
@@ -35,7 +36,7 @@ class ManifestError(RuntimeError):
     """Base error for invalid or unavailable causal-cut state."""
 
 
-class RecoveryRequiredError(ManifestError):
+class RecoveryRequiredError(ManifestError, _BaseRecoveryRequiredError):
     """Raised when a pending causal transition prevents ordinary execution."""
 
 
