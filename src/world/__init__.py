@@ -14,6 +14,7 @@ from .manifest import (
     CheckpointReference,
     ManifestError,
     ManifestStatus,
+    SingleWriterPreconditionError,
     WorldCausalManifest,
     WorldCausalManifestStore,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "PresenceOwnerLink",
     "RecoveryRequiredError",
     "RuntimeStatus",
+    "SingleWriterPreconditionError",
     "TickInProgressError",
     "WorldCausalManifest",
     "WorldCausalManifestStore",

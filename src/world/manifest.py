@@ -40,6 +40,10 @@ class RecoveryRequiredError(ManifestError, _BaseRecoveryRequiredError):
     """Raised when a pending causal transition prevents ordinary execution."""
 
 
+class SingleWriterPreconditionError(ManifestError):
+    """Raised when a runtime attempts to publish from a stale World cut."""
+
+
 @dataclass(frozen=True, slots=True)
 class CheckpointReference:
     """Opaque reference to one owner checkpoint identified by its owner contract."""
@@ -232,10 +236,36 @@ class WorldCausalManifestStore:
                 )
             return manifest
 
+    def _read_for_tick(self) -> WorldCausalManifest:
+        """Read the current cut without treating a live PREPARING cut as abandoned.
+
+        Startup restoration uses ``_require_active`` to convert a persisted
+        PREPARING state into RECOVERY_REQUIRED. A runtime attempting another
+        tick must not perform that startup transition: it may be observing a
+        different writer that is still executing its already-published step.
+
+        This cooperative check applies to concurrent ``tick`` attempts. The
+        single-logical-writer precondition excludes restoring another runtime
+        while a tick is active; startup recovery still treats persisted
+        PREPARING as interrupted work.
+        """
+        with self._writer_lock():
+            manifest = self.read()
+            if manifest.status is ManifestStatus.PREPARING:
+                raise SingleWriterPreconditionError(
+                    "another World transition is already preparing from the current committed cut"
+                )
+            if manifest.status is ManifestStatus.RECOVERY_REQUIRED:
+                raise RecoveryRequiredError(
+                    f"World requires explicit recovery for transition {manifest.pending_transition_id}"
+                )
+            return manifest
+
     def _begin_transition(
         self,
         transition_id: str,
         *,
+        expected_manifest: WorldCausalManifest | None = None,
         registered_owner_ids: tuple[tuple[str, str], ...] | None = None,
         presence_owner_links: tuple[tuple[str, str, str], ...] | None = None,
         step_participant_ids: tuple[tuple[str, str], ...] = (),
@@ -245,6 +275,12 @@ class WorldCausalManifestStore:
             raise ValueError("transition_id must not be empty")
         with self._writer_lock():
             current = self.read()
+            if expected_manifest is not None and current != expected_manifest:
+                raise SingleWriterPreconditionError(
+                    "World committed cut changed before transition publication "
+                    f"(expected tick {expected_manifest.causal_tick} commit {expected_manifest.commit_id!r}; "
+                    f"found {current.status.value} tick {current.causal_tick} commit {current.commit_id!r})"
+                )
             if current.status is not ManifestStatus.COMMITTED:
                 raise RecoveryRequiredError(
                     f"World requires recovery for transition {current.pending_transition_id}"
