@@ -8,17 +8,34 @@ remain the responsibility of ``run_physical_step`` and its owner ports.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import math
 import xml.etree.ElementTree as ET
 
-from embodiment.physics3d.articulated_state import JointKinematicState, SolverArticulatedCandidate
+from embodiment.physics3d.articulated_state import (
+    ArticulatedEmbodimentPhysicalState,
+    JointKinematicState,
+    SolverArticulatedCandidate,
+)
 from embodiment.physics3d.joint_torque import JointTorqueCandidate
-from embodiment.physics3d.physical_projection import BodyPhysicalInput
+from embodiment.physics3d.physical_projection import (
+    BodyPhysicalInput,
+    project_body_physical_input,
+)
 from embodiment.physics3d.physical_transition import PhysicalStepCorrelation, SolverBodyCandidate
-from environment.static_scene import EnvironmentPhysicalProjection, StaticSceneCandidate
+from environment.static_scene import (
+    EnvironmentPhysicalProjection,
+    PhysicalStepCorrelation as EnvironmentStepCorrelation,
+    StaticEnvironmentOwner,
+    StaticSceneCandidate,
+)
 
+from world.durable_runtime import DurableWorldRuntime
+from world.journal import CausalRecord
+from world.manifest import CheckpointReference
 from world.physical_step import PhysicalStepCandidate, PhysicalStepContext
+from world.physical_step import PhysicalStepPorts, run_physical_step
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,3 +261,114 @@ def execute_articulated_mujoco_step(
         SolverArticulatedCandidate(root_candidate, tuple(joints)),
         StaticSceneCandidate(environment.correlation, scene),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ArticulatedPhysicalStepOutcome:
+    """Committed World record plus the owner-returned accepted body state."""
+
+    record: CausalRecord
+    body_state: ArticulatedEmbodimentPhysicalState
+
+
+def advance_articulated_mujoco_step(
+    world: DurableWorldRuntime,
+    *,
+    commit_id: str,
+    physical_step_id: str,
+    body_state: ArticulatedEmbodimentPhysicalState,
+    torque: JointTorqueCandidate,
+    environment_owner: StaticEnvironmentOwner,
+    configuration: ArticulatedMujocoConfiguration,
+    write_checkpoints: Callable[
+        [PhysicalStepContext, ArticulatedEmbodimentPhysicalState, StaticEnvironmentOwner],
+        Iterable[CheckpointReference],
+    ],
+) -> ArticulatedPhysicalStepOutcome:
+    """Run the owner-projected articulated physical step through World commit.
+
+    This is the production integration join for the currently supported
+    articulated Embodiment and static Environment capabilities. It assembles
+    no domain state: Embodiment and Environment produce/validate their own
+    projections and adoption results; the caller's checkpoint writer persists
+    the accepted owner states and returns their World references.
+
+    Environment's static owner correlation tracks the source causal state
+    being transitioned, matching its established adoption/checkpoint contract.
+    Embodiment's body projection and action torque are likewise source-scoped;
+    World commits the resulting transition at the target causal tick.
+    """
+    accepted: dict[str, ArticulatedEmbodimentPhysicalState] = {}
+
+    def project_body(context: PhysicalStepContext) -> ArticulatedPhysicalInput:
+        if body_state.causal_tick != context.source_causal_tick:
+            raise ValueError("Embodiment state is not at the World source causal tick")
+        correlation = PhysicalStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            context.body_id,
+            context.embodiment_episode_id,
+            context.morphology_revision,
+            context.environment_revision,
+            context.solver_config_revision,
+        )
+        projection = project_body_physical_input(body_state, correlation=correlation)
+        return ArticulatedPhysicalInput(projection, torque)
+
+    def project_environment(context: PhysicalStepContext) -> EnvironmentPhysicalProjection:
+        correlation = EnvironmentStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            environment_owner.scene.environment_id,
+            context.environment_revision,
+        )
+        return environment_owner.project_physical_step(correlation)
+
+    def execute_solver(context, body_projection, environment_projection):
+        return execute_articulated_mujoco_step(
+            context,
+            body_projection,
+            environment_projection,
+            configuration=configuration,
+        )
+
+    def adopt_body(context, candidate: SolverArticulatedCandidate) -> None:
+        accepted["body"] = body_state.adopt_candidate(candidate, world_context=context)
+
+    def adopt_environment(context, candidate: StaticSceneCandidate) -> None:
+        expected = EnvironmentStepCorrelation(
+            context.world_id,
+            context.source_causal_tick,
+            context.physical_step_id,
+            environment_owner.scene.environment_id,
+            context.environment_revision,
+        )
+        environment_owner.validate_and_adopt(candidate, expected_correlation=expected)
+
+    def persist(context):
+        adopted = accepted.get("body")
+        if adopted is None:
+            raise RuntimeError("Embodiment did not publish an adopted state")
+        return tuple(write_checkpoints(context, adopted, environment_owner))
+
+    record = run_physical_step(
+        world,
+        commit_id=commit_id,
+        physical_step_id=physical_step_id,
+        body_id=body_state.root.body_id,
+        embodiment_episode_id=body_state.root.embodiment_episode_id,
+        morphology_revision=body_state.morphology_revision,
+        environment_revision=environment_owner.scene.environment_revision,
+        solver_config_revision=configuration.revision,
+        ports=PhysicalStepPorts(
+            project_body=project_body,
+            project_environment=project_environment,
+            execute_solver=execute_solver,
+            adopt_body=adopt_body,
+            adopt_environment=adopt_environment,
+            write_checkpoints=persist,
+        ),
+    )
+    return ArticulatedPhysicalStepOutcome(record, accepted["body"])
