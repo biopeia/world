@@ -755,6 +755,8 @@ def test_restore_rejects_digest_valid_semantically_malformed_organism_checkpoint
         for reference in persisted.committed_cut.owner_checkpoint_references
         if reference.owner == "organism"
     )
+    assert organism_reference.owner_identity == str(ORGANISM_ID)
+    assert organism_reference.schema_version == ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA
     encoded = Path(organism_reference.locator).read_bytes()
     assert hashlib.sha256(encoded).hexdigest() == organism_reference.sha256
     envelope = json.loads(encoded)
