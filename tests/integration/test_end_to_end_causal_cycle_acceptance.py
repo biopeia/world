@@ -346,9 +346,7 @@ def _run(directory: Path):
         environment_owner=env_owner,
         owner_checkpoint_store=owner_checkpoint_store,
     )
-    first_observations = tuple(
-        message.observation for message in plane.current_messages()
-    )
+    first_messages = plane.current_messages()
 
     restored: dict[tuple[str, str], object] = {}
 
@@ -428,10 +426,8 @@ def _run(directory: Path):
         environment_owner=restored_environment,
         owner_checkpoint_store=owner_checkpoint_store,
     )
-    resumed_observations = tuple(
-        message.observation for message in plane.current_messages()
-    )
-    return result, first_observations, resumed, resumed_observations
+    resumed_messages = plane.current_messages()
+    return result, first_messages, resumed, resumed_messages
 
 
 def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology) -> bool:
@@ -443,17 +439,18 @@ def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology)
 
 
 def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: Path) -> None:
-    first, first_observations, first_resumed, first_resumed_observations = _run(
+    first, first_messages, first_resumed, first_resumed_messages = _run(
         tmp_path / "run-a"
     )
-    second, second_observations, second_resumed, second_resumed_observations = _run(
+    second, second_messages, second_resumed, second_resumed_messages = _run(
         tmp_path / "run-b"
     )
 
-    for result, observations in (
-        (first, first_observations),
-        (second, second_observations),
+    for result, messages in (
+        (first, first_messages),
+        (second, second_messages),
     ):
+        observations = tuple(message.observation for message in messages)
         assert result.context.source_causal_tick == 0
         assert result.context.target_causal_tick == result.committed_cut.causal_tick == 1
         assert result.sensory_input.sample.value == pytest.approx(0.25)
@@ -486,6 +483,9 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
         )
         assert len(result.observation_publication.delivery_sequences) == 2
         assert result.observation_publication.committed_cut == result.committed_cut
+        assert tuple(message.sequence for message in messages) == (
+            result.observation_publication.delivery_sequences
+        )
         assert len(observations) == 2
         body_observation, field_observation = observations
         assert body_observation.claim.family.path == ("body_pose",)
@@ -512,10 +512,11 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
             for reference in result.committed_cut.owner_checkpoint_references
         )
 
-    for resumed, observations in (
-        (first_resumed, first_resumed_observations),
-        (second_resumed, second_resumed_observations),
+    for resumed, messages in (
+        (first_resumed, first_resumed_messages),
+        (second_resumed, second_resumed_messages),
     ):
+        observations = tuple(message.observation for message in messages)
         assert resumed.context.source_causal_tick == 1
         assert resumed.context.target_causal_tick == resumed.committed_cut.causal_tick == 2
         assert resumed.action_candidate.motor_command is not None
@@ -523,9 +524,32 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
         assert len(resumed.observation_publication.delivery_sequences) == 2
         assert resumed.observation_publication.committed_cut == resumed.committed_cut
         assert len(observations) == 2
-        assert all(
-            any(domain_time.value == resumed.committed_cut.causal_tick for domain_time in observation.context_time)
-            for observation in observations
+        assert tuple(message.sequence for message in messages) == (
+            resumed.observation_publication.delivery_sequences
+        )
+        body_observation, field_observation = observations
+        assert body_observation.claim.family.path == ("body_pose",)
+        assert field_observation.claim.family.path == ("finite_scalar_field",)
+        for observation in observations:
+            assert any(
+                domain_time.domain.value == "world"
+                and domain_time.kind
+                in {"world_target_causal_tick", "world_causal_tick"}
+                and domain_time.value == resumed.committed_cut.causal_tick
+                for domain_time in observation.context_time
+            )
+        assert any(
+            reference.owner == "embodiment"
+            and reference.sha256
+            in {parent.reference for parent in body_observation.lineage.parents}
+            for reference in resumed.committed_cut.owner_checkpoint_references
+        )
+        assert any(
+            reference.owner == "environment"
+            and reference.owner_identity == RESOURCE_ID
+            and reference.sha256
+            in {parent.reference for parent in field_observation.lineage.parents}
+            for reference in resumed.committed_cut.owner_checkpoint_references
         )
 
     assert first.committed_cut.commit_id == second.committed_cut.commit_id
@@ -535,11 +559,15 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
     assert first.physical_outcome.body_state.joints == pytest.approx(
         second.physical_outcome.body_state.joints
     )
-    assert first_observations == second_observations
+    assert tuple(message.observation for message in first_messages) == tuple(
+        message.observation for message in second_messages
+    )
     assert first_resumed.committed_cut.commit_id == second_resumed.committed_cut.commit_id
     assert first_resumed.committed_cut.causal_tick == second_resumed.committed_cut.causal_tick == 2
     assert first_resumed.action_candidate.motor_command == second_resumed.action_candidate.motor_command
-    assert first_resumed_observations == second_resumed_observations
+    assert tuple(message.observation for message in first_resumed_messages) == tuple(
+        message.observation for message in second_resumed_messages
+    )
     assert first_resumed.physical_outcome.body_state.joints == pytest.approx(
         second_resumed.physical_outcome.body_state.joints
     )
