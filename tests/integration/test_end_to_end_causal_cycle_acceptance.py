@@ -19,6 +19,7 @@ from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
 from embodiment.physics3d.articulated_state import (
     ActiveArticulatedMorphology,
     ArticulatedEmbodimentPhysicalState,
+    ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
     JointKinematicState,
 )
 from embodiment.physics3d.differential_motor_composition import (
@@ -45,8 +46,6 @@ from environment import (
     StaticPhysicalScene,
 )
 from modality import DimensionlessScalarFieldIdentityV1
-from observation.embodiment import embodiment_body_pose_observation
-from observation.environment import environment_finite_scalar_field_observation
 from observation.plane import ObservationPlane
 from organism.actuation import (
     ActuatorEvidenceContext,
@@ -74,13 +73,13 @@ from world.durable_runtime import (
     WorldGenesisSpec,
 )
 from world.manifest import CheckpointReference, WorldCausalManifestStore
-from world.observation_publication import OwnerObservation
 from world.runtime import PresenceId, WorldId
 from world.causal_cycle import (
-    project_scalar_field_after_commit,
+    ORGANISM_ACTION_CHECKPOINT_SCHEMA,
     run_scalar_sensorimotor_cycle_and_publish,
 )
 from world.adapters.articulated_mujoco import ArticulatedMujocoConfiguration
+from world.owner_checkpoint_store import FileOwnerCheckpointStore
 
 WORLD_ID = "world.acceptance.sensorimotor-v1"
 PRESENCE_ID = "presence.acceptance.sensorimotor-v1"
@@ -235,11 +234,11 @@ def _run(directory: Path):
         ("organism", str(ORGANISM_ID)): _Contract(
             str(ORGANISM_ID), {
                 "organism-transition-v2": lambda data: _valid_transition_checkpoint(data, str(ORGANISM_ID)),
-                "organism-exploration-checkpoint-v3": lambda data: _valid_organism_checkpoint(data, str(ORGANISM_ID)),
+                ORGANISM_ACTION_CHECKPOINT_SCHEMA: lambda data: _valid_organism_checkpoint(data, str(ORGANISM_ID)),
             },
         ),
         ("embodiment", BODY_ID): _Contract(
-            BODY_ID, {"embodiment-articulated-physical-state-v2": lambda data: _valid_body_checkpoint(data, morphology)},
+            BODY_ID, {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
         ),
         ("environment", ENVIRONMENT_OWNER_ID): _Contract(
             ENVIRONMENT_OWNER_ID, {StaticEnvironmentOwner.CHECKPOINT_SCHEMA: lambda data: StaticEnvironmentOwner.validate_checkpoint(
@@ -255,7 +254,7 @@ def _run(directory: Path):
     owner_dir = directory / "owners"
     initial_refs = (
         _reference(owner_dir, "organism", str(ORGANISM_ID), "organism-transition-v2", 0, organism.to_bytes()),
-        _reference(owner_dir, "embodiment", BODY_ID, "embodiment-articulated-physical-state-v2", 0, body.checkpoint_bytes()),
+        _reference(owner_dir, "embodiment", BODY_ID, ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA, 0, body.checkpoint_bytes()),
         _reference(owner_dir, "environment", ENVIRONMENT_OWNER_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA, 0, env_owner.checkpoint_bytes()),
         _reference(owner_dir, "environment", RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA, 0, field.checkpoint_bytes()),
     )
@@ -323,26 +322,7 @@ def _run(directory: Path):
         contact_policy="max-sliding-body-torsion-rolling/no-self-collision-v1",
     )
 
-    def write_checkpoints(context, organism_state, organism_checkpoint, adopted_body, adopted_environment, adopted_field):
-        tick = context.target_causal_tick
-        return (
-            _reference(owner_dir, "organism", str(ORGANISM_ID), "organism-exploration-checkpoint-v3", tick, organism_checkpoint),
-            _reference(owner_dir, "embodiment", BODY_ID, "embodiment-articulated-physical-state-v2", tick, adopted_body.checkpoint_bytes()),
-            _reference(owner_dir, "environment", ENVIRONMENT_OWNER_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA, tick, adopted_environment.checkpoint_bytes()),
-            _reference(owner_dir, "environment", RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA, tick, adopted_field.checkpoint_bytes()),
-        )
-
     plane = ObservationPlane()
-
-    def project(context, cut, adopted_body, adopted_field):
-        body_ref = next(ref for ref in cut.owner_checkpoint_references if ref.owner == "embodiment" and ref.owner_identity == BODY_ID)
-        field_ref = next(ref for ref in cut.owner_checkpoint_references if ref.owner == "environment" and ref.owner_identity == RESOURCE_ID)
-        body_observation = embodiment_body_pose_observation(adopted_body.body_pose_observation_projection())
-        field_projection = project_scalar_field_after_commit(
-            adopted_field, context=context, point_m=(0.0, 0.0, 0.0), frame=frame
-        )
-        field_observation = environment_finite_scalar_field_observation(field_projection)
-        return (OwnerObservation(body_ref, body_observation), OwnerObservation(field_ref, field_observation))
 
     result = run_scalar_sensorimotor_cycle_and_publish(
         world, plane,
@@ -366,8 +346,7 @@ def _run(directory: Path):
         differential_binding=motor_binding,
         torque_binding=torque_binding,
         environment_owner=env_owner,
-        write_checkpoints=write_checkpoints,
-        project_owner_observations=project,
+        owner_checkpoint_store=FileOwnerCheckpointStore(owner_dir / "committed"),
     )
     return result, plane
 

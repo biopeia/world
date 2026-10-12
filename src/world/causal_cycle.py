@@ -1,14 +1,15 @@
-"""World-owned composition of the bounded sensorimotor causal cycle.
+"""World-owned composition of a bounded sensorimotor causal cycle.
 
-This integration boundary composes owner APIs but does not own cognition,
-action policy, body/environment state, numerical physics, or observation
-meaning. Owner checkpoints must be durably written by the supplied writer
-before World can publish the causal cut.
+This integration boundary composes public owner APIs but does not own
+cognition, action policy, body/environment state, numerical physics, or
+observation meaning. Owner checkpoint bytes are durably published by an
+opaque checkpoint store before World can commit their references. The
+post-commit owner-to-Observation bindings are part of this TARGET runtime
+composition, not delegated to a test or launcher.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Protocol, runtime_checkable
@@ -16,6 +17,7 @@ from typing import Protocol, runtime_checkable
 from embodiment.physics3d.articulated_state import (
     ActiveArticulatedMorphology,
     ArticulatedEmbodimentPhysicalState,
+    ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
 )
 from embodiment.physics3d.differential_motor_composition import (
     EmbodimentDifferentialMotorBinding,
@@ -47,11 +49,17 @@ from .observation_publication import (
     OwnerObservation,
     publish_committed_owner_observations,
 )
+from .owner_checkpoint_store import (
+    OwnerCheckpointPayload,
+    OwnerCheckpointStore,
+)
 from .organism_transition import (
     ScalarFieldOrganismInput,
     advance_organism_from_scalar_field_for_physical_step,
 )
 from .physical_step import PhysicalStepContext
+
+ORGANISM_ACTION_CHECKPOINT_SCHEMA = "biopeia-organism-exploration-checkpoint-v3"
 
 
 class _ActionCandidate(Protocol):
@@ -127,26 +135,7 @@ def run_scalar_sensorimotor_cycle_and_publish(
     differential_binding: EmbodimentDifferentialMotorBinding,
     torque_binding: EmbodimentJointTorqueBinding,
     environment_owner: StaticEnvironmentOwner,
-    write_checkpoints: Callable[
-        [
-            PhysicalStepContext,
-            OrganismTransitionState,
-            bytes,
-            ArticulatedEmbodimentPhysicalState,
-            StaticEnvironmentOwner,
-            IdentifiedFiniteScalarField,
-        ],
-        Iterable[CheckpointReference],
-    ],
-    project_owner_observations: Callable[
-        [
-            PhysicalStepContext,
-            CommittedWorldCut,
-            ArticulatedEmbodimentPhysicalState,
-            IdentifiedFiniteScalarField,
-        ],
-        Iterable[OwnerObservation],
-    ],
+    owner_checkpoint_store: OwnerCheckpointStore,
 ) -> CausalCycleResult:
     """Sense, transition, issue an Organism command, solve, adopt, commit, publish.
 
@@ -160,6 +149,8 @@ def run_scalar_sensorimotor_cycle_and_publish(
         raise TypeError("current_organism must be an OrganismTransitionState")
     if not isinstance(action_composer, _OrganismActionComposer):
         raise TypeError("action_composer must implement the Organism action port")
+    if not isinstance(owner_checkpoint_store, OwnerCheckpointStore):
+        raise TypeError("owner_checkpoint_store must implement the opaque owner checkpoint store")
     source_tick = world.causal_tick
     if embodiment_state.causal_tick != source_tick:
         raise ValueError("Embodiment source state does not match the current World cut")
@@ -223,13 +214,34 @@ def run_scalar_sensorimotor_cycle_and_publish(
                 transition_state=sensed.state,
             )
             written_references = tuple(
-                write_checkpoints(
+                owner_checkpoint_store.write(
                     step_context,
-                    sensed.state,
-                    organism_checkpoint,
-                    adopted_body,
-                    adopted_environment,
-                    environment_field,
+                    (
+                        OwnerCheckpointPayload(
+                            owner="organism",
+                            owner_identity=str(sensed.state.identity),
+                            schema_version=ORGANISM_ACTION_CHECKPOINT_SCHEMA,
+                            encoded=organism_checkpoint,
+                        ),
+                        OwnerCheckpointPayload(
+                            owner="embodiment",
+                            owner_identity=adopted_body.root.body_id,
+                            schema_version=ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
+                            encoded=adopted_body.checkpoint_bytes(),
+                        ),
+                        OwnerCheckpointPayload(
+                            owner="environment",
+                            owner_identity=adopted_environment.owner_id,
+                            schema_version=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
+                            encoded=adopted_environment.checkpoint_bytes(),
+                        ),
+                        OwnerCheckpointPayload(
+                            owner="environment",
+                            owner_identity=environment_field.resource_id,
+                            schema_version=environment_field.OWNER_SCHEMA,
+                            encoded=environment_field.checkpoint_bytes(),
+                        ),
+                    ),
                 )
             )
             _require_checkpoint(
@@ -282,10 +294,30 @@ def run_scalar_sensorimotor_cycle_and_publish(
             expected_owner_references=written_references,
         )
         action_composer.adopt_after_world_commit(candidate, committed_cut=cut)
-        observations = tuple(
-            project_owner_observations(
-                context, cut, physical.body_state, environment_field
-            )
+        # This is the production domain-to-Observation binding. The test
+        # supplies neither the owner checkpoint set nor claim construction.
+        from observation.embodiment import embodiment_body_pose_observation
+        from observation.environment import environment_finite_scalar_field_observation
+
+        body_reference = _reference_for_owner(
+            cut, "embodiment", physical.body_state.root.body_id
+        )
+        field_reference = _reference_for_owner(
+            cut, "environment", environment_field.resource_id
+        )
+        body_claim = embodiment_body_pose_observation(
+            physical.body_state.body_pose_observation_projection()
+        )
+        field_projection = project_scalar_field_after_commit(
+            environment_field,
+            context=context,
+            point_m=sensed.receptor_point.position_m,
+            frame=sampling_frame,
+        )
+        field_claim = environment_finite_scalar_field_observation(field_projection)
+        observations = (
+            OwnerObservation(body_reference, body_claim),
+            OwnerObservation(field_reference, field_claim),
         )
         publication = publish_committed_owner_observations(
             world,
@@ -345,4 +377,24 @@ def _require_checkpoint(
         )
 
 
-__all__ = ["CausalCycleResult", "project_scalar_field_after_commit", "run_scalar_sensorimotor_cycle_and_publish"]
+def _reference_for_owner(
+    cut: CommittedWorldCut, owner: str, owner_identity: str
+) -> CheckpointReference:
+    matches = tuple(
+        reference
+        for reference in cut.owner_checkpoint_references
+        if reference.owner == owner and reference.owner_identity == owner_identity
+    )
+    if len(matches) != 1:
+        raise ManifestError(
+            f"committed cut must contain exactly one {owner} checkpoint for {owner_identity}"
+        )
+    return matches[0]
+
+
+__all__ = [
+    "CausalCycleResult",
+    "ORGANISM_ACTION_CHECKPOINT_SCHEMA",
+    "project_scalar_field_after_commit",
+    "run_scalar_sensorimotor_cycle_and_publish",
+]
