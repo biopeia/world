@@ -14,9 +14,9 @@ mujoco = ["mujoco==3.14.0"]
 # Production World orchestration across the sensor-to-Organism transition.
 # This remains optional so World causal primitives can be installed alone.
 runtime = [
-    "organism @ git+https://github.com/biopeia/organism.git@e798ba95647e8d127919c07d9eca2043cc0c0978",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@baa2d071e763cba6c1a380d50488ebf863cb3578",
-    "environment @ git+https://github.com/biopeia/environment.git@9812464ef2f2841b2984375738c8b5e8ee6da2dc",
+    "organism @ git+https://github.com/biopeia/organism.git@a885c90aba5b5b5dacee38104b3933f28076ed2b",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@a4a665f9d62ef5c86ede5055040a24766f590a2d",
+    "environment @ git+https://github.com/biopeia/environment.git@b71d5566c3a73774a088a41a7b99a03954e43a53",
     "modality @ git+https://github.com/biopeia/modality.git@79b779152d4bff2ab4191dc6601c8f1640e4cae3",
 ]
 # Cross-repository integration tests only. The package itself has no runtime
@@ -26,9 +26,9 @@ runtime = [
 integration = [
     "pytest>=8",
     "mujoco==3.14.0",
-    "organism @ git+https://github.com/biopeia/organism.git@e798ba95647e8d127919c07d9eca2043cc0c0978",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@baa2d071e763cba6c1a380d50488ebf863cb3578",
-    "environment @ git+https://github.com/biopeia/environment.git@9812464ef2f2841b2984375738c8b5e8ee6da2dc",
+    "organism @ git+https://github.com/biopeia/organism.git@a885c90aba5b5b5dacee38104b3933f28076ed2b",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@a4a665f9d62ef5c86ede5055040a24766f590a2d",
+    "environment @ git+https://github.com/biopeia/environment.git@b71d5566c3a73774a088a41a7b99a03954e43a53",
     "modality @ git+https://github.com/biopeia/modality.git@79b779152d4bff2ab4191dc6601c8f1640e4cae3",
     "observation @ git+https://github.com/biopeia/observation.git@ef6321d2bab43b883238cdcf0ce33c08321d595c",
 ]
