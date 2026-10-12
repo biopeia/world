@@ -671,24 +671,29 @@ def test_fresh_process_restore_rejects_corrupt_committed_owner_state(tmp_path: P
     assert committed_after_restore.commit_id == committed_before_restore.commit_id
 
 
-def test_fresh_process_restore_rejects_missing_committed_owner_checkpoint(tmp_path: Path) -> None:
-    persisted, _, no_resume, _ = _run(
-        tmp_path / "missing-owner", stop_after_first=True
-    )
+@pytest.mark.parametrize(
+    ("owner", "owner_identity"),
+    (("embodiment", BODY_ID), ("organism", str(ORGANISM_ID))),
+)
+def test_fresh_process_restore_rejects_missing_committed_owner_checkpoint(
+    tmp_path: Path, owner: str, owner_identity: str
+) -> None:
+    directory = tmp_path / f"missing-{owner}-owner"
+    persisted, _, no_resume, _ = _run(directory, stop_after_first=True)
     assert no_resume is None
-    embodiment_reference = next(
+    owner_reference = next(
         reference
         for reference in persisted.committed_cut.owner_checkpoint_references
-        if reference.owner == "embodiment"
+        if reference.owner == owner and reference.owner_identity == owner_identity
     )
-    Path(embodiment_reference.locator).unlink()
+    Path(owner_reference.locator).unlink()
 
-    manifest_store = WorldCausalManifestStore(tmp_path / "missing-owner" / "manifest.json")
+    manifest_store = WorldCausalManifestStore(directory / "manifest.json")
     committed_before_restore = manifest_store.read()
     assert committed_before_restore.causal_tick == 1
 
     with pytest.raises(ManifestError):
-        _restore_runtime_from_directory(tmp_path / "missing-owner")
+        _restore_runtime_from_directory(directory)
 
     committed_after_restore = manifest_store.read()
     assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
