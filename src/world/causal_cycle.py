@@ -15,16 +15,16 @@ from hashlib import sha256
 from typing import Protocol, runtime_checkable
 
 from embodiment.physics3d.articulated_state import (
+    ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
     ActiveArticulatedMorphology,
     ArticulatedEmbodimentPhysicalState,
-    ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
 )
 from embodiment.physics3d.differential_motor_composition import (
     EmbodimentDifferentialMotorBinding,
 )
 from embodiment.physics3d.joint_torque import EmbodimentJointTorqueBinding
-from embodiment.physics3d.receptor import EmbodimentReceptor
 from embodiment.physics3d.physical_transition import EmbodimentPhysicalState
+from embodiment.physics3d.receptor import EmbodimentReceptor
 from environment import (
     EnvironmentObservationContext,
     FrameDescriptor,
@@ -32,6 +32,7 @@ from environment import (
     StaticEnvironmentOwner,
 )
 from modality import DimensionlessScalarFieldIdentityV1
+from organism.actuation import ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA
 from organism.cognition import SenseChannelBinding
 from organism.cognition.limits import KernelLimits
 from organism.transition import OrganismTransitionState
@@ -49,17 +50,15 @@ from .observation_publication import (
     OwnerObservation,
     publish_committed_owner_observations,
 )
-from .owner_checkpoint_store import (
-    OwnerCheckpointPayload,
-    OwnerCheckpointStore,
-)
 from .organism_transition import (
     ScalarFieldOrganismInput,
     advance_organism_from_scalar_field_for_physical_step,
 )
+from .owner_checkpoint_store import (
+    OwnerCheckpointPayload,
+    OwnerCheckpointStore,
+)
 from .physical_step import PhysicalStepContext
-
-ORGANISM_ACTION_CHECKPOINT_SCHEMA = "biopeia-organism-exploration-checkpoint-v3"
 
 
 class _ActionCandidate(Protocol):
@@ -220,7 +219,7 @@ def run_scalar_sensorimotor_cycle_and_publish(
                         OwnerCheckpointPayload(
                             owner="organism",
                             owner_identity=str(sensed.state.identity),
-                            schema_version=ORGANISM_ACTION_CHECKPOINT_SCHEMA,
+                            schema_version=ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
                             encoded=organism_checkpoint,
                         ),
                         OwnerCheckpointPayload(
@@ -394,7 +393,6 @@ def _reference_for_owner(
 
 __all__ = [
     "CausalCycleResult",
-    "ORGANISM_ACTION_CHECKPOINT_SCHEMA",
     "project_scalar_field_after_commit",
     "run_scalar_sensorimotor_cycle_and_publish",
 ]

@@ -17,9 +17,9 @@ import pytest
 from embodiment.observation import BodyPoseSample
 from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
 from embodiment.physics3d.articulated_state import (
+    ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
     ActiveArticulatedMorphology,
     ArticulatedEmbodimentPhysicalState,
-    ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
     JointKinematicState,
 )
 from embodiment.physics3d.differential_motor_composition import (
@@ -48,15 +48,16 @@ from environment import (
 from modality import DimensionlessScalarFieldIdentityV1
 from observation.plane import ObservationPlane
 from organism.actuation import (
+    ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
     ActuatorEvidenceContext,
     ActuatorSurface,
     CompetenceDevelopmentEngine,
+    OrganismCheckpointContract,
     OrganismExplorationComposer,
 )
 from organism.cognition import CognitiveRuntimeCheckpoint, SenseChannelBinding
 from organism.cognition.graph import CognitiveGraph, PlasticNode
 from organism.cognition.limits import KernelLimits
-from organism.cognition.sense_input import SenseProvenance
 from organism.cognition.transition import CognitiveTransitionState
 from organism.cognition.types import NodeKind
 from organism.identity import OrganismIdentity
@@ -64,7 +65,11 @@ from organism.transition import (
     EmbodimentContextRef,
     OrganismLifecycle,
     OrganismTransitionState,
-    WorldCausalCorrelation,
+)
+
+from world.adapters.articulated_mujoco import ArticulatedMujocoConfiguration
+from world.causal_cycle import (
+    run_scalar_sensorimotor_cycle_and_publish,
 )
 from world.durable_runtime import (
     DurableJournalSnapshotStore,
@@ -73,13 +78,8 @@ from world.durable_runtime import (
     WorldGenesisSpec,
 )
 from world.manifest import CheckpointReference, WorldCausalManifestStore
-from world.runtime import PresenceId, WorldId
-from world.causal_cycle import (
-    ORGANISM_ACTION_CHECKPOINT_SCHEMA,
-    run_scalar_sensorimotor_cycle_and_publish,
-)
-from world.adapters.articulated_mujoco import ArticulatedMujocoConfiguration
 from world.owner_checkpoint_store import FileOwnerCheckpointStore
+from world.runtime import PresenceId, WorldId
 
 WORLD_ID = "world.acceptance.sensorimotor-v1"
 PRESENCE_ID = "presence.acceptance.sensorimotor-v1"
@@ -231,12 +231,7 @@ def _run(directory: Path):
         lifecycle=OrganismLifecycle.ACTIVE,
     )
     contracts = {
-        ("organism", str(ORGANISM_ID)): _Contract(
-            str(ORGANISM_ID), {
-                "organism-transition-v2": lambda data: _valid_transition_checkpoint(data, str(ORGANISM_ID)),
-                ORGANISM_ACTION_CHECKPOINT_SCHEMA: lambda data: _valid_organism_checkpoint(data, str(ORGANISM_ID)),
-            },
-        ),
+        ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(),
         ("embodiment", BODY_ID): _Contract(
             BODY_ID, {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
         ),
@@ -351,54 +346,6 @@ def _run(directory: Path):
     return result, plane
 
 
-def _valid_organism_checkpoint(data: bytes, identity: str) -> bool:
-    try:
-        import base64
-        import json
-
-        payload = json.loads(data)
-        expected_fields = {
-            "schema", "organism_id", "generation", "world_id",
-            "source_causal_tick", "target_causal_tick", "physical_step_id",
-            "commit_id", "transition_state_base64", "engine", "action_domain",
-        }
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != expected_fields
-            or payload["schema"] != "biopeia-organism-exploration-checkpoint-v3"
-            or payload["organism_id"] != identity
-            or type(payload["generation"]) is not int
-            or payload["generation"] < 1
-            or type(payload["source_causal_tick"]) is not int
-            or type(payload["target_causal_tick"]) is not int
-            or payload["target_causal_tick"] != payload["source_causal_tick"] + 1
-            or not isinstance(payload["world_id"], str)
-            or not isinstance(payload["physical_step_id"], str)
-            or not isinstance(payload["commit_id"], str)
-            or not isinstance(payload["engine"], dict)
-            or not isinstance(payload["action_domain"], dict)
-        ):
-            return False
-        transition_bytes = base64.b64decode(payload["transition_state_base64"], validate=True)
-        state = OrganismTransitionState.from_bytes(transition_bytes)
-    except (TypeError, ValueError, KeyError, UnicodeDecodeError):
-        return False
-    return (
-        str(state.identity) == identity
-        and state.world_correlation is not None
-        and state.world_correlation.world_id == payload["world_id"]
-        and state.world_correlation.causal_tick == payload["source_causal_tick"]
-    )
-
-
-def _valid_transition_checkpoint(data: bytes, identity: str) -> bool:
-    try:
-        state = OrganismTransitionState.from_bytes(data)
-    except (TypeError, ValueError):
-        return False
-    return str(state.identity) == identity
-
-
 def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology) -> bool:
     try:
         ArticulatedEmbodimentPhysicalState.restore_checkpoint(data, active_morphology=morphology)
@@ -427,6 +374,21 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
         }
         assert result.physical_outcome.body_state.joints[0].position_rad != 0.0
         assert len(result.committed_cut.owner_checkpoint_references) == 4
+        organism_references = tuple(
+            reference
+            for reference in result.committed_cut.owner_checkpoint_references
+            if reference.owner == "organism" and reference.owner_identity == str(ORGANISM_ID)
+        )
+        assert len(organism_references) == 1
+        organism_reference = organism_references[0]
+        assert organism_reference.schema_version == ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA
+        # Owner-side payload validation is not proof of restored-state equivalence
+        # or binding to this exact committed World cut.
+        assert OrganismCheckpointContract().validate_checkpoint(
+            Path(organism_reference.locator).read_bytes(),
+            organism_reference.owner_identity,
+            organism_reference.schema_version,
+        )
         assert len(result.observation_publication.delivery_sequences) == 2
         messages = plane.current_messages()
         assert len(messages) == 2
