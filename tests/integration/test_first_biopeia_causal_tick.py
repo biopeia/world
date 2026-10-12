@@ -24,6 +24,7 @@ from embodiment.physics3d.actuator_binding import (
 from embodiment.physics3d.actuation_projection import project_motor_command
 from observation.projection import runtime_tick_events
 from organism.actuation import (
+    ActionSource,
     ActionCommitment,
     ActuatorSurface,
     MotorIntent,
@@ -189,12 +190,14 @@ def _run_three_ticks() -> tuple[OrganismIdentity, tuple[TickSnapshot, ...]]:
     commitment = ActionCommitment(
         commitment_id="commitment.integration.forward",
         proposal_id="proposal.integration.forward",
-        effect_target_id="effect.forward",
-        competence_id="competence.forward",
+        effect_target_id=None,
+        competence_id=None,
         started_tick=1,
         controller_id="controller.integration",
         surface_fingerprint=actuator_surface.contract_fingerprint,
+        proposal_source=ActionSource.EXPLORATION,
         embodiment_id="integration-episode",
+        maximum_duration=10,
     )
     controller = SequenceController(
         "controller.integration",

@@ -622,7 +622,11 @@ def _run_valid_step(
         )
         assert command.commitment_id == commitment.commitment_id
         assert command.competence_id == decision.competence_id
-        delivered_actuations = action_domain.execute(command, actuator_surface)
+        delivered_actuations = action_domain.execute(
+            command,
+            actuator_surface,
+            tick=context.target_causal_tick,
+        )
         assert tuple(
             (item.actuator_id, item.delivered) for item in delivered_actuations
         ) == command.channels
