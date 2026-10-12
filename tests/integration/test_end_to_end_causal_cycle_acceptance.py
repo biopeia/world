@@ -8,12 +8,14 @@ shortcut.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import mujoco
@@ -60,6 +62,7 @@ from organism.actuation import (
     OrganismExplorationComposer,
 )
 from organism.cognition import CognitiveRuntimeCheckpoint, SenseChannelBinding
+from organism.checkpoint import OrganismCheckpoint
 from organism.cognition.graph import CognitiveGraph, PlasticNode
 from organism.cognition.limits import KernelLimits
 from organism.cognition.transition import CognitiveTransitionState
@@ -171,6 +174,7 @@ def _run(
     *,
     stop_after_first: bool = False,
     continue_from_live_state: bool = False,
+    malformed_organism_checkpoint: bool = False,
 ):
     frame = _frame()
     spec = _spec()
@@ -266,6 +270,49 @@ def _run(
     manifest_store = WorldCausalManifestStore(directory / "manifest.json")
     journal_store = DurableJournalSnapshotStore(directory / "journal", WorldId(WORLD_ID))
     owner_checkpoint_store = FileOwnerCheckpointStore(owner_dir / "committed")
+    if malformed_organism_checkpoint:
+        # Deliberately construct an adversarial committed fixture: keep the
+        # World reference digest and Organism envelope integrity valid while
+        # making the private cognitive payload semantically invalid. The
+        # lenient validator is used only to seed this negative fixture; restore
+        # below always uses the real owner contract.
+        strict_organism_contract = contracts[("organism", str(ORGANISM_ID))]
+        class _FixtureOrganismContract:
+            def validate_checkpoint(self, encoded, owner_identity, schema_version):
+                if strict_organism_contract.validate_checkpoint(
+                    encoded, owner_identity, schema_version
+                ):
+                    return True
+                if schema_version != ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA:
+                    return False
+                try:
+                    envelope = json.loads(encoded)
+                    transition = OrganismTransitionState.from_bytes(
+                        base64.b64decode(
+                            envelope["transition_state_base64"], validate=True
+                        )
+                    )
+                    return (
+                        envelope["organism_id"] == owner_identity
+                        and str(transition.identity) == owner_identity
+                        and OrganismCheckpoint.from_bytes(
+                            transition.owner_checkpoint.to_bytes()
+                        )
+                        == transition.owner_checkpoint
+                    )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    return False
+
+            def verify_restoration(self, reference):
+                try:
+                    encoded = Path(reference.locator).read_bytes()
+                except OSError:
+                    return False
+                return self.validate_checkpoint(
+                    encoded, reference.owner_identity, reference.schema_version
+                )
+
+        contracts[("organism", str(ORGANISM_ID))] = _FixtureOrganismContract()
     world = DurableWorldRuntime.initialize(
         WorldGenesisSpec(
             world_id=WorldId(WORLD_ID),
@@ -299,6 +346,28 @@ def _run(
     # not declared mutually exclusive to Organism, so a complete command may
     # include both without World synthesizing an omitted channel.
     composer = OrganismExplorationComposer(organism_id=str(ORGANISM_ID), engine=engine)
+    if malformed_organism_checkpoint:
+        original_checkpoint_for_candidate = composer.checkpoint_for_candidate
+
+        def checkpoint_with_invalid_private_payload(*args, **kwargs):
+            encoded = original_checkpoint_for_candidate(*args, **kwargs)
+            document = json.loads(encoded)
+            transition_bytes = base64.b64decode(
+                document["transition_state_base64"], validate=True
+            )
+            transition = OrganismTransitionState.from_bytes(transition_bytes)
+            invalid_private_state = OrganismCheckpoint(
+                identity=transition.identity,
+                private_state=b"not-a-valid-cognitive-runtime-checkpoint",
+                dependencies=transition.owner_checkpoint.dependencies,
+            )
+            invalid_transition = replace(transition, owner_checkpoint=invalid_private_state)
+            document["transition_state_base64"] = base64.b64encode(
+                invalid_transition.to_bytes()
+            ).decode("ascii")
+            return json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        composer.checkpoint_for_candidate = checkpoint_with_invalid_private_payload
     receptor = EmbodimentReceptor(
         receptor_id=RECEPTOR_ID, body_id=BODY_ID,
         embodiment_episode_id=EPISODE_ID, morphology_revision=MORPHOLOGY_REVISION,
@@ -669,6 +738,51 @@ def test_fresh_process_restore_rejects_corrupt_committed_owner_state(tmp_path: P
     committed_after_restore = manifest_store.read()
     assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
     assert committed_after_restore.commit_id == committed_before_restore.commit_id
+
+
+def test_restore_rejects_digest_valid_semantically_malformed_organism_checkpoint(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "malformed-organism-owner"
+    persisted, _, no_resume, _ = _run(
+        directory,
+        stop_after_first=True,
+        malformed_organism_checkpoint=True,
+    )
+    assert no_resume is None
+    organism_reference = next(
+        reference
+        for reference in persisted.committed_cut.owner_checkpoint_references
+        if reference.owner == "organism"
+    )
+    encoded = Path(organism_reference.locator).read_bytes()
+    assert hashlib.sha256(encoded).hexdigest() == organism_reference.sha256
+    envelope = json.loads(encoded)
+    transition = OrganismTransitionState.from_bytes(
+        base64.b64decode(envelope["transition_state_base64"], validate=True)
+    )
+    # The nested owner envelope is itself digest-valid, while its private
+    # cognitive bytes fail the Organism semantic decoder.
+    assert OrganismCheckpoint.from_bytes(
+        transition.owner_checkpoint.to_bytes()
+    ) == transition.owner_checkpoint
+    with pytest.raises(ValueError):
+        CognitiveRuntimeCheckpoint.from_bytes(
+            transition.owner_checkpoint.private_state,
+            kernel_limits=KernelLimits(),
+        )
+
+    manifest_store = WorldCausalManifestStore(directory / "manifest.json")
+    committed_before_restore = manifest_store.read()
+    assert committed_before_restore.causal_tick == persisted.committed_cut.causal_tick == 1
+
+    with pytest.raises(ManifestError):
+        _restore_runtime_from_directory(directory)
+
+    committed_after_restore = manifest_store.read()
+    assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
+    assert committed_after_restore.commit_id == committed_before_restore.commit_id
+    assert committed_after_restore.checkpoint_references == committed_before_restore.checkpoint_references
 
 
 @pytest.mark.parametrize(
