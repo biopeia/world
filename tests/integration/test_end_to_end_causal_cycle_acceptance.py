@@ -175,6 +175,7 @@ def _run(
     stop_after_first: bool = False,
     continue_from_live_state: bool = False,
     malformed_organism_checkpoint: bool = False,
+    kernel_limits: KernelLimits = KernelLimits(),
 ):
     frame = _frame()
     spec = _spec()
@@ -235,7 +236,7 @@ def _run(
         graph=CognitiveGraph(
             nodes=(PlasticNode("opaque.scalar.signal", NodeKind.SENSE),),
             edges=(),
-            kernel_limits=KernelLimits(),
+            kernel_limits=kernel_limits,
         ),
     )
     organism = OrganismTransitionState(
@@ -245,7 +246,9 @@ def _run(
         lifecycle=OrganismLifecycle.ACTIVE,
     )
     contracts = {
-        ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(),
+        ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(
+            kernel_limits=kernel_limits
+        ),
         ("embodiment", BODY_ID): _Contract(
             BODY_ID, {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
         ),
@@ -415,7 +418,7 @@ def _run(
         sampling_frame=frame,
         transduction=DimensionlessScalarFieldIdentityV1(),
         sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
-        kernel_limits=KernelLimits(),
+        kernel_limits=kernel_limits,
         actuator_context=actuator_context,
         actuator_surface=surface,
         articulated_body=body,
@@ -469,6 +472,7 @@ def _run(
             expected_environment_revision=ENVIRONMENT_REVISION,
             expected_field_id=RESOURCE_ID,
             expected_field_revision=FIELD_REVISION,
+            kernel_limits=kernel_limits,
         )
         next_world = restored_runtime.world
         next_organism = restored_runtime.organism.transition_state
@@ -503,7 +507,7 @@ def _run(
         sampling_frame=frame,
         transduction=DimensionlessScalarFieldIdentityV1(),
         sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
-        kernel_limits=KernelLimits(),
+        kernel_limits=kernel_limits,
         actuator_context=actuator_context,
         actuator_surface=surface,
         articulated_body=next_body,
@@ -521,6 +525,7 @@ def _restore_runtime_from_directory(
     directory: Path,
     *,
     expected_field_revision: str = FIELD_REVISION,
+    kernel_limits: KernelLimits | None = KernelLimits(),
 ):
     morphology = ActiveArticulatedMorphology.from_spec(
         body_id=BODY_ID,
@@ -529,7 +534,9 @@ def _restore_runtime_from_directory(
         spec=_spec(),
     )
     contracts = {
-        ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(),
+        ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(
+            kernel_limits=kernel_limits or KernelLimits()
+        ),
         ("embodiment", BODY_ID): _Contract(
             BODY_ID,
             {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
@@ -574,6 +581,7 @@ def _restore_runtime_from_directory(
         expected_environment_revision=ENVIRONMENT_REVISION,
         expected_field_id=RESOURCE_ID,
         expected_field_revision=expected_field_revision,
+        kernel_limits=kernel_limits,
     )
     return restored, morphology
 
@@ -714,6 +722,44 @@ def test_committed_cycle_restores_and_continues_in_fresh_process(tmp_path: Path)
     assert fresh_process_result["cycle"] == uninterrupted_summary
     assert fresh_process_result["cycle"]["causal_tick"] == 2
     assert fresh_process_result["cycle"]["commit_id"] == "commit.acceptance.sensorimotor.tick-2"
+
+
+def test_non_default_kernel_limits_restore_and_continue_fail_closed(tmp_path: Path) -> None:
+    configured_limits = replace(KernelLimits(), consolidation_interval_ticks=31)
+    uninterrupted, _, uninterrupted_next, uninterrupted_messages = _run(
+        tmp_path / "non-default-uninterrupted",
+        continue_from_live_state=True,
+        kernel_limits=configured_limits,
+    )
+    persisted, _, resumed, resumed_messages = _run(
+        tmp_path / "non-default-restored",
+        kernel_limits=configured_limits,
+    )
+
+    assert resumed is not None
+    assert uninterrupted_next is not None
+    assert uninterrupted.committed_cut.causal_tick == persisted.committed_cut.causal_tick == 1
+    assert _summary(resumed, resumed_messages) == _summary(
+        uninterrupted_next, uninterrupted_messages
+    )
+
+    directory = tmp_path / "non-default-rejected-restore"
+    first, _, no_resume, _ = _run(
+        directory,
+        stop_after_first=True,
+        kernel_limits=configured_limits,
+    )
+    assert no_resume is None
+    manifest_store = WorldCausalManifestStore(directory / "manifest.json")
+    committed_before_restore = manifest_store.read()
+    assert committed_before_restore.causal_tick == first.committed_cut.causal_tick == 1
+
+    for supplied_limits in (None, replace(configured_limits, consolidation_interval_ticks=32)):
+        with pytest.raises(ManifestError):
+            _restore_runtime_from_directory(directory, kernel_limits=supplied_limits)
+        committed_after_restore = manifest_store.read()
+        assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
+        assert committed_after_restore.commit_id == committed_before_restore.commit_id
 
 
 def test_fresh_process_restore_rejects_corrupt_committed_owner_state(tmp_path: Path) -> None:
