@@ -253,6 +253,9 @@ def _run(directory: Path):
         _reference(owner_dir, "environment", ENVIRONMENT_OWNER_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA, 0, env_owner.checkpoint_bytes()),
         _reference(owner_dir, "environment", RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA, 0, field.checkpoint_bytes()),
     )
+    manifest_store = WorldCausalManifestStore(directory / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(directory / "journal", WorldId(WORLD_ID))
+    owner_checkpoint_store = FileOwnerCheckpointStore(owner_dir / "committed")
     world = DurableWorldRuntime.initialize(
         WorldGenesisSpec(
             world_id=WorldId(WORLD_ID),
@@ -263,8 +266,8 @@ def _run(directory: Path):
             presence_owner_links=(PresenceOwnerLink(PresenceId(PRESENCE_ID), "organism", str(ORGANISM_ID)),),
         ),
         PRESENCE_ID,
-        WorldCausalManifestStore(directory / "manifest.json"),
-        DurableJournalSnapshotStore(directory / "journal", WorldId(WORLD_ID)),
+        manifest_store,
+        journal_store,
         owner_checkpoint_verifier=lambda refs: all(
             contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
                 Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
@@ -341,9 +344,88 @@ def _run(directory: Path):
         differential_binding=motor_binding,
         torque_binding=torque_binding,
         environment_owner=env_owner,
-        owner_checkpoint_store=FileOwnerCheckpointStore(owner_dir / "committed"),
+        owner_checkpoint_store=owner_checkpoint_store,
     )
-    return result, plane
+
+    restored: dict[tuple[str, str], object] = {}
+
+    def restore_owners(references: tuple[CheckpointReference, ...]) -> None:
+        for reference in references:
+            encoded = Path(reference.locator).read_bytes()
+            key = (reference.owner, reference.owner_identity)
+            if reference.owner == "organism":
+                restored[key] = OrganismExplorationComposer.restore_from_committed_checkpoint(
+                    encoded,
+                    committed_cut=result.committed_cut,
+                    expected_organism_id=str(ORGANISM_ID),
+                    expected_physical_step_id=result.context.physical_step_id,
+                )
+            elif reference.owner == "embodiment":
+                restored[key] = ArticulatedEmbodimentPhysicalState.restore_checkpoint(
+                    encoded, active_morphology=morphology
+                )
+            elif reference.owner == "environment" and reference.owner_identity == ENVIRONMENT_OWNER_ID:
+                restored[key] = StaticEnvironmentOwner.from_checkpoint_bytes(encoded)
+            elif reference.owner == "environment" and reference.owner_identity == RESOURCE_ID:
+                restored[key] = IdentifiedFiniteScalarField.from_checkpoint_bytes(encoded)
+            else:
+                raise AssertionError(f"unexpected committed owner reference: {key}")
+
+    restored_world = DurableWorldRuntime.restore(
+        WorldId(WORLD_ID),
+        PRESENCE_ID,
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=lambda refs: all(
+            contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+            ) for ref in refs if ref.owner != "world-journal"
+        ),
+        owner_checkpoint_contracts=contracts,
+        owner_checkpoint_restorer=restore_owners,
+    )
+    restored_organism = restored[("organism", str(ORGANISM_ID))]
+    restored_body = restored[("embodiment", BODY_ID)]
+    restored_environment = restored[("environment", ENVIRONMENT_OWNER_ID)]
+    restored_field = restored[("environment", RESOURCE_ID)]
+    assert restored_world.causal_tick == result.committed_cut.causal_tick == 1
+    assert restored_body.checkpoint_bytes() == Path(
+        next(ref.locator for ref in result.committed_cut.owner_checkpoint_references if ref.owner == "embodiment")
+    ).read_bytes()
+    # The static Environment owner records the source-state correlation used
+    # for this physical step, while the World cut advances to the target tick.
+    assert restored_environment.last_adopted_tick == result.context.source_causal_tick
+    assert restored_environment.last_accepted_correlation is not None
+    assert restored_environment.last_accepted_correlation.physical_step_id == (
+        result.context.physical_step_id
+    )
+
+    resumed = run_scalar_sensorimotor_cycle_and_publish(
+        restored_world,
+        plane,
+        commit_id="commit.acceptance.sensorimotor.tick-2",
+        physical_step_id="physical-step.acceptance.sensorimotor.tick-2",
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_configuration=solver,
+        current_organism=restored_organism.transition_state,
+        action_composer=restored_organism.action_composer,
+        receptor=receptor,
+        embodiment_state=restored_body.root,
+        environment_field=restored_field,
+        sampling_frame=frame,
+        transduction=DimensionlessScalarFieldIdentityV1(),
+        sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
+        kernel_limits=KernelLimits(),
+        actuator_context=actuator_context,
+        actuator_surface=surface,
+        articulated_body=restored_body,
+        active_morphology=morphology,
+        differential_binding=motor_binding,
+        torque_binding=torque_binding,
+        environment_owner=restored_environment,
+        owner_checkpoint_store=owner_checkpoint_store,
+    )
+    return result, resumed, plane
 
 
 def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology) -> bool:
@@ -355,8 +437,8 @@ def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology)
 
 
 def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: Path) -> None:
-    first, first_plane = _run(tmp_path / "run-a")
-    second, second_plane = _run(tmp_path / "run-b")
+    first, first_resumed, first_plane = _run(tmp_path / "run-a")
+    second, second_resumed, second_plane = _run(tmp_path / "run-b")
 
     for result, plane in ((first, first_plane), (second, second_plane)):
         assert result.context.source_causal_tick == 0
@@ -394,6 +476,13 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
         assert len(messages) == 2
         assert all(message.observation.context_time for message in messages)
 
+    for resumed in (first_resumed, second_resumed):
+        assert resumed.context.source_causal_tick == 1
+        assert resumed.context.target_causal_tick == resumed.committed_cut.causal_tick == 2
+        assert resumed.action_candidate.motor_command is not None
+        assert resumed.physical_outcome.body_state.joints[0].position_rad != 0.0
+        assert len(resumed.observation_publication.delivery_sequences) == 2
+
     assert first.committed_cut.commit_id == second.committed_cut.commit_id
     assert first.committed_cut.causal_tick == second.committed_cut.causal_tick
     assert first.sensory_input.signal.value == second.sensory_input.signal.value
@@ -403,4 +492,10 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
     )
     assert tuple(message.observation for message in first_plane.current_messages()) == tuple(
         message.observation for message in second_plane.current_messages()
+    )
+    assert first_resumed.committed_cut.commit_id == second_resumed.committed_cut.commit_id
+    assert first_resumed.committed_cut.causal_tick == second_resumed.committed_cut.causal_tick == 2
+    assert first_resumed.action_candidate.motor_command == second_resumed.action_candidate.motor_command
+    assert first_resumed.physical_outcome.body_state.joints == pytest.approx(
+        second_resumed.physical_outcome.body_state.joints
     )
