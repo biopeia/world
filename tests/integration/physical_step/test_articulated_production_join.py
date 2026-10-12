@@ -7,9 +7,8 @@ physical behavior or crash/power-loss durability.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mujoco
@@ -21,21 +20,29 @@ from embodiment.physics3d.articulated_state import (
     ArticulatedEmbodimentPhysicalState,
     JointKinematicState,
 )
+from embodiment.physics3d.differential_motor_composition import (
+    DifferentialMotorPair,
+    EmbodimentDifferentialMotorBinding,
+)
 from embodiment.physics3d.joint_torque import (
     EmbodimentJointTorqueBinding,
     JointTorqueChannelBinding,
-    JointTorqueInputChannel,
-    JointTorqueRequest,
-    project_joint_torque_command,
 )
-from embodiment.physics3d.mechanics import JointSpec, JointTopology, SegmentSpec, SurfaceMaterial
+from embodiment.physics3d.mechanics import (
+    JointSpec,
+    JointTopology,
+    SegmentSpec,
+    SurfaceMaterial,
+)
 from embodiment.physics3d.physical_transition import EmbodimentPhysicalState
 from environment import FrameDescriptor, StaticEnvironmentOwner, StaticPhysicalScene
+from organism.actuation import MotorCommand
+
+import world.adapters.articulated_mujoco as articulated_adapter
 from world.adapters.articulated_mujoco import (
     ArticulatedMujocoConfiguration,
-    advance_articulated_mujoco_step,
+    advance_articulated_mujoco_step_from_motor_command,
 )
-import world.adapters.articulated_mujoco as articulated_adapter
 from world.durable_runtime import (
     DurableJournalSnapshotStore,
     DurableWorldRuntime,
@@ -45,7 +52,6 @@ from world.durable_runtime import (
 from world.journal import CausalRecord
 from world.manifest import CheckpointReference, ManifestStatus, WorldCausalManifestStore
 from world.runtime import PresenceId, WorldId
-
 
 WORLD_ID = "world.articulated-production-join"
 PRESENCE_ID = "presence.articulated-production-join"
@@ -171,17 +177,29 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         source_surface_fingerprint=SURFACE_FINGERPRINT,
         channels=(JointTorqueChannelBinding("actuator.hinge", "joint.hinge", (0.0, 1.0, 0.0)),),
     )
-    request = JointTorqueRequest(
+    command = MotorCommand(
         command_id="command.articulated-production-1",
         commitment_id="commitment.articulated-production-1",
         controller_id="controller.fixture",
         competence_id=None,
         surface_fingerprint=SURFACE_FINGERPRINT,
-        channels=(JointTorqueInputChannel("actuator.hinge", 0.5, "joint_torque", "N*m"),),
+        channels=(("actuator.hinge.positive", 0.75), ("actuator.hinge.negative", 0.25)),
         issued_at_tick=0,
         embodiment_id=EPISODE_ID,
     )
-    torque = project_joint_torque_command(request, binding, morphology)
+    motor_binding = EmbodimentDifferentialMotorBinding(
+        binding_id="binding.motor-differential-r1",
+        body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        source_surface_fingerprint=SURFACE_FINGERPRINT,
+        pairs=(DifferentialMotorPair(
+            joint_id="joint.hinge",
+            positive_actuator_id="actuator.hinge.positive",
+            negative_actuator_id="actuator.hinge.negative",
+            scale=0.5,
+        ),),
+    )
     configuration = ArticulatedMujocoConfiguration(
         revision=SOLVER_REVISION,
         timestep_s=0.01,
@@ -267,12 +285,15 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             ),
         )
 
-    outcome = advance_articulated_mujoco_step(
+    outcome = advance_articulated_mujoco_step_from_motor_command(
         runtime,
         commit_id="commit.articulated-production-1",
         physical_step_id="physical-step.articulated-production-1",
         body_state=body,
-        torque=torque,
+        motor_command=command,
+        active_morphology=morphology,
+        differential_binding=motor_binding,
+        torque_binding=binding,
         environment_owner=environment,
         configuration=configuration,
         write_checkpoints=write_checkpoints,
@@ -284,25 +305,75 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert outcome.body_state.joints[0].position_rad != 0.0
     assert environment.last_adopted_tick == 0
 
+    stale_command = replace(
+        command,
+        command_id="command.articulated-production-stale",
+        commitment_id="commitment.articulated-production-stale",
+    )
+    with pytest.raises(ValueError, match="does not match the World source causal tick"):
+        advance_articulated_mujoco_step_from_motor_command(
+            runtime,
+            commit_id="commit.articulated-production-stale",
+            physical_step_id="physical-step.articulated-production-stale",
+            body_state=outcome.body_state,
+            motor_command=stale_command,
+            active_morphology=morphology,
+            differential_binding=motor_binding,
+            torque_binding=binding,
+            environment_owner=environment,
+            configuration=configuration,
+            write_checkpoints=write_checkpoints,
+        )
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert runtime.causal_tick == 1
+
+    stale_morphology = ActiveArticulatedMorphology.from_spec(
+        body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        spec=replace(
+            spec,
+            joint_specs=(replace(spec.joint_specs[0], max_motor_torque=1.0),),
+        ),
+    )
+    with pytest.raises(ValueError, match="active morphology content differs"):
+        advance_articulated_mujoco_step_from_motor_command(
+            runtime,
+            commit_id="commit.articulated-production-stale-morphology",
+            physical_step_id="physical-step.articulated-production-stale-morphology",
+            body_state=outcome.body_state,
+            motor_command=command,
+            active_morphology=stale_morphology,
+            differential_binding=motor_binding,
+            torque_binding=binding,
+            environment_owner=environment,
+            configuration=configuration,
+            write_checkpoints=write_checkpoints,
+        )
+    assert runtime.status is ManifestStatus.COMMITTED
+    assert runtime.causal_tick == 1
+
     def fail_solver(*args, **kwargs):
         raise RuntimeError("injected articulated solver failure")
 
     monkeypatch.setattr(articulated_adapter, "execute_articulated_mujoco_step", fail_solver)
-    next_request = replace(
-        request,
+    next_command = replace(
+        command,
         command_id="command.articulated-production-failure",
         commitment_id="commitment.articulated-production-failure",
         issued_at_tick=1,
     )
-    next_torque = project_joint_torque_command(next_request, binding, morphology)
 
     with pytest.raises(RuntimeError, match="injected articulated solver failure"):
-        advance_articulated_mujoco_step(
+        advance_articulated_mujoco_step_from_motor_command(
             runtime,
             commit_id="commit.articulated-production-failure",
             physical_step_id="physical-step.articulated-production-failure",
             body_state=outcome.body_state,
-            torque=next_torque,
+            motor_command=next_command,
+            active_morphology=morphology,
+            differential_binding=motor_binding,
+            torque_binding=binding,
             environment_owner=environment,
             configuration=configuration,
             write_checkpoints=write_checkpoints,

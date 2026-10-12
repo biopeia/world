@@ -8,34 +8,111 @@ remain the responsibility of ``run_physical_step`` and its owner ports.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 import math
 import xml.etree.ElementTree as ET
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from embodiment.physics3d.articulated_state import (
+    ActiveArticulatedMorphology,
     ArticulatedEmbodimentPhysicalState,
     JointKinematicState,
     SolverArticulatedCandidate,
 )
-from embodiment.physics3d.joint_torque import JointTorqueCandidate
+from embodiment.physics3d.differential_motor_composition import (
+    EmbodimentDifferentialMotorBinding,
+    compose_differential_motor_command,
+)
+from embodiment.physics3d.joint_torque import (
+    EmbodimentJointTorqueBinding,
+    JointTorqueCandidate,
+    project_joint_torque_command,
+)
 from embodiment.physics3d.physical_projection import (
     BodyPhysicalInput,
     project_body_physical_input,
 )
-from embodiment.physics3d.physical_transition import PhysicalStepCorrelation, SolverBodyCandidate
+from embodiment.physics3d.physical_transition import (
+    PhysicalStepCorrelation,
+    SolverBodyCandidate,
+)
 from environment.static_scene import (
     EnvironmentPhysicalProjection,
-    PhysicalStepCorrelation as EnvironmentStepCorrelation,
     StaticEnvironmentOwner,
     StaticSceneCandidate,
 )
+from environment.static_scene import (
+    PhysicalStepCorrelation as EnvironmentStepCorrelation,
+)
+from organism.actuation import MotorCommand
 
 from world.durable_runtime import DurableWorldRuntime
 from world.journal import CausalRecord
 from world.manifest import CheckpointReference
-from world.physical_step import PhysicalStepCandidate, PhysicalStepContext
-from world.physical_step import PhysicalStepPorts, run_physical_step
+from world.physical_step import (
+    PhysicalStepCandidate,
+    PhysicalStepContext,
+    PhysicalStepPorts,
+    run_physical_step,
+)
+
+
+def advance_articulated_mujoco_step_from_motor_command(
+    world: DurableWorldRuntime,
+    *,
+    commit_id: str,
+    physical_step_id: str,
+    body_state: ArticulatedEmbodimentPhysicalState,
+    motor_command: MotorCommand,
+    active_morphology: ActiveArticulatedMorphology,
+    differential_binding: EmbodimentDifferentialMotorBinding,
+    torque_binding: EmbodimentJointTorqueBinding,
+    environment_owner: StaticEnvironmentOwner,
+    configuration: ArticulatedMujocoConfiguration,
+    write_checkpoints: Callable[
+        [PhysicalStepContext, ArticulatedEmbodimentPhysicalState, StaticEnvironmentOwner],
+        Iterable[CheckpointReference],
+    ],
+) -> ArticulatedPhysicalStepOutcome:
+    """Compose a TARGET MotorCommand through Embodiment and commit one step.
+
+    This production join preserves stable actuator identity and the explicit
+    Embodiment-owned differential mapping. It does not infer units, issue a
+    command for omitted channels, or make the solver authoritative.
+    """
+    context = (
+        body_state.root.body_id,
+        body_state.root.embodiment_episode_id,
+        body_state.morphology_revision,
+    )
+    morphology_context = (
+        active_morphology.body_id,
+        active_morphology.embodiment_episode_id,
+        active_morphology.morphology_revision,
+    )
+    if context != morphology_context:
+        raise ValueError("active morphology does not match the Embodiment body state")
+    if body_state.morphology.morphology_sha256 != active_morphology.morphology_sha256:
+        raise ValueError("active morphology content differs from the Embodiment body state")
+    if motor_command.issued_at_tick != body_state.causal_tick:
+        raise ValueError("motor command does not match the World source causal tick")
+    request = compose_differential_motor_command(
+        motor_command,
+        differential_binding,
+        torque_binding,
+        active_morphology,
+    )
+    torque = project_joint_torque_command(request, torque_binding, active_morphology)
+    return advance_articulated_mujoco_step(
+        world,
+        commit_id=commit_id,
+        physical_step_id=physical_step_id,
+        body_state=body_state,
+        torque=torque,
+        environment_owner=environment_owner,
+        configuration=configuration,
+        write_checkpoints=write_checkpoints,
+    )
 
 
 @dataclass(frozen=True, slots=True)
