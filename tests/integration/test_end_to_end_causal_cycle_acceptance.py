@@ -9,6 +9,10 @@ shortcut.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -69,6 +73,7 @@ from organism.transition import (
 
 from world.adapters.articulated_mujoco import ArticulatedMujocoConfiguration
 from world.causal_cycle import (
+    restore_scalar_sensorimotor_runtime,
     run_scalar_sensorimotor_cycle_and_publish,
 )
 from world.durable_runtime import (
@@ -77,7 +82,7 @@ from world.durable_runtime import (
     PresenceOwnerLink,
     WorldGenesisSpec,
 )
-from world.manifest import CheckpointReference, WorldCausalManifestStore
+from world.manifest import CheckpointReference, ManifestError, WorldCausalManifestStore
 from world.owner_checkpoint_store import FileOwnerCheckpointStore
 from world.runtime import PresenceId, WorldId
 
@@ -161,7 +166,12 @@ def _reference(directory: Path, owner: str, identity: str, schema: str, tick: in
     )
 
 
-def _run(directory: Path):
+def _run(
+    directory: Path,
+    *,
+    stop_after_first: bool = False,
+    continue_from_live_state: bool = False,
+):
     frame = _frame()
     spec = _spec()
     morphology = ActiveArticulatedMorphology.from_spec(
@@ -347,87 +357,305 @@ def _run(directory: Path):
         owner_checkpoint_store=owner_checkpoint_store,
     )
     first_messages = plane.current_messages()
+    if stop_after_first:
+        return result, first_messages, None, None
 
-    restored: dict[tuple[str, str], object] = {}
-
-    def restore_owners(references: tuple[CheckpointReference, ...]) -> None:
-        for reference in references:
-            encoded = Path(reference.locator).read_bytes()
-            key = (reference.owner, reference.owner_identity)
-            if reference.owner == "organism":
-                restored[key] = OrganismExplorationComposer.restore_from_committed_checkpoint(
-                    encoded,
-                    committed_cut=result.committed_cut,
-                    expected_organism_id=str(ORGANISM_ID),
-                    expected_physical_step_id=result.context.physical_step_id,
-                )
-            elif reference.owner == "embodiment":
-                restored[key] = ArticulatedEmbodimentPhysicalState.restore_checkpoint(
-                    encoded, active_morphology=morphology
-                )
-            elif reference.owner == "environment" and reference.owner_identity == ENVIRONMENT_OWNER_ID:
-                restored[key] = StaticEnvironmentOwner.from_checkpoint_bytes(encoded)
-            elif reference.owner == "environment" and reference.owner_identity == RESOURCE_ID:
-                restored[key] = IdentifiedFiniteScalarField.from_checkpoint_bytes(encoded)
-            else:
-                raise AssertionError(f"unexpected committed owner reference: {key}")
-
-    restored_world = DurableWorldRuntime.restore(
-        WorldId(WORLD_ID),
-        PRESENCE_ID,
-        manifest_store,
-        journal_store,
-        owner_checkpoint_verifier=lambda refs: all(
-            contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
-                Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
-            ) for ref in refs if ref.owner != "world-journal"
-        ),
-        owner_checkpoint_contracts=contracts,
-        owner_checkpoint_restorer=restore_owners,
-    )
-    restored_organism = restored[("organism", str(ORGANISM_ID))]
-    restored_body = restored[("embodiment", BODY_ID)]
-    restored_environment = restored[("environment", ENVIRONMENT_OWNER_ID)]
-    restored_field = restored[("environment", RESOURCE_ID)]
-    assert restored_world.causal_tick == result.committed_cut.causal_tick == 1
-    assert restored_body.checkpoint_bytes() == Path(
-        next(ref.locator for ref in result.committed_cut.owner_checkpoint_references if ref.owner == "embodiment")
-    ).read_bytes()
-    # The static Environment owner records the source-state correlation used
-    # for this physical step, while the World cut advances to the target tick.
-    assert restored_environment.last_adopted_tick == result.context.source_causal_tick
-    assert restored_environment.last_accepted_correlation is not None
-    assert restored_environment.last_accepted_correlation.physical_step_id == (
-        result.context.physical_step_id
-    )
+    if continue_from_live_state:
+        # This is the independent uninterrupted control: retain the original
+        # in-memory World, Organism composer, Embodiment result and Environment
+        # owner after the first accepted commit. Do not restore from a checkpoint.
+        next_world = world
+        next_organism = result.sensory_input.state
+        next_composer = composer
+        next_body = result.physical_outcome.body_state
+        next_environment = env_owner
+        next_field = field
+        assert next_world.causal_tick == result.committed_cut.causal_tick == 1
+        assert next_body.checkpoint_bytes() == Path(
+            next(
+                ref.locator
+                for ref in result.committed_cut.owner_checkpoint_references
+                if ref.owner == "embodiment"
+            )
+        ).read_bytes()
+        assert next_environment.last_adopted_tick == result.context.source_causal_tick
+        assert next_environment.last_accepted_correlation is not None
+        assert next_environment.last_accepted_correlation.physical_step_id == (
+            result.context.physical_step_id
+        )
+    else:
+        restored_runtime = restore_scalar_sensorimotor_runtime(
+            WorldId(WORLD_ID), PRESENCE_ID, manifest_store, journal_store,
+            owner_checkpoint_verifier=lambda refs: all(
+                contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                    Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+                ) for ref in refs if ref.owner != "world-journal"
+            ),
+            owner_checkpoint_contracts=contracts,
+            active_morphology=morphology,
+            expected_organism_id=str(ORGANISM_ID),
+            expected_physical_step_id=result.context.physical_step_id,
+            expected_environment_owner_id=ENVIRONMENT_OWNER_ID,
+            expected_environment_id=ENVIRONMENT_ID,
+            expected_environment_revision=ENVIRONMENT_REVISION,
+            expected_field_id=RESOURCE_ID,
+            expected_field_revision=FIELD_REVISION,
+        )
+        next_world = restored_runtime.world
+        next_organism = restored_runtime.organism.transition_state
+        next_composer = restored_runtime.organism.action_composer
+        next_body = restored_runtime.articulated_body
+        next_environment = restored_runtime.environment_owner
+        next_field = restored_runtime.environment_field
+        assert next_world.causal_tick == result.committed_cut.causal_tick == 1
+        assert next_body.checkpoint_bytes() == Path(
+            next(ref.locator for ref in result.committed_cut.owner_checkpoint_references if ref.owner == "embodiment")
+        ).read_bytes()
+        # The static Environment owner records the source-state correlation used
+        # for this physical step, while the World cut advances to the target tick.
+        assert next_environment.last_adopted_tick == result.context.source_causal_tick
+        assert next_environment.last_accepted_correlation is not None
+        assert next_environment.last_accepted_correlation.physical_step_id == (
+            result.context.physical_step_id
+        )
 
     resumed = run_scalar_sensorimotor_cycle_and_publish(
-        restored_world,
+        next_world,
         plane,
         commit_id="commit.acceptance.sensorimotor.tick-2",
         physical_step_id="physical-step.acceptance.sensorimotor.tick-2",
         environment_revision=ENVIRONMENT_REVISION,
         solver_configuration=solver,
-        current_organism=restored_organism.transition_state,
-        action_composer=restored_organism.action_composer,
+        current_organism=next_organism,
+        action_composer=next_composer,
         receptor=receptor,
-        embodiment_state=restored_body.root,
-        environment_field=restored_field,
+        embodiment_state=next_body.root,
+        environment_field=next_field,
         sampling_frame=frame,
         transduction=DimensionlessScalarFieldIdentityV1(),
         sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
         kernel_limits=KernelLimits(),
         actuator_context=actuator_context,
         actuator_surface=surface,
-        articulated_body=restored_body,
+        articulated_body=next_body,
         active_morphology=morphology,
         differential_binding=motor_binding,
         torque_binding=torque_binding,
-        environment_owner=restored_environment,
+        environment_owner=next_environment,
         owner_checkpoint_store=owner_checkpoint_store,
     )
     resumed_messages = plane.current_messages()
     return result, first_messages, resumed, resumed_messages
+
+
+def _restore_runtime_from_directory(directory: Path):
+    morphology = ActiveArticulatedMorphology.from_spec(
+        body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        spec=_spec(),
+    )
+    contracts = {
+        ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(),
+        ("embodiment", BODY_ID): _Contract(
+            BODY_ID,
+            {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
+        ),
+        ("environment", ENVIRONMENT_OWNER_ID): _Contract(
+            ENVIRONMENT_OWNER_ID,
+            {StaticEnvironmentOwner.CHECKPOINT_SCHEMA: lambda data: StaticEnvironmentOwner.validate_checkpoint(
+                data, ENVIRONMENT_OWNER_ID, StaticEnvironmentOwner.CHECKPOINT_SCHEMA
+            )},
+        ),
+        ("environment", RESOURCE_ID): _Contract(
+            RESOURCE_ID,
+            {IdentifiedFiniteScalarField.OWNER_SCHEMA: lambda data: IdentifiedFiniteScalarField.validate_checkpoint(
+                data, RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA
+            )},
+        ),
+    }
+    manifest_store = WorldCausalManifestStore(directory / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(directory / "journal", WorldId(WORLD_ID))
+    restored = restore_scalar_sensorimotor_runtime(
+        WorldId(WORLD_ID), PRESENCE_ID, manifest_store, journal_store,
+        owner_checkpoint_verifier=lambda refs: all(
+            contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+            ) for ref in refs if ref.owner != "world-journal"
+        ),
+        owner_checkpoint_contracts=contracts,
+        active_morphology=morphology,
+        expected_organism_id=str(ORGANISM_ID),
+        expected_physical_step_id="physical-step.acceptance.sensorimotor.tick-1",
+        expected_environment_owner_id=ENVIRONMENT_OWNER_ID,
+        expected_environment_id=ENVIRONMENT_ID,
+        expected_environment_revision=ENVIRONMENT_REVISION,
+        expected_field_id=RESOURCE_ID,
+        expected_field_revision=FIELD_REVISION,
+    )
+    return restored, morphology
+
+
+def _resume_in_fresh_process(directory: Path, output_path: Path) -> None:
+    """Child-process entrypoint: restore and continue using World production APIs."""
+    frame = _frame()
+    restored, morphology = _restore_runtime_from_directory(directory)
+    surface = ActuatorSurface.from_effector_ids(
+        ("actuator.hinge.positive", "actuator.hinge.negative"),
+        fingerprint_material=SURFACE_FINGERPRINT,
+    )
+    actuator_context = ActuatorEvidenceContext(
+        BODY_ID, EPISODE_ID, MORPHOLOGY_REVISION, surface.contract_fingerprint
+    )
+    receptor = EmbodimentReceptor(
+        receptor_id=RECEPTOR_ID, body_id=BODY_ID,
+        embodiment_episode_id=EPISODE_ID, morphology_revision=MORPHOLOGY_REVISION,
+        body_frame="body.root", position_in_body_frame_m=(0.0, 0.0, 0.0),
+    )
+    motor_binding = EmbodimentDifferentialMotorBinding(
+        binding_id="binding.acceptance.differential-r1",
+        body_id=BODY_ID, embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        source_surface_fingerprint=surface.contract_fingerprint,
+        pairs=(DifferentialMotorPair(
+            joint_id="joint.hinge",
+            positive_actuator_id="actuator.hinge.positive",
+            negative_actuator_id="actuator.hinge.negative",
+            scale=0.5,
+        ),),
+    )
+    torque_binding = EmbodimentJointTorqueBinding(
+        binding_id="binding.acceptance.torque-r1",
+        body_id=BODY_ID, embodiment_episode_id=EPISODE_ID,
+        morphology_revision=MORPHOLOGY_REVISION,
+        source_surface_fingerprint=surface.contract_fingerprint,
+        channels=(JointTorqueChannelBinding("actuator.hinge", "joint.hinge", (0.0, 1.0, 0.0)),),
+    )
+    solver = ArticulatedMujocoConfiguration(
+        revision=SOLVER_REVISION, timestep_s=0.01, iterations=50,
+        tolerance=1e-10, solref=(0.02, 1.0),
+        solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
+        contact_policy="max-sliding-body-torsion-rolling/no-self-collision-v1",
+    )
+    plane = ObservationPlane()
+    cycle = run_scalar_sensorimotor_cycle_and_publish(
+        restored.world,
+        plane,
+        commit_id="commit.acceptance.sensorimotor.tick-2",
+        physical_step_id="physical-step.acceptance.sensorimotor.tick-2",
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_configuration=solver,
+        current_organism=restored.organism.transition_state,
+        action_composer=restored.organism.action_composer,
+        receptor=receptor,
+        embodiment_state=restored.articulated_body.root,
+        environment_field=restored.environment_field,
+        sampling_frame=frame,
+        transduction=DimensionlessScalarFieldIdentityV1(),
+        sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
+        kernel_limits=KernelLimits(),
+        actuator_context=actuator_context,
+        actuator_surface=surface,
+        articulated_body=restored.articulated_body,
+        active_morphology=morphology,
+        differential_binding=motor_binding,
+        torque_binding=torque_binding,
+        environment_owner=restored.environment_owner,
+        owner_checkpoint_store=FileOwnerCheckpointStore(directory / "owners" / "committed"),
+    )
+    messages = plane.current_messages()
+    output_path.write_text(
+        json.dumps(
+            {"process_id": os.getpid(), "cycle": _summary(cycle, messages)},
+            sort_keys=True,
+        )
+    )
+
+
+def _summary(cycle, messages) -> dict[str, object]:
+    command = cycle.action_candidate.motor_command
+    state = cycle.sensory_input.state
+    return {
+        "world_id": cycle.committed_cut.world_id,
+        "causal_tick": cycle.committed_cut.causal_tick,
+        "commit_id": cycle.committed_cut.commit_id,
+        "organism_id": str(state.identity),
+        "organism_step": state.organism_step,
+        "signal_value": cycle.sensory_input.signal.value,
+        "command_channels": repr(command.channels),
+        "joint_state": repr(cycle.physical_outcome.body_state.joints),
+        "owner_refs": sorted(
+            (ref.owner, ref.owner_identity, ref.schema_version, ref.sha256)
+            for ref in cycle.committed_cut.owner_checkpoint_references
+        ),
+        "observations": [repr(message.observation) for message in messages],
+    }
+
+
+def test_committed_cycle_restores_and_continues_in_fresh_process(tmp_path: Path) -> None:
+    uninterrupted, _, uninterrupted_next, uninterrupted_messages = _run(
+        tmp_path / "uninterrupted", continue_from_live_state=True
+    )
+    assert uninterrupted.committed_cut.causal_tick == 1
+    assert uninterrupted_next is not None
+
+    persisted, _, no_resume, _ = _run(
+        tmp_path / "fresh-process", stop_after_first=True
+    )
+    assert persisted.committed_cut.causal_tick == 1
+    assert no_resume is None
+
+    output_path = tmp_path / "fresh-process-result.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--resume",
+            str(tmp_path / "fresh-process"),
+            str(output_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, (
+        f"fresh-process restore failed ({completed.returncode})\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    fresh_process_result = json.loads(output_path.read_text())
+
+    uninterrupted_summary = json.loads(
+        json.dumps(_summary(uninterrupted_next, uninterrupted_messages), sort_keys=True)
+    )
+    assert fresh_process_result["process_id"] != os.getpid()
+    assert fresh_process_result["cycle"] == uninterrupted_summary
+    assert fresh_process_result["cycle"]["causal_tick"] == 2
+    assert fresh_process_result["cycle"]["commit_id"] == "commit.acceptance.sensorimotor.tick-2"
+
+
+def test_fresh_process_restore_rejects_corrupt_committed_owner_state(tmp_path: Path) -> None:
+    persisted, _, no_resume, _ = _run(
+        tmp_path / "corrupt-owner", stop_after_first=True
+    )
+    assert no_resume is None
+    organism_reference = next(
+        reference
+        for reference in persisted.committed_cut.owner_checkpoint_references
+        if reference.owner == "organism"
+    )
+    Path(organism_reference.locator).write_bytes(b"corrupt owner checkpoint")
+
+    manifest_store = WorldCausalManifestStore(tmp_path / "corrupt-owner" / "manifest.json")
+    committed_before_restore = manifest_store.read()
+    assert committed_before_restore.causal_tick == 1
+
+    with pytest.raises(ManifestError):
+        _restore_runtime_from_directory(tmp_path / "corrupt-owner")
+
+    committed_after_restore = manifest_store.read()
+    assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
+    assert committed_after_restore.commit_id == committed_before_restore.commit_id
 
 
 def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology) -> bool:
@@ -436,6 +664,12 @@ def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology)
     except (TypeError, ValueError):
         return False
     return True
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4 or sys.argv[1] != "--resume":
+        raise SystemExit("usage: test_end_to_end_causal_cycle_acceptance.py --resume DIR OUTPUT")
+    _resume_in_fresh_process(Path(sys.argv[2]), Path(sys.argv[3]))
 
 
 def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: Path) -> None:
