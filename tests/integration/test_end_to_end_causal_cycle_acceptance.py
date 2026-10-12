@@ -448,7 +448,11 @@ def _run(
     return result, first_messages, resumed, resumed_messages
 
 
-def _restore_runtime_from_directory(directory: Path):
+def _restore_runtime_from_directory(
+    directory: Path,
+    *,
+    expected_field_revision: str = FIELD_REVISION,
+):
     morphology = ActiveArticulatedMorphology.from_spec(
         body_id=BODY_ID,
         embodiment_episode_id=EPISODE_ID,
@@ -476,13 +480,22 @@ def _restore_runtime_from_directory(directory: Path):
     }
     manifest_store = WorldCausalManifestStore(directory / "manifest.json")
     journal_store = DurableJournalSnapshotStore(directory / "journal", WorldId(WORLD_ID))
+
+    def verify_owner_checkpoints(refs: tuple[CheckpointReference, ...]) -> bool:
+        try:
+            return all(
+                contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                    Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+                )
+                for ref in refs
+                if ref.owner != "world-journal"
+            )
+        except OSError:
+            return False
+
     restored = restore_scalar_sensorimotor_runtime(
         WorldId(WORLD_ID), PRESENCE_ID, manifest_store, journal_store,
-        owner_checkpoint_verifier=lambda refs: all(
-            contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
-                Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
-            ) for ref in refs if ref.owner != "world-journal"
-        ),
+        owner_checkpoint_verifier=verify_owner_checkpoints,
         owner_checkpoint_contracts=contracts,
         active_morphology=morphology,
         expected_organism_id=str(ORGANISM_ID),
@@ -491,7 +504,7 @@ def _restore_runtime_from_directory(directory: Path):
         expected_environment_id=ENVIRONMENT_ID,
         expected_environment_revision=ENVIRONMENT_REVISION,
         expected_field_id=RESOURCE_ID,
-        expected_field_revision=FIELD_REVISION,
+        expected_field_revision=expected_field_revision,
     )
     return restored, morphology
 
@@ -652,6 +665,54 @@ def test_fresh_process_restore_rejects_corrupt_committed_owner_state(tmp_path: P
 
     with pytest.raises(ManifestError):
         _restore_runtime_from_directory(tmp_path / "corrupt-owner")
+
+    committed_after_restore = manifest_store.read()
+    assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
+    assert committed_after_restore.commit_id == committed_before_restore.commit_id
+
+
+def test_fresh_process_restore_rejects_missing_committed_owner_checkpoint(tmp_path: Path) -> None:
+    persisted, _, no_resume, _ = _run(
+        tmp_path / "missing-owner", stop_after_first=True
+    )
+    assert no_resume is None
+    embodiment_reference = next(
+        reference
+        for reference in persisted.committed_cut.owner_checkpoint_references
+        if reference.owner == "embodiment"
+    )
+    Path(embodiment_reference.locator).unlink()
+
+    manifest_store = WorldCausalManifestStore(tmp_path / "missing-owner" / "manifest.json")
+    committed_before_restore = manifest_store.read()
+    assert committed_before_restore.causal_tick == 1
+
+    with pytest.raises(ManifestError):
+        _restore_runtime_from_directory(tmp_path / "missing-owner")
+
+    committed_after_restore = manifest_store.read()
+    assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
+    assert committed_after_restore.commit_id == committed_before_restore.commit_id
+
+
+def test_fresh_process_restore_rejects_stale_owner_revision_without_publishing_cut(
+    tmp_path: Path,
+) -> None:
+    persisted, _, no_resume, _ = _run(
+        tmp_path / "stale-owner-revision", stop_after_first=True
+    )
+    assert no_resume is None
+    manifest_store = WorldCausalManifestStore(
+        tmp_path / "stale-owner-revision" / "manifest.json"
+    )
+    committed_before_restore = manifest_store.read()
+    assert committed_before_restore.causal_tick == persisted.committed_cut.causal_tick == 1
+
+    with pytest.raises(ManifestError, match="scalar field identity or revision"):
+        _restore_runtime_from_directory(
+            tmp_path / "stale-owner-revision",
+            expected_field_revision="field.acceptance.stale-r0",
+        )
 
     committed_after_restore = manifest_store.read()
     assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
