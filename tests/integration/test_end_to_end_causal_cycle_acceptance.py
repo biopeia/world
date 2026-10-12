@@ -469,6 +469,8 @@ def _run(
             expected_environment_revision=ENVIRONMENT_REVISION,
             expected_field_id=RESOURCE_ID,
             expected_field_revision=FIELD_REVISION,
+            actuator_context=actuator_context,
+            actuator_surface=surface,
         )
         next_world = restored_runtime.world
         next_organism = restored_runtime.organism.transition_state
@@ -521,12 +523,20 @@ def _restore_runtime_from_directory(
     directory: Path,
     *,
     expected_field_revision: str = FIELD_REVISION,
+    actuator_context: ActuatorEvidenceContext | None = None,
 ):
     morphology = ActiveArticulatedMorphology.from_spec(
         body_id=BODY_ID,
         embodiment_episode_id=EPISODE_ID,
         morphology_revision=MORPHOLOGY_REVISION,
         spec=_spec(),
+    )
+    surface = ActuatorSurface.from_effector_ids(
+        ("actuator.hinge.positive", "actuator.hinge.negative"),
+        fingerprint_material=SURFACE_FINGERPRINT,
+    )
+    current_actuator_context = actuator_context or ActuatorEvidenceContext(
+        BODY_ID, EPISODE_ID, MORPHOLOGY_REVISION, surface.contract_fingerprint
     )
     contracts = {
         ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(),
@@ -574,6 +584,8 @@ def _restore_runtime_from_directory(
         expected_environment_revision=ENVIRONMENT_REVISION,
         expected_field_id=RESOURCE_ID,
         expected_field_revision=expected_field_revision,
+        actuator_context=current_actuator_context,
+        actuator_surface=surface,
     )
     return restored, morphology
 
@@ -838,6 +850,31 @@ def test_fresh_process_restore_rejects_stale_owner_revision_without_publishing_c
     committed_after_restore = manifest_store.read()
     assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
     assert committed_after_restore.commit_id == committed_before_restore.commit_id
+
+
+def test_fresh_process_restore_rejects_stale_actuator_applicability_without_publishing_cut(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "stale-actuator-applicability"
+    persisted, _, no_resume, _ = _run(directory, stop_after_first=True)
+    assert no_resume is None
+    manifest_store = WorldCausalManifestStore(directory / "manifest.json")
+    committed_before_restore = manifest_store.read()
+    assert committed_before_restore.causal_tick == persisted.committed_cut.causal_tick == 1
+
+    stale_context = ActuatorEvidenceContext(
+        BODY_ID,
+        "episode.acceptance.stale-r0",
+        MORPHOLOGY_REVISION,
+        SURFACE_FINGERPRINT,
+    )
+    with pytest.raises(ValueError, match="active Embodiment morphology and surface"):
+        _restore_runtime_from_directory(directory, actuator_context=stale_context)
+
+    committed_after_restore = manifest_store.read()
+    assert committed_after_restore.causal_tick == committed_before_restore.causal_tick == 1
+    assert committed_after_restore.commit_id == committed_before_restore.commit_id
+    assert committed_after_restore.checkpoint_references == committed_before_restore.checkpoint_references
 
 
 def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology) -> bool:
