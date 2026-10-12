@@ -36,6 +36,8 @@ from environment import (
 from modality import DimensionlessScalarFieldIdentityV1
 from organism.actuation import (
     ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
+    ActuatorEvidenceContext,
+    ActuatorSurface,
     OrganismExplorationComposer,
     RestoredOrganismExplorationCheckpoint,
 )
@@ -159,6 +161,8 @@ def restore_scalar_sensorimotor_runtime(
     expected_environment_revision: str,
     expected_field_id: str,
     expected_field_revision: str,
+    actuator_context: ActuatorEvidenceContext,
+    actuator_surface: ActuatorSurface,
     kernel_limits: KernelLimits | None = None,
 ) -> RestoredScalarSensorimotorRuntime:
     """Restore the production causal-cycle owners from one committed World cut.
@@ -175,6 +179,17 @@ def restore_scalar_sensorimotor_runtime(
         raise TypeError("world_id must be a WorldId")
     if not isinstance(active_morphology, ActiveArticulatedMorphology):
         raise TypeError("active_morphology must be an ActiveArticulatedMorphology")
+    if not isinstance(actuator_context, ActuatorEvidenceContext):
+        raise TypeError("actuator_context must be an ActuatorEvidenceContext")
+    if not isinstance(actuator_surface, ActuatorSurface):
+        raise TypeError("actuator_surface must be an ActuatorSurface")
+    if (
+        actuator_context.body_id != active_morphology.body_id
+        or actuator_context.embodiment_episode_id != active_morphology.embodiment_episode_id
+        or actuator_context.morphology_revision != active_morphology.morphology_revision
+        or actuator_context.surface_fingerprint != actuator_surface.contract_fingerprint
+    ):
+        raise ValueError("actuator applicability must match the active Embodiment morphology and surface")
     expected_owners = {
         ("organism", expected_organism_id),
         ("embodiment", active_morphology.body_id),
@@ -226,6 +241,8 @@ def restore_scalar_sensorimotor_runtime(
             committed_cut=cut,
             expected_organism_id=expected_organism_id,
             expected_physical_step_id=expected_physical_step_id,
+            expected_actuator_context=actuator_context,
+            expected_surface=actuator_surface,
             kernel_limits=kernel_limits,
         )
     except (TypeError, ValueError) as error:
