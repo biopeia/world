@@ -1,9 +1,9 @@
 """Bounded World causal coordination primitives."""
 
 from .durable_runtime import (
+    CommittedWorldCut,
     DurableJournalSnapshotStore,
     DurableWorldRuntime,
-    CommittedWorldCut,
     OwnerCausalRecord,
     OwnerCheckpointContract,
     PresenceLifecycleTransition,
@@ -21,6 +21,15 @@ from .manifest import (
 )
 from .manifest import (
     RecoveryRequiredError as ManifestRecoveryRequiredError,
+)
+from .observation_publication import (
+    ObservationPublication,
+    OwnerObservation,
+    publish_committed_owner_observations,
+)
+from .physical_step_publication import (
+    PhysicalStepPublicationResult,
+    run_physical_step_and_publish,
 )
 from .runtime import (
     PresenceId,
@@ -41,10 +50,13 @@ __all__ = [
     "ManifestError",
     "ManifestRecoveryRequiredError",
     "ManifestStatus",
+    "ObservationPublication",
     "OwnerCausalRecord",
     "OwnerCheckpointContract",
-    "PresenceLifecycleTransition",
+    "OwnerObservation",
+    "PhysicalStepPublicationResult",
     "PresenceId",
+    "PresenceLifecycleTransition",
     "PresenceOwnerLink",
     "RecoveryRequiredError",
     "RuntimeStatus",
@@ -55,4 +67,6 @@ __all__ = [
     "WorldGenesisSpec",
     "WorldId",
     "WorldRuntime",
+    "publish_committed_owner_observations",
+    "run_physical_step_and_publish",
 ]

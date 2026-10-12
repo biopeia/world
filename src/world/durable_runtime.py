@@ -13,11 +13,12 @@ import os
 import re
 import tempfile
 import fcntl
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from threading import Lock
+from threading import Lock, get_ident
 from types import MappingProxyType
 from typing import Protocol
 
@@ -226,6 +227,30 @@ class DurableJournalSnapshotStore:
     def __init__(self, directory: str | Path, world_id: WorldId) -> None:
         self.directory = Path(directory)
         self.world_id = world_id.value
+        # A live single-writer can reuse a prefix it just verified and wrote.
+        # The cache is deliberately process-local: restore/new store instances
+        # still perform a complete hash-chain verification before extending.
+        # File metadata is only an optimization witness under the declared
+        # local-filesystem/single-writer model, not a cryptographic tamper proof.
+        self._verified_reference: CheckpointReference | None = None
+        self._verified_file_signature: tuple[int, int, int, int, int] | None = None
+
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int, int, int, int]:
+        stat = path.stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _previous_prefix_is_cached(self, reference: CheckpointReference, path: Path) -> bool:
+        if self._verified_reference != reference or self._verified_file_signature is None:
+            return False
+        try:
+            return self._file_signature(path) == self._verified_file_signature
+        except OSError:
+            return False
+
+    def _cache_verified_prefix(self, reference: CheckpointReference, path: Path) -> None:
+        self._verified_reference = reference
+        self._verified_file_signature = self._file_signature(path)
 
     @staticmethod
     def _position(reference: CheckpointReference) -> tuple[int, int, int]:
@@ -393,9 +418,16 @@ class DurableJournalSnapshotStore:
                 or previous_reference.owner_identity != self.world_id
                 or previous_reference.schema_version != _JOURNAL_SCHEMA
                 or Path(previous_reference.locator) != target
-                or not self._verify_prefix(previous_reference)
             ):
                 raise ManifestError("previous committed World journal reference is invalid")
+            # Sequential writes through this store have already validated and
+            # fsynced the exact committed prefix. Avoid rescanning the entire
+            # history on every tick, but reverify whenever this store instance
+            # is new or the backing file's identity/metadata changed.
+            if not self._previous_prefix_is_cached(previous_reference, target):
+                if not self._verify_prefix(previous_reference):
+                    raise ManifestError("previous committed World journal reference is invalid")
+                self._cache_verified_prefix(previous_reference, target)
             _, previous_sequence, previous_offset = self._position(previous_reference)
             previous_count = previous_sequence + 1
             if previous_count < 0 or previous_count > record_count:
@@ -453,7 +485,7 @@ class DurableJournalSnapshotStore:
                 os.fsync(stream.fileno())
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         offset = previous_offset + len(encoded_delta)
-        return CheckpointReference(
+        reference = CheckpointReference(
             owner=_JOURNAL_OWNER,
             owner_identity=self.world_id,
             checkpoint_id=f"journal-cut-{causal_tick}-sequence-{record_count - 1}-offset-{offset}",
@@ -461,6 +493,8 @@ class DurableJournalSnapshotStore:
             locator=str(target),
             sha256=digest,
         )
+        self._cache_verified_prefix(reference, target)
+        return reference
 
     def read(self, reference: CheckpointReference) -> EventJournal:
         try:
@@ -510,6 +544,39 @@ class DurableJournalSnapshotStore:
                 return journal
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise ManifestError("cannot read valid World journal snapshot") from exc
+
+    def _discard_uncommitted_tail(self, committed_reference: CheckpointReference) -> int:
+        """Truncate World-owned journal bytes beyond a verified committed cut.
+
+        Owner checkpoint artifacts are deliberately outside this cleanup
+        boundary. This recovery-only helper must be called under the manifest
+        writer lock after owner restoration and verification.
+        """
+        target = self.directory / "world-causal-journal-v3.jsonl"
+        if (
+            committed_reference.owner != _JOURNAL_OWNER
+            or committed_reference.owner_identity != self.world_id
+            or committed_reference.schema_version != _JOURNAL_SCHEMA
+            or Path(committed_reference.locator) != target
+            or not self._verify_prefix(committed_reference)
+        ):
+            raise ManifestError("cannot clean journal tail without a valid committed World reference")
+        _, _, committed_offset = self._position(committed_reference)
+        try:
+            with target.open("r+b") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                current_size = os.fstat(stream.fileno()).st_size
+                if current_size < committed_offset:
+                    raise ManifestError("World journal is shorter than its committed reference")
+                discarded_bytes = current_size - committed_offset
+                if discarded_bytes:
+                    stream.truncate(committed_offset)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                return discarded_bytes
+        except OSError as exc:
+            raise ManifestError("cannot discard uncommitted World journal tail") from exc
 
     @staticmethod
     def verify(reference: CheckpointReference) -> bool:
@@ -660,6 +727,8 @@ class DurableWorldRuntime:
         self._owner_checkpoint_verifier = owner_checkpoint_verifier
         self._owner_checkpoint_contracts = dict(owner_checkpoint_contracts)
         self._tick_guard = Lock()
+        self._publication_guard_thread_id: int | None = None
+        self._publication_guard_tick_used = False
         self._latched_failure: str | None = None
         self._validate_cut(manifest, journal)
 
@@ -832,7 +901,13 @@ class DurableWorldRuntime:
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("previous causal cut dependency closure changed during recovery")
 
-        recovered = manifest_store._complete_recovery(pending.pending_transition_id)
+        # Finalization and tail cleanup are serialized under the manifest
+        # writer lock. A stale concurrent recovery must not truncate journal
+        # bytes from a later committed transition.
+        recovered = manifest_store._complete_recovery(
+            pending.pending_transition_id,
+            before_publish=lambda: journal_store._discard_uncommitted_tail(journal_refs[0]),
+        )
         return cls(
             world_id,
             presence_id,
@@ -868,6 +943,29 @@ class DurableWorldRuntime:
     def manifest(self) -> WorldCausalManifest:
         return self._manifest
 
+    @contextmanager
+    def committed_cut_publication_guard(self) -> Iterator[None]:
+        """Keep a committed cut current while its post-commit publication runs.
+
+        Physical-step composition holds this scope across commit receipt
+        verification, owner projection, and Observation delivery. Reentrancy
+        permits that same thread to perform the World tick and receipt lookup,
+        but a second tick from that thread is rejected until publication leaves
+        the scope. Competing threads fail with ``TickInProgressError``.
+        """
+        if self._publication_guard_thread_id is not None:
+            raise TickInProgressError("a World causal publication is already in progress")
+        if not self._tick_guard.acquire(blocking=False):
+            raise TickInProgressError("a World causal tick is already in progress")
+        self._publication_guard_thread_id = get_ident()
+        self._publication_guard_tick_used = False
+        try:
+            yield
+        finally:
+            self._publication_guard_thread_id = None
+            self._publication_guard_tick_used = False
+            self._tick_guard.release()
+
     def committed_cut_for(
         self,
         *,
@@ -886,7 +984,8 @@ class DurableWorldRuntime:
         never opens or decodes owner checkpoint bytes. A pending/recovery state,
         stale identity, or stale owner reference fails closed.
         """
-        with self._tick_guard:
+        publication_owner = self._publication_guard_thread_id == get_ident()
+        with nullcontext() if publication_owner else self._tick_guard:
             # Unlike startup restore, a receipt lookup must not reinterpret a
             # live PREPARING transition as abandoned work. _read_for_tick rejects
             # that state without mutating the manifest.
@@ -963,7 +1062,14 @@ class DurableWorldRuntime:
         register_owner_contracts: Mapping[tuple[str, str], OwnerCheckpointContract] | None = None,
         presence_lifecycle: PresenceLifecycleTransition | None = None,
     ) -> CausalRecord:
-        if not self._tick_guard.acquire(blocking=False):
+        publication_owner = self._publication_guard_thread_id == get_ident()
+        if publication_owner:
+            if self._publication_guard_tick_used:
+                raise TickInProgressError(
+                    "a World causal publication cannot start another tick before delivery completes"
+                )
+            self._publication_guard_tick_used = True
+        elif not self._tick_guard.acquire(blocking=False):
             raise TickInProgressError("a World causal tick is already in progress")
         try:
             if self._latched_failure is not None:
@@ -1271,7 +1377,8 @@ class DurableWorldRuntime:
                     pass
                 raise
         finally:
-            self._tick_guard.release()
+            if not publication_owner:
+                self._tick_guard.release()
 
     @staticmethod
     def _verify_references(

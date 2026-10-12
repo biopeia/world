@@ -11,10 +11,13 @@ dependencies = []
 
 [project.optional-dependencies]
 mujoco = ["mujoco==3.14.0"]
-# Production World -> Organism transition invocation. This remains optional so
-# the causal runtime primitives can still be installed independently.
+# Production World orchestration across the sensor-to-Organism transition.
+# This remains optional so World causal primitives can be installed alone.
 runtime = [
-    "organism @ git+https://github.com/biopeia/organism.git@48726e7640ed3fbce15b792966f7082e3c9756ae",
+    "organism @ git+https://github.com/biopeia/organism.git@e798ba95647e8d127919c07d9eca2043cc0c0978",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@baa2d071e763cba6c1a380d50488ebf863cb3578",
+    "environment @ git+https://github.com/biopeia/environment.git@9812464ef2f2841b2984375738c8b5e8ee6da2dc",
+    "modality @ git+https://github.com/biopeia/modality.git@79b779152d4bff2ab4191dc6601c8f1640e4cae3",
 ]
 # Cross-repository integration tests only. The package itself has no runtime
 # dependency on other Biopeia repositories unless its optional runtime or
@@ -23,11 +26,11 @@ runtime = [
 integration = [
     "pytest>=8",
     "mujoco==3.14.0",
-    "organism @ git+https://github.com/biopeia/organism.git@48726e7640ed3fbce15b792966f7082e3c9756ae",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@b5714f985d0aa970d3a412a7d29e43fa0bcb89d6",
-    "environment @ git+https://github.com/biopeia/environment.git@caa885a11ec0170717bb4b71d271ab171807197e",
+    "organism @ git+https://github.com/biopeia/organism.git@e798ba95647e8d127919c07d9eca2043cc0c0978",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@baa2d071e763cba6c1a380d50488ebf863cb3578",
+    "environment @ git+https://github.com/biopeia/environment.git@9812464ef2f2841b2984375738c8b5e8ee6da2dc",
     "modality @ git+https://github.com/biopeia/modality.git@79b779152d4bff2ab4191dc6601c8f1640e4cae3",
-    "observation @ git+https://github.com/biopeia/observation.git@6aac3c76684834722440f53c9d8604ac4c16b138",
+    "observation @ git+https://github.com/biopeia/observation.git@ef6321d2bab43b883238cdcf0ce33c08321d595c",
 ]
 
 [tool.setuptools.packages.find]

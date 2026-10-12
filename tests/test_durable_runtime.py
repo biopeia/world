@@ -127,6 +127,67 @@ def test_journal_v3_appends_fixed_size_records_and_recovers_exact_prefix(tmp_pat
         store.read(reference)
 
 
+def test_sequential_appends_reuse_owned_prefix_but_new_store_revalidates(tmp_path, monkeypatch):
+    world_id = WorldId("world-journal-verified-prefix-cache")
+    journal = EventJournal()
+    store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    journal.append(CausalRecord("record-0", world_id.value, 0, "test.event", payload={"v": 0}))
+    reference = store.write(journal, causal_tick=0)
+
+    verify_prefix = DurableJournalSnapshotStore._verify_prefix
+    verified_references = []
+
+    def count_verification(candidate):
+        verified_references.append(candidate)
+        return verify_prefix(candidate)
+
+    monkeypatch.setattr(
+        DurableJournalSnapshotStore,
+        "_verify_prefix",
+        staticmethod(count_verification),
+    )
+
+    for tick in range(1, 21):
+        journal.append(
+            CausalRecord(f"record-{tick}", world_id.value, tick, "test.event", payload={"v": tick})
+        )
+        reference = store.write(journal, causal_tick=tick, previous_reference=reference)
+
+    # The store extends only the exact reference and file revision it
+    # produced itself, without rescanning the complete prefix per append.
+    assert verified_references == []
+
+    restored_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    previous_reference = reference
+    journal.append(CausalRecord("record-21", world_id.value, 21, "test.event", payload={"v": 21}))
+    reference = restored_store.write(journal, causal_tick=21, previous_reference=previous_reference)
+    assert verified_references == [previous_reference]
+
+    journal.append(CausalRecord("record-22", world_id.value, 22, "test.event", payload={"v": 22}))
+    restored_store.write(journal, causal_tick=22, previous_reference=reference)
+    assert verified_references == [previous_reference]
+
+
+def test_changed_backing_file_invalidates_cached_prefix_and_rejects_tampering(tmp_path):
+    world_id = WorldId("world-journal-cache-tamper")
+    journal = EventJournal()
+    store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    journal.append(CausalRecord("record-0", world_id.value, 0, "test.event", payload={"v": 0}))
+    reference = store.write(journal, causal_tick=0)
+    journal.append(CausalRecord("record-1", world_id.value, 1, "test.event", payload={"v": 1}))
+    reference = store.write(journal, causal_tick=1, previous_reference=reference)
+
+    journal_path = Path(reference.locator)
+    corrupted = bytearray(journal_path.read_bytes())
+    marker = corrupted.index(b'"v":0') + len(b'"v":')
+    corrupted[marker] = ord("9")
+    journal_path.write_bytes(corrupted)
+    journal.append(CausalRecord("record-2", world_id.value, 2, "test.event", payload={"v": 2}))
+
+    with pytest.raises(ManifestError, match="previous committed World journal reference is invalid"):
+        store.write(journal, causal_tick=2, previous_reference=reference)
+
+
 def test_corrupted_earlier_committed_prefix_blocks_next_causal_commit(tmp_path):
     world_id = WorldId("world-prefix-integrity-before-commit")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
@@ -1010,6 +1071,7 @@ def test_journal_append_fsync_failure_keeps_previous_committed_prefix(tmp_path, 
     committed_records = journal_store.read(previous_reference).replay()
     journal_file = Path(previous_reference.locator)
     previous_size = journal_file.stat().st_size
+    candidate_owner = tmp_path / "owner-1.json"
     original_fsync = os.fsync
     attempts = []
 
@@ -1027,7 +1089,6 @@ def test_journal_append_fsync_failure_keeps_previous_committed_prefix(tmp_path, 
 
     def write_candidate_owner(tick):
         assert tick == 1
-        candidate_owner = tmp_path / "owner-1.json"
         candidate_owner.write_bytes(b"candidate owner state at tick one")
         return (_checkpoint(candidate_owner),)
 
@@ -1042,6 +1103,14 @@ def test_journal_append_fsync_failure_keeps_previous_committed_prefix(tmp_path, 
     assert journal_file.stat().st_size > previous_size
     assert journal_store.read(previous_reference).replay() == runtime.records
 
+    # Cleanup is fail-closed: an invalid committed reference cannot authorize
+    # truncation of candidate bytes, even when a valid prior cut exists.
+    invalid_reference = replace(previous_reference, sha256="0" * 64)
+    with pytest.raises(ManifestError, match="valid committed World reference"):
+        journal_store._discard_uncommitted_tail(invalid_reference)
+    assert journal_file.stat().st_size > previous_size
+    monkeypatch.setattr(os, "fsync", original_fsync)
+
     recovered = DurableWorldRuntime.recover_previous_cut(
         world_id, "presence-a", manifest_store, journal_store,
         owner_checkpoint_verifier=_verifier, owner_checkpoint_contracts=contracts,
@@ -1050,11 +1119,12 @@ def test_journal_append_fsync_failure_keeps_previous_committed_prefix(tmp_path, 
     assert recovered.status is ManifestStatus.COMMITTED
     assert recovered.causal_tick == committed_before.causal_tick
     assert journal_store.read(previous_reference).replay() == runtime.records
+    assert journal_file.stat().st_size == previous_size
+    assert candidate_owner.read_bytes() == b"candidate owner state at tick one"
 
-    # The next successful writer truncates only the uncommitted physical tail
-    # and publishes a new committed prefix; owner checkpoint bytes remain
-    # outside World journal cleanup.
-    monkeypatch.setattr(os, "fsync", original_fsync)
+    # Cleanup is idempotent once recovery has removed the candidate journal
+    # tail, and owner checkpoint bytes remain outside World cleanup.
+    assert journal_store._discard_uncommitted_tail(previous_reference) == 0
     next_owner = tmp_path / "owner-after-recovery.json"
     next_owner.write_bytes(b"owner state after explicit recovery")
     recovered.tick("transition-after-recovery", lambda _tick: (_checkpoint(next_owner),))
@@ -1067,6 +1137,19 @@ def test_journal_append_fsync_failure_keeps_previous_committed_prefix(tmp_path, 
         record.record_type == "world.causal_tick.committed" and record.causal_tick == 1
         for record in latest_records
     ) == 1
+
+    # A delayed recovery finalizer must re-check the manifest under its writer
+    # lock before cleanup; it cannot truncate a later committed journal tail.
+    finalizer_calls = []
+    with pytest.raises(ValueError, match="recovery requires a durable pending transition"):
+        manifest_store._complete_recovery(
+            "transition-journal-append-fsync-failure",
+            before_publish=lambda: finalizer_calls.append(
+                journal_store._discard_uncommitted_tail(previous_reference)
+            ),
+        )
+    assert finalizer_calls == []
+    assert journal_store.read(latest_reference).replay() == recovered.records
 
 
 def test_process_termination_during_partial_manifest_write_keeps_previous_cut(tmp_path):
