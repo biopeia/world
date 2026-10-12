@@ -10,8 +10,10 @@ composition, not delegated to a test or launcher.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from embodiment.physics3d.articulated_state import (
@@ -32,7 +34,11 @@ from environment import (
     StaticEnvironmentOwner,
 )
 from modality import DimensionlessScalarFieldIdentityV1
-from organism.actuation import ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA
+from organism.actuation import (
+    ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
+    OrganismExplorationComposer,
+    RestoredOrganismExplorationCheckpoint,
+)
 from organism.cognition import SenseChannelBinding
 from organism.cognition.limits import KernelLimits
 from organism.transition import OrganismTransitionState
@@ -42,7 +48,14 @@ from .adapters.articulated_mujoco import (
     ArticulatedPhysicalStepOutcome,
     advance_articulated_mujoco_step_from_motor_command,
 )
-from .durable_runtime import CommittedWorldCut, DurableWorldRuntime
+from .durable_runtime import (
+    CommittedWorldCut,
+    DurableJournalSnapshotStore,
+    DurableWorldRuntime,
+    OwnerCheckpointContract,
+    OwnerCheckpointVerifier,
+    WorldCausalManifestStore,
+)
 from .manifest import CheckpointReference, ManifestError
 from .observation_publication import (
     ObservationPlaneLike,
@@ -59,6 +72,7 @@ from .owner_checkpoint_store import (
     OwnerCheckpointStore,
 )
 from .physical_step import PhysicalStepContext
+from .runtime import PresenceId, WorldId
 
 
 class _ActionCandidate(Protocol):
@@ -108,6 +122,179 @@ class CausalCycleResult:
     physical_outcome: ArticulatedPhysicalStepOutcome
     committed_cut: CommittedWorldCut
     observation_publication: ObservationPublication
+
+
+@dataclass(frozen=True, slots=True)
+class RestoredScalarSensorimotorRuntime:
+    """A fully restored, receipt-bound composition ready for another cycle.
+
+    This object is returned only after World has validated the durable cut,
+    issued its committed-cut receipt, and each semantic owner's public restore
+    API has reconstructed the referenced state. It is a bounded fixture for
+    the current production scalar sensorimotor composition, not a general
+    migration-complete Organism checkpoint.
+    """
+
+    world: DurableWorldRuntime
+    committed_cut: CommittedWorldCut
+    organism: RestoredOrganismExplorationCheckpoint
+    articulated_body: ArticulatedEmbodimentPhysicalState
+    environment_owner: StaticEnvironmentOwner
+    environment_field: IdentifiedFiniteScalarField
+
+
+def restore_scalar_sensorimotor_runtime(
+    world_id: WorldId,
+    presence_id: str,
+    manifest_store: WorldCausalManifestStore,
+    journal_store: DurableJournalSnapshotStore,
+    *,
+    owner_checkpoint_verifier: OwnerCheckpointVerifier,
+    owner_checkpoint_contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
+    active_morphology: ActiveArticulatedMorphology,
+    expected_organism_id: str,
+    expected_physical_step_id: str,
+    expected_environment_owner_id: str,
+    expected_environment_id: str,
+    expected_environment_revision: str,
+    expected_field_id: str,
+    expected_field_revision: str,
+    kernel_limits: KernelLimits | None = None,
+) -> RestoredScalarSensorimotorRuntime:
+    """Restore the production causal-cycle owners from one committed World cut.
+
+    The World restore path validates the manifest, journal, exact owner roster,
+    checkpoint contracts and recoverability before returning. This composition
+    then obtains the receipt from that restored World runtime, uses it at the
+    Organism public restore boundary, restores Embodiment and Environment via
+    their public APIs, and exposes the composition only after all identities
+    and revisions have been checked. The owner bytes remain opaque to World
+    except for the existing public checkpoint-contract validation.
+    """
+    if not isinstance(world_id, WorldId):
+        raise TypeError("world_id must be a WorldId")
+    if not isinstance(active_morphology, ActiveArticulatedMorphology):
+        raise TypeError("active_morphology must be an ActiveArticulatedMorphology")
+    expected_owners = {
+        ("organism", expected_organism_id),
+        ("embodiment", active_morphology.body_id),
+        ("environment", expected_environment_owner_id),
+        ("environment", expected_field_id),
+    }
+    staged: dict[tuple[str, str], tuple[CheckpointReference, bytes]] = {}
+
+    def stage_owner_checkpoints(references: tuple[CheckpointReference, ...]) -> None:
+        if len(references) != len(expected_owners):
+            raise ManifestError("committed cut does not contain the required scalar-cycle owner set")
+        for reference in references:
+            key = (reference.owner, reference.owner_identity)
+            if key not in expected_owners or key in staged:
+                raise ManifestError("committed cut has an unexpected or duplicate scalar-cycle owner")
+            try:
+                encoded = Path(reference.locator).read_bytes()
+            except OSError as error:
+                raise ManifestError("committed owner checkpoint is unavailable") from error
+            if sha256(encoded).hexdigest() != reference.sha256:
+                raise ManifestError("committed owner checkpoint digest does not match its World reference")
+            staged[key] = (reference, encoded)
+        if set(staged) != expected_owners:
+            raise ManifestError("committed cut is missing a required scalar-cycle owner")
+
+    restored_world = DurableWorldRuntime.restore(
+        world_id,
+        presence_id,
+        manifest_store,
+        journal_store,
+        owner_checkpoint_verifier=owner_checkpoint_verifier,
+        owner_checkpoint_contracts=owner_checkpoint_contracts,
+        owner_checkpoint_restorer=stage_owner_checkpoints,
+    )
+    manifest = restored_world.manifest
+    cut = restored_world.committed_cut_for(
+        world_id=world_id.value,
+        causal_tick=manifest.causal_tick,
+        commit_id=manifest.commit_id,
+        expected_owner_references=tuple(value[0] for value in staged.values()),
+    )
+
+    organism_reference, organism_bytes = staged[("organism", expected_organism_id)]
+    if organism_reference.schema_version != ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA:
+        raise ManifestError("committed Organism checkpoint schema is not supported by this composition")
+    try:
+        organism = OrganismExplorationComposer.restore_from_committed_checkpoint(
+            organism_bytes,
+            committed_cut=cut,
+            expected_organism_id=expected_organism_id,
+            expected_physical_step_id=expected_physical_step_id,
+            kernel_limits=kernel_limits,
+        )
+    except (TypeError, ValueError) as error:
+        raise ManifestError("Organism checkpoint does not restore against the committed World receipt") from error
+
+    body_reference, body_bytes = staged[("embodiment", active_morphology.body_id)]
+    if body_reference.schema_version != ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA:
+        raise ManifestError("committed Embodiment checkpoint schema is not supported by this composition")
+    try:
+        articulated_body = ArticulatedEmbodimentPhysicalState.restore_checkpoint(
+            body_bytes, active_morphology=active_morphology
+        )
+    except (TypeError, ValueError) as error:
+        raise ManifestError("Embodiment checkpoint is incompatible with the active morphology") from error
+
+    environment_reference, environment_bytes = staged[("environment", expected_environment_owner_id)]
+    if environment_reference.schema_version != StaticEnvironmentOwner.CHECKPOINT_SCHEMA:
+        raise ManifestError("committed Environment checkpoint schema is not supported by this composition")
+    try:
+        environment_owner = StaticEnvironmentOwner.from_checkpoint_bytes(environment_bytes)
+    except (TypeError, ValueError) as error:
+        raise ManifestError("Environment owner checkpoint cannot be restored") from error
+
+    field_reference, field_bytes = staged[("environment", expected_field_id)]
+    if field_reference.schema_version != IdentifiedFiniteScalarField.OWNER_SCHEMA:
+        raise ManifestError("committed scalar-field checkpoint schema is not supported by this composition")
+    try:
+        environment_field = IdentifiedFiniteScalarField.from_checkpoint_bytes(field_bytes)
+    except (TypeError, ValueError) as error:
+        raise ManifestError("Environment scalar-field checkpoint cannot be restored") from error
+
+    if (
+        str(organism.transition_state.identity) != expected_organism_id
+        or organism.transition_state.world_correlation is None
+        or organism.transition_state.world_correlation.world_id != world_id.value
+        or organism.transition_state.world_correlation.causal_tick != cut.causal_tick - 1
+    ):
+        raise ManifestError("restored Organism transition does not match the committed cut lineage")
+    if (
+        articulated_body.root.world_id != world_id.value
+        or articulated_body.root.causal_tick != cut.causal_tick
+        or articulated_body.root.body_id != active_morphology.body_id
+        or articulated_body.root.embodiment_episode_id != active_morphology.embodiment_episode_id
+        or articulated_body.root.morphology_revision != active_morphology.morphology_revision
+    ):
+        raise ManifestError("restored Embodiment state does not match the committed World cut")
+    if (
+        environment_owner.owner_id != expected_environment_owner_id
+        or environment_owner.world_id != world_id.value
+        or environment_owner.scene.environment_id != expected_environment_id
+        or environment_owner.scene.environment_revision != expected_environment_revision
+    ):
+        raise ManifestError("restored Environment owner identity or revision is incompatible")
+    if (
+        environment_field.resource_id != expected_field_id
+        or environment_field.environment_id != expected_environment_id
+        or environment_field.environment_revision != expected_environment_revision
+        or environment_field.field_revision != expected_field_revision
+    ):
+        raise ManifestError("restored scalar field identity or revision is incompatible")
+
+    return RestoredScalarSensorimotorRuntime(
+        world=restored_world,
+        committed_cut=cut,
+        organism=organism,
+        articulated_body=articulated_body,
+        environment_owner=environment_owner,
+        environment_field=environment_field,
+    )
 
 
 def run_scalar_sensorimotor_cycle_and_publish(
@@ -393,6 +580,8 @@ def _reference_for_owner(
 
 __all__ = [
     "CausalCycleResult",
+    "RestoredScalarSensorimotorRuntime",
     "project_scalar_field_after_commit",
+    "restore_scalar_sensorimotor_runtime",
     "run_scalar_sensorimotor_cycle_and_publish",
 ]
