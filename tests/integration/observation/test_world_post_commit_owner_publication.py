@@ -16,17 +16,19 @@ from pathlib import Path
 from threading import Thread
 
 import pytest
+from embodiment.observation import BodyPoseSample
+from embodiment.physics3d.physical_transition import (
+    EmbodimentPhysicalState,
+    SolverBodyCandidate,
+)
+from embodiment.physics3d.physical_transition import (
+    PhysicalStepCorrelation as EmbodimentStepCorrelation,
+)
 from environment import (
     EnvironmentObservationContext,
     FiniteResourceState,
     FrameDescriptor,
     IdentifiedFiniteScalarField,
-)
-from embodiment.observation import BodyPoseSample
-from embodiment.physics3d.physical_transition import (
-    EmbodimentPhysicalState,
-    PhysicalStepCorrelation as EmbodimentStepCorrelation,
-    SolverBodyCandidate,
 )
 from observation.embodiment import embodiment_body_pose_observation
 from observation.environment import environment_finite_scalar_field_observation
@@ -44,6 +46,7 @@ from world.physical_step import (
     PhysicalStepCandidate,
     PhysicalStepContext,
     PhysicalStepPorts,
+    run_physical_step,
 )
 from world.physical_step_publication import run_physical_step_and_publish
 from world.runtime import PresenceId, TickInProgressError, WorldId
@@ -516,3 +519,251 @@ def test_real_body_pose_projection_uses_committed_checkpoint_digest(tmp_path):
     assert observation.lineage.parents[0].namespace == "embodiment_state_sha256"
     assert observation.lineage.parents[0].reference == reference.sha256
     assert reference.sha256 == hashlib.sha256(Path(reference.locator).read_bytes()).hexdigest()
+
+
+def _run_nontrivial_body_step(tmp_path: Path, *, publish_observation: bool):
+    """Run the same adopted Embodiment transition with publication enabled/disabled."""
+    body_id = "body.noninterference"
+    episode_id = "episode.noninterference"
+    morphology_revision = "morphology.noninterference-r1"
+    world_id = WorldId("world.observation-noninterference")
+    field = _field()
+    initial_body = EmbodimentPhysicalState(
+        world_id=world_id.value,
+        causal_tick=0,
+        body_id=body_id,
+        embodiment_episode_id=episode_id,
+        morphology_revision=morphology_revision,
+        pose=BodyPoseSample(
+            body_id=body_id,
+            reference_frame="world-frame",
+            body_frame="body-root",
+            position_m=(0.0, 0.0, 0.5),
+            orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+            sample_kind="genesis",
+            sample_value=0,
+        ),
+        linear_velocity_m_per_s=(0.0, 0.0, 0.0),
+        angular_velocity_rad_per_s=(0.0, 0.0, 0.0),
+    )
+
+    class BodyContract:
+        def validate_checkpoint(self, encoded, owner_identity, schema_version):
+            restored = EmbodimentPhysicalState.restore_checkpoint(encoded)
+            return (
+                owner_identity == body_id
+                and schema_version == "embodiment-physical-state-v2"
+                and restored.body_id == body_id
+                and restored.embodiment_episode_id == episode_id
+                and restored.world_id == world_id.value
+            )
+
+        def verify_restoration(self, reference):
+            return Path(reference.locator).is_file()
+
+    body_contract = BodyContract()
+    field_contract = _FieldCheckpointContract()
+    owner_contracts = {
+        ("embodiment", body_id): body_contract,
+        ("environment", RESOURCE_ID): field_contract,
+    }
+
+    def store_reference(owner, identity, schema, tick, encoded):
+        directory = tmp_path / "owners"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{owner}-{tick}.checkpoint"
+        path.write_bytes(encoded)
+        return CheckpointReference(
+            owner=owner,
+            owner_identity=identity,
+            checkpoint_id=f"{owner}-cut-{tick}",
+            schema_version=schema,
+            locator=str(path),
+            sha256=hashlib.sha256(encoded).hexdigest(),
+        )
+
+    initial_references = (
+        store_reference(
+            "embodiment", body_id, "embodiment-physical-state-v2", 0,
+            initial_body.checkpoint_bytes(),
+        ),
+        store_reference(
+            "environment", RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA, 0,
+            field.checkpoint_bytes(),
+        ),
+    )
+    world = DurableWorldRuntime.initialize(
+        WorldGenesisSpec(
+            world_id=world_id,
+            initial_presence_ids=("presence.body", "presence.environment"),
+            registered_owner_ids=tuple(sorted(owner_contracts)),
+            initial_owner_references=initial_references,
+            owner_checkpoint_contracts=owner_contracts,
+            presence_owner_links=(
+                PresenceOwnerLink(PresenceId("presence.body"), "embodiment", body_id),
+                PresenceOwnerLink(PresenceId("presence.environment"), "environment", RESOURCE_ID),
+            ),
+        ),
+        "presence.body",
+        WorldCausalManifestStore(tmp_path / "manifest.json"),
+        DurableJournalSnapshotStore(tmp_path / "journal", world_id),
+        owner_checkpoint_verifier=lambda refs: all(
+            owner_contracts[(ref.owner, ref.owner_identity)].validate_checkpoint(
+                Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version
+            )
+            for ref in refs
+        ),
+    )
+    staged_body = {"value": initial_body}
+
+    def execute(context, body_projection, environment_projection):
+        assert body_projection is initial_body
+        assert environment_projection is field
+        correlation = EmbodimentStepCorrelation(
+            world_id=context.world_id,
+            causal_tick=context.source_causal_tick,
+            physical_step_id=context.physical_step_id,
+            body_id=context.body_id,
+            embodiment_episode_id=context.embodiment_episode_id,
+            morphology_revision=context.morphology_revision,
+            environment_revision=context.environment_revision,
+            solver_config_revision=context.solver_config_revision,
+        )
+        return PhysicalStepCandidate(
+            SolverBodyCandidate(
+                correlation=correlation,
+                reference_frame="world-frame",
+                body_frame="body-root",
+                position_m=(0.1, 0.0, 0.5),
+                orientation_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_velocity_m_per_s=(0.1, 0.0, 0.0),
+                angular_velocity_rad_per_s=(0.0, 0.0, 0.0),
+            ),
+            None,
+        )
+
+    checkpoint_references = []
+
+    def write_checkpoints(context):
+        references = (
+            store_reference(
+                "embodiment", body_id, "embodiment-physical-state-v2",
+                context.target_causal_tick, staged_body["value"].checkpoint_bytes(),
+            ),
+            store_reference(
+                "environment", RESOURCE_ID, IdentifiedFiniteScalarField.OWNER_SCHEMA,
+                context.target_causal_tick, field.checkpoint_bytes(),
+            ),
+        )
+        checkpoint_references[:] = references
+        return references
+
+    ports = PhysicalStepPorts(
+        project_body=lambda _context: initial_body,
+        project_environment=lambda _context: field,
+        execute_solver=execute,
+        adopt_body=lambda context, candidate: staged_body.update(
+            value=initial_body.adopt_candidate(candidate, world_context=context)
+        ),
+        adopt_environment=lambda _context, _candidate: None,
+        write_checkpoints=write_checkpoints,
+    )
+    common = dict(
+        commit_id="noninterference-commit-1",
+        physical_step_id="noninterference-step-1",
+        body_id=body_id,
+        embodiment_episode_id=episode_id,
+        morphology_revision=morphology_revision,
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision="solver.noninterference-r1",
+        ports=ports,
+    )
+    plane = ObservationPlane() if publish_observation else None
+    if publish_observation:
+        frame = _frame()
+
+        def project_body_pose(context, committed_cut):
+            reference = next(
+                ref for ref in committed_cut.owner_checkpoint_references
+                if ref.owner == "embodiment" and ref.owner_identity == body_id
+            )
+            encoded = Path(reference.locator).read_bytes()
+            assert hashlib.sha256(encoded).hexdigest() == reference.sha256
+            restored = EmbodimentPhysicalState.restore_checkpoint(encoded)
+            projection = restored.body_pose_observation_projection()
+            observation = embodiment_body_pose_observation(projection)
+            return (OwnerObservation(reference, observation),)
+
+        result = run_physical_step_and_publish(
+            world,
+            plane,
+            **common,
+            project_owner_observations=project_body_pose,
+        )
+        record = result.causal_record
+        cut = result.committed_cut
+    else:
+        record = run_physical_step(world, **common)
+        cut = world.committed_cut_for(
+            world_id=record.world_id,
+            causal_tick=record.causal_tick,
+            commit_id="noninterference-commit-1",
+            expected_owner_references=tuple(checkpoint_references),
+        )
+    body_ref = next(
+        ref for ref in cut.owner_checkpoint_references
+        if ref.owner == "embodiment" and ref.owner_identity == body_id
+    )
+    env_ref = next(
+        ref for ref in cut.owner_checkpoint_references
+        if ref.owner == "environment" and ref.owner_identity == RESOURCE_ID
+    )
+    adopted_body = EmbodimentPhysicalState.restore_checkpoint(
+        Path(body_ref.locator).read_bytes()
+    )
+    return world, plane, record, cut, adopted_body, env_ref
+
+
+def test_passive_observation_publication_does_not_change_adopted_world_result(
+    tmp_path,
+):
+    """Publication does not alter a nontrivial solver result or owner adoption."""
+    observed = _run_nontrivial_body_step(
+        tmp_path / "observed", publish_observation=True
+    )
+    unobserved = _run_nontrivial_body_step(
+        tmp_path / "unobserved", publish_observation=False
+    )
+    observed_world, plane, observed_record, observed_cut, observed_body, observed_env_ref = observed
+    unobserved_world, _, unobserved_record, unobserved_cut, unobserved_body, unobserved_env_ref = unobserved
+
+    assert observed_world.causal_tick == unobserved_world.causal_tick == 1
+    assert observed_record == unobserved_record
+    assert observed_cut.causal_tick == unobserved_cut.causal_tick == 1
+    assert observed_body == unobserved_body
+    assert observed_body.pose.position_m == (0.1, 0.0, 0.5)
+    assert observed_body.linear_velocity_m_per_s == (0.1, 0.0, 0.0)
+    assert observed_env_ref.sha256 == unobserved_env_ref.sha256
+
+    def stable_reference(reference):
+        return (
+            reference.owner,
+            reference.owner_identity,
+            reference.checkpoint_id,
+            reference.schema_version,
+            reference.sha256,
+        )
+
+    assert tuple(map(stable_reference, observed_cut.owner_checkpoint_references)) == tuple(
+        map(stable_reference, unobserved_cut.owner_checkpoint_references)
+    )
+    assert plane is not None
+    messages = plane.current_messages()
+    assert len(messages) == 1
+    observation = messages[0].observation
+    assert observation.claim.authority.value == "embodiment"
+    assert observation.lineage.parents[0].reference == next(
+        reference.sha256
+        for reference in observed_cut.owner_checkpoint_references
+        if reference.owner == "embodiment"
+    )
