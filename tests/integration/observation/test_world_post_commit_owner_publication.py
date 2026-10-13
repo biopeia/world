@@ -16,17 +16,19 @@ from pathlib import Path
 from threading import Thread
 
 import pytest
+from embodiment.observation import BodyPoseSample
+from embodiment.physics3d.physical_transition import (
+    EmbodimentPhysicalState,
+    SolverBodyCandidate,
+)
+from embodiment.physics3d.physical_transition import (
+    PhysicalStepCorrelation as EmbodimentStepCorrelation,
+)
 from environment import (
     EnvironmentObservationContext,
     FiniteResourceState,
     FrameDescriptor,
     IdentifiedFiniteScalarField,
-)
-from embodiment.observation import BodyPoseSample
-from embodiment.physics3d.physical_transition import (
-    EmbodimentPhysicalState,
-    PhysicalStepCorrelation as EmbodimentStepCorrelation,
-    SolverBodyCandidate,
 )
 from observation.embodiment import embodiment_body_pose_observation
 from observation.environment import environment_finite_scalar_field_observation
@@ -44,6 +46,7 @@ from world.physical_step import (
     PhysicalStepCandidate,
     PhysicalStepContext,
     PhysicalStepPorts,
+    run_physical_step,
 )
 from world.physical_step_publication import run_physical_step_and_publish
 from world.runtime import PresenceId, TickInProgressError, WorldId
@@ -516,3 +519,63 @@ def test_real_body_pose_projection_uses_committed_checkpoint_digest(tmp_path):
     assert observation.lineage.parents[0].namespace == "embodiment_state_sha256"
     assert observation.lineage.parents[0].reference == reference.sha256
     assert reference.sha256 == hashlib.sha256(Path(reference.locator).read_bytes()).hexdigest()
+
+
+def test_passive_observation_publication_does_not_change_committed_world_result(
+    tmp_path,
+):
+    """The same physical input commits the same World result with or without publication."""
+    observed_world, plane, observed = _run(tmp_path / "observed")
+
+    field = _field()
+    unobserved_world = _world(tmp_path / "unobserved", field)
+    unobserved_references = []
+    unobserved_ports = _ports(field, tmp_path / "unobserved" / "owners")
+    write_checkpoints = unobserved_ports.write_checkpoints
+
+    def write_and_capture(context):
+        references = tuple(write_checkpoints(context))
+        unobserved_references[:] = references
+        return references
+
+    unobserved_record = run_physical_step(
+        unobserved_world,
+        commit_id="commit-1",
+        physical_step_id="physical-step-1",
+        body_id="body.fixture",
+        embodiment_episode_id="episode.fixture",
+        morphology_revision="morphology-r1",
+        environment_revision=ENVIRONMENT_REVISION,
+        solver_config_revision="solver.fixture-r1",
+        ports=replace(unobserved_ports, write_checkpoints=write_and_capture),
+    )
+    unobserved_cut = unobserved_world.committed_cut_for(
+        world_id=unobserved_record.world_id,
+        causal_tick=unobserved_record.causal_tick,
+        commit_id="commit-1",
+        expected_owner_references=unobserved_references,
+    )
+
+    def stable_reference(reference):
+        return (
+            reference.owner,
+            reference.owner_identity,
+            reference.checkpoint_id,
+            reference.schema_version,
+            reference.sha256,
+        )
+
+    assert observed_world.causal_tick == unobserved_world.causal_tick == 1
+    assert observed.causal_record == unobserved_record
+    assert observed.committed_cut.causal_tick == 1
+    assert tuple(map(stable_reference, observed.committed_cut.owner_checkpoint_references)) == tuple(
+        map(stable_reference, unobserved_cut.owner_checkpoint_references)
+    )
+
+    messages = plane.current_messages()
+    assert len(messages) == 1
+    assert messages[0].observation.lineage.parents[0].reference == next(
+        reference.sha256
+        for reference in observed.committed_cut.owner_checkpoint_references
+        if reference.owner == "environment"
+    )
