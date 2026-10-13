@@ -32,7 +32,7 @@ from environment import (
 )
 from observation.embodiment import embodiment_body_pose_observation
 from observation.environment import environment_finite_scalar_field_observation
-from observation.plane import ObservationPlane
+from observation.plane import ObservationPlane, PlaneRebaseRequired
 
 from world.durable_runtime import (
     DurableJournalSnapshotStore,
@@ -521,7 +521,12 @@ def test_real_body_pose_projection_uses_committed_checkpoint_digest(tmp_path):
     assert reference.sha256 == hashlib.sha256(Path(reference.locator).read_bytes()).hexdigest()
 
 
-def _run_nontrivial_body_step(tmp_path: Path, *, publish_observation: bool):
+def _run_nontrivial_body_step(
+    tmp_path: Path,
+    *,
+    publish_observation: bool,
+    overflow_subscriber: bool = False,
+):
     """Run the same adopted Embodiment transition with publication enabled/disabled."""
     body_id = "body.noninterference"
     episode_id = "episode.noninterference"
@@ -678,7 +683,12 @@ def _run_nontrivial_body_step(tmp_path: Path, *, publish_observation: bool):
         solver_config_revision="solver.noninterference-r1",
         ports=ports,
     )
-    plane = ObservationPlane() if publish_observation else None
+    plane = (
+        ObservationPlane(subscriber_queue_size=1)
+        if publish_observation and overflow_subscriber
+        else ObservationPlane() if publish_observation else None
+    )
+    subscription = plane.open_stream() if overflow_subscriber and plane is not None else None
     if publish_observation:
         frame = _frame()
 
@@ -692,7 +702,33 @@ def _run_nontrivial_body_step(tmp_path: Path, *, publish_observation: bool):
             restored = EmbodimentPhysicalState.restore_checkpoint(encoded)
             projection = restored.body_pose_observation_projection()
             observation = embodiment_body_pose_observation(projection)
-            return (OwnerObservation(reference, observation),)
+            owner_observations = [OwnerObservation(reference, observation)]
+            if overflow_subscriber:
+                environment_reference = next(
+                    ref for ref in committed_cut.owner_checkpoint_references
+                    if ref.owner == "environment" and ref.owner_identity == RESOURCE_ID
+                )
+                environment_projection = field.project_observation(
+                    (0.0, 0.0, 0.0),
+                    frame=frame,
+                    context=EnvironmentObservationContext(
+                        world_id=context.world_id,
+                        source_causal_tick=context.source_causal_tick,
+                        target_causal_tick=context.target_causal_tick,
+                        physical_step_id=context.physical_step_id,
+                        environment_id=ENVIRONMENT_ID,
+                        environment_revision=ENVIRONMENT_REVISION,
+                        resource_id=RESOURCE_ID,
+                        field_revision=FIELD_REVISION,
+                    ),
+                )
+                owner_observations.append(
+                    OwnerObservation(
+                        environment_reference,
+                        environment_finite_scalar_field_observation(environment_projection),
+                    )
+                )
+            return tuple(owner_observations)
 
         result = run_physical_step_and_publish(
             world,
@@ -721,7 +757,10 @@ def _run_nontrivial_body_step(tmp_path: Path, *, publish_observation: bool):
     adopted_body = EmbodimentPhysicalState.restore_checkpoint(
         Path(body_ref.locator).read_bytes()
     )
-    return world, plane, record, cut, adopted_body, env_ref
+    rebase = subscription.queue.get_nowait() if subscription is not None else None
+    if subscription is not None:
+        plane.close_stream(subscription)
+    return world, plane, record, cut, adopted_body, env_ref, rebase
 
 
 def test_passive_observation_publication_does_not_change_adopted_world_result(
@@ -734,8 +773,8 @@ def test_passive_observation_publication_does_not_change_adopted_world_result(
     unobserved = _run_nontrivial_body_step(
         tmp_path / "unobserved", publish_observation=False
     )
-    observed_world, plane, observed_record, observed_cut, observed_body, observed_env_ref = observed
-    unobserved_world, _, unobserved_record, unobserved_cut, unobserved_body, unobserved_env_ref = unobserved
+    observed_world, plane, observed_record, observed_cut, observed_body, observed_env_ref, _ = observed
+    unobserved_world, _, unobserved_record, unobserved_cut, unobserved_body, unobserved_env_ref, _ = unobserved
 
     assert observed_world.causal_tick == unobserved_world.causal_tick == 1
     assert observed_record == unobserved_record
@@ -767,3 +806,43 @@ def test_passive_observation_publication_does_not_change_adopted_world_result(
         for reference in observed_cut.owner_checkpoint_references
         if reference.owner == "embodiment"
     )
+
+
+def test_observation_subscriber_overflow_does_not_change_world_causal_result(tmp_path):
+    """A bounded subscriber rebase cannot alter World commit or owner adoption."""
+    saturated = _run_nontrivial_body_step(
+        tmp_path / "saturated", publish_observation=True, overflow_subscriber=True
+    )
+    unobserved = _run_nontrivial_body_step(
+        tmp_path / "unobserved", publish_observation=False
+    )
+    world, plane, record, cut, body, environment_ref, rebase = saturated
+    baseline_world, _, baseline_record, baseline_cut, baseline_body, baseline_environment_ref, _ = unobserved
+
+    assert isinstance(rebase, PlaneRebaseRequired)
+    assert rebase.reason == "consumer_overflow"
+    assert rebase.sequence == 2
+    assert plane is not None
+    assert plane.consumer_overflows == 1
+
+    assert world.causal_tick == baseline_world.causal_tick == 1
+    assert record == baseline_record
+    assert cut.causal_tick == baseline_cut.causal_tick == 1
+    assert cut.commit_id == baseline_cut.commit_id == "noninterference-commit-1"
+    assert body == baseline_body
+    assert body.pose.position_m == (0.1, 0.0, 0.5)
+    assert environment_ref.sha256 == baseline_environment_ref.sha256
+
+    def stable_reference(reference):
+        return (
+            reference.owner,
+            reference.owner_identity,
+            reference.checkpoint_id,
+            reference.schema_version,
+            reference.sha256,
+        )
+
+    assert tuple(map(stable_reference, cut.owner_checkpoint_references)) == tuple(
+        map(stable_reference, baseline_cut.owner_checkpoint_references)
+    )
+    assert len(plane.current_messages()) == 2
