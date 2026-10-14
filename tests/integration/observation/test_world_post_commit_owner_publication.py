@@ -282,6 +282,44 @@ def test_reentrant_tick_during_projection_is_rejected(tmp_path):
     assert plane.latest_sequence == 1
 
 
+def test_observation_sink_failure_leaves_committed_world_cut_authoritative(tmp_path):
+    """Characterize the post-commit boundary; this does not implement retry."""
+    committed_worlds = []
+
+    class FailingObservationPlane:
+        def publish(self, observation):
+            raise RuntimeError("synthetic sink unavailable")
+
+    def capture_committed_world(world: DurableWorldRuntime) -> None:
+        committed_worlds.append(world)
+
+    with pytest.raises(RuntimeError, match="synthetic sink unavailable"):
+        _run(
+            tmp_path,
+            plane=FailingObservationPlane(),
+            on_projection=capture_committed_world,
+        )
+
+    assert len(committed_worlds) == 1
+    world = committed_worlds[0]
+    assert world.causal_tick == 1
+    assert world.status.value == "COMMITTED"
+    assert world.manifest.status.value == "COMMITTED"
+    assert world.manifest.commit_id == "commit-1"
+    assert any(record.causal_tick == 1 for record in world.records)
+    committed_cut = world.committed_cut_for(
+        world_id=WORLD_ID,
+        causal_tick=1,
+        commit_id="commit-1",
+    )
+    assert committed_cut.causal_tick == 1
+    assert committed_cut.commit_id == "commit-1"
+    assert any(
+        reference.owner == "environment" and reference.owner_identity == RESOURCE_ID
+        for reference in committed_cut.owner_checkpoint_references
+    )
+
+
 def test_solver_failure_commits_no_cut_and_publishes_nothing(tmp_path):
     plane = ObservationPlane()
     with pytest.raises(RuntimeError, match="solver failure"):
