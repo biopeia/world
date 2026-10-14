@@ -1,6 +1,6 @@
 # Runtime M1 World Process Contract
 
-**Status:** Proposed implementation contract for World Issue #150. This document is not a claim of scientific validation, domain-wide production readiness, migration completion, or longitudinal continuity.
+**Status:** Implemented candidate for World Issue #150. This document is not a claim of scientific validation, domain-wide production readiness, migration completion, or longitudinal continuity.
 
 ## Decision and profile provenance
 
@@ -35,7 +35,11 @@ The Docs report describes its historical acceptance run with MuJoCo `3.14.0`; Wo
 - SIGINT/SIGTERM request cooperative stop at the next cycle boundary. They do not interrupt an in-flight solver, commit, or publication. A stop during an in-flight cycle is reported only after that cycle returns. Signal-driven `stopped` is distinct from finite `completed`.
 - Separate commit outcome from publication outcome. A committed cut with incomplete post-commit publication must be represented as such and must not be reported as a fully successful published cycle.
 - The current session result's `cycles` contains only cycles whose production method returned full publication results. If a runtime error occurs after World commit but before publication completes, terminal state must not erase the committed cut or imply rollback; surface a non-zero failed/incomplete outcome with the independently verified last cut and explicit publication uncertainty.
-- Initial process has no network listener; any later bridge must bind loopback only and expose only approved post-commit Observation projections.
+- The local Observation bridge binds only to loopback and exposes only the approved post-commit current Observation projections. It is not a public network listener or durable Observation store.
+
+## Invocation
+
+The explicit candidate command is `world-m1 --profile <operator-profile.json> --state-root <new-directory> --cycles <positive-count>`. No implicit profile is selected. The state root and its parent must already be unambiguous, and the target root must not exist. `--cycles` is bounded to 1–10,000 in this implementation. The process reports its active loopback bridge URL in `ready` and closes the bridge on exit.
 
 ## Validation requirements
 

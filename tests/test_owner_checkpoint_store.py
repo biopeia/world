@@ -66,3 +66,26 @@ def test_file_store_rejects_empty_or_ambiguous_checkpoint_sets(tmp_path, payload
     store = FileOwnerCheckpointStore(tmp_path)
     with pytest.raises(ValueError):
         store.write(_context(), payloads)
+
+
+def test_file_store_writes_owner_authored_genesis_checkpoint_without_step_identity(
+    tmp_path: Path,
+) -> None:
+    store = FileOwnerCheckpointStore(tmp_path / "genesis")
+    payload = OwnerCheckpointPayload("organism", "organism.genesis", "v1", b"initial owner bytes")
+
+    reference, = store.write_genesis((payload,))
+
+    assert reference.owner == payload.owner
+    assert reference.owner_identity == payload.owner_identity
+    assert reference.schema_version == payload.schema_version
+    assert reference.checkpoint_id.startswith("genesis:")
+    assert reference.sha256 == hashlib.sha256(payload.encoded).hexdigest()
+    assert Path(reference.locator).read_bytes() == payload.encoded
+
+
+def test_file_store_rejects_ambiguous_genesis_checkpoint_sets(tmp_path: Path) -> None:
+    store = FileOwnerCheckpointStore(tmp_path)
+    duplicate = OwnerCheckpointPayload("organism", "same", "v1", b"one")
+    with pytest.raises(ValueError):
+        store.write_genesis((duplicate, duplicate))

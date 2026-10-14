@@ -63,6 +63,7 @@ from .durable_runtime import (
 from .manifest import CheckpointReference, ManifestError
 from .observation_publication import (
     ObservationPlaneLike,
+    ObservationPublicationFailure,
     ObservationPublication,
     OwnerObservation,
     publish_committed_owner_observations,
@@ -193,6 +194,8 @@ class ScalarSensorimotorSessionResult:
     cycles: tuple[CausalCycleResult, ...]
     last_committed_cut: CommittedWorldCut | None
     error: str | None = None
+    failure_kind: str | None = None
+    publication_delivery_status_uncertain: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +619,7 @@ def run_scalar_sensorimotor_session(
     source_revisions: Mapping[str, str],
     max_cycles: int | None = 1,
     stop_requested: Callable[[], bool] | None = None,
+    on_cycle_result: Callable[[CausalCycleResult], None] | None = None,
     commit_id_prefix: str | None = None,
     physical_step_id_prefix: str | None = None,
 ) -> ScalarSensorimotorSessionResult:
@@ -639,6 +643,8 @@ def run_scalar_sensorimotor_session(
         raise ValueError("continuous mode requires stop_requested")
     if stop_requested is not None and not callable(stop_requested):
         raise TypeError("stop_requested must be callable")
+    if on_cycle_result is not None and not callable(on_cycle_result):
+        raise TypeError("on_cycle_result must be callable")
     revisions = dict(source_revisions)
     if not revisions or any(
         not isinstance(key, str)
@@ -682,6 +688,8 @@ def run_scalar_sensorimotor_session(
         )
 
     status = ScalarSensorimotorSessionStatus.COMPLETED
+    failure_kind: str | None = None
+    publication_delivery_status_uncertain = False
     inputs = cycle_inputs
     try:
         while max_cycles is None or len(completed) < max_cycles:
@@ -698,6 +706,8 @@ def run_scalar_sensorimotor_session(
             )
             completed.append(result)
             last_cut = result.committed_cut
+            if on_cycle_result is not None:
+                on_cycle_result(result)
             inputs = replace(
                 inputs,
                 current_organism=result.sensory_input.state,
@@ -707,6 +717,9 @@ def run_scalar_sensorimotor_session(
     except Exception as exc:
         status = ScalarSensorimotorSessionStatus.FAILED
         error = f"{type(exc).__name__}: {exc}"
+        failure_kind = type(exc).__name__
+        if isinstance(exc, ObservationPublicationFailure):
+            publication_delivery_status_uncertain = exc.delivery_status_uncertain
         # A production cycle can commit before an Observation delivery error.
         # Report that cut only if World can still verify it as the current cut;
         # the failed cycle remains absent from ``cycles``.
@@ -728,6 +741,8 @@ def run_scalar_sensorimotor_session(
         cycles=tuple(completed),
         last_committed_cut=last_cut,
         error=error,
+        failure_kind=failure_kind,
+        publication_delivery_status_uncertain=publication_delivery_status_uncertain,
     )
 
 
