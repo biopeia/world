@@ -12,7 +12,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from .manifest import CheckpointReference
 from .physical_step import PhysicalStepContext
@@ -71,19 +71,52 @@ class FileOwnerCheckpointStore:
         if not payloads or len(keys) != len(set(keys)):
             raise ValueError("checkpoint payloads must be non-empty and uniquely identified")
 
+        return self._write_payloads(
+            payloads,
+            checkpoint_id=lambda payload, digest: (
+                f"{context.target_causal_tick}:{digest[:24]}"
+            ),
+        )
+
+    def write_genesis(
+        self,
+        payloads: tuple[OwnerCheckpointPayload, ...],
+    ) -> tuple[CheckpointReference, ...]:
+        """Persist immutable owner-authored bytes referenced by an initial cut.
+
+        Genesis has no World-issued physical-step context. This narrow method
+        therefore records content-addressed owner checkpoints without inventing
+        a transition identity; World genesis names them as initial references.
+        """
+        payloads = tuple(payloads)
+        keys = tuple((item.owner, item.owner_identity) for item in payloads)
+        if not payloads or len(keys) != len(set(keys)):
+            raise ValueError("genesis checkpoint payloads must be non-empty and uniquely identified")
+        if any(not isinstance(item, OwnerCheckpointPayload) for item in payloads):
+            raise TypeError("genesis payloads must be OwnerCheckpointPayload values")
+        return self._write_payloads(
+            payloads,
+            checkpoint_id=lambda payload, digest: f"genesis:{digest[:24]}",
+        )
+
+    def _write_payloads(
+        self,
+        payloads: tuple[OwnerCheckpointPayload, ...],
+        *,
+        checkpoint_id: Callable[[OwnerCheckpointPayload, str], str],
+    ) -> tuple[CheckpointReference, ...]:
         references: list[CheckpointReference] = []
         for payload in payloads:
+            if not isinstance(payload, OwnerCheckpointPayload):
+                raise TypeError("payloads must be OwnerCheckpointPayload values")
             digest = hashlib.sha256(payload.encoded).hexdigest()
             target = self.root / digest[:2] / f"{digest}.blob"
             self._publish_blob(target, payload.encoded, digest)
-            checkpoint_id = (
-                f"{context.target_causal_tick}:{digest[:24]}"
-            )
             references.append(
                 CheckpointReference(
                     owner=payload.owner,
                     owner_identity=payload.owner_identity,
-                    checkpoint_id=checkpoint_id,
+                    checkpoint_id=checkpoint_id(payload, digest),
                     schema_version=payload.schema_version,
                     locator=str(target),
                     sha256=digest,

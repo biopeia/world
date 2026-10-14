@@ -184,6 +184,7 @@ def _run(
     session_cycles: int | None = None,
     use_session: bool = False,
     session_stop_after: int | None = None,
+    on_cycle_result: Callable[[CausalCycleResult], None] | None = None,
     environment_revision_override: str | None = None,
     kernel_limits: KernelLimits = KernelLimits(),
     actuator_surface_material: str = SURFACE_FINGERPRINT,
@@ -460,6 +461,7 @@ def _run(
                 if session_stop_after is not None
                 else None
             ),
+            on_cycle_result=on_cycle_result,
             source_revisions={"world": "test-commit"},
         )
         result = session_result.cycles[0] if session_result.cycles else None
@@ -1238,9 +1240,30 @@ def test_world_owned_session_reports_committed_cut_when_observation_delivery_fai
     assert session.last_committed_cut is not None
     assert session.last_committed_cut.causal_tick == 1
     assert session.last_committed_cut.commit_id == "acceptance-run:commit:1"
+    assert session.failure_kind == "ObservationPublicationFailure"
+    assert session.publication_delivery_status_uncertain is True
     # One item was acknowledged before the second delivery raised; the
     # publication as a whole is not returned as a completed cycle.
     assert len(messages) == 1
+
+
+def test_world_owned_session_emits_cycle_result_only_after_full_publication(
+    tmp_path: Path,
+) -> None:
+    observed: list[CausalCycleResult] = []
+    session, _messages, _, _ = _run(
+        tmp_path / "cycle-result-callback",
+        session_cycles=2,
+        use_session=True,
+        on_cycle_result=observed.append,
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.COMPLETED
+    assert len(session.cycles) == len(observed) == 2
+    assert [result.committed_cut for result in observed] == [
+        result.committed_cut for result in session.cycles
+    ]
+    assert all(result.observation_publication.complete for result in observed)
 
 
 def test_committed_world_publications_are_readable_through_local_observation_bridge(
