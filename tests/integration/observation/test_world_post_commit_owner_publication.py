@@ -349,10 +349,13 @@ def test_observation_sink_failure_leaves_committed_world_cut_authoritative(tmp_p
     )
 
 
-def test_solver_failure_commits_no_cut_and_publishes_nothing(tmp_path):
+def test_solver_failure_with_unresolved_manifest_is_unknown_without_publication(tmp_path):
     plane = ObservationPlane()
     world, _plane, result = _run(tmp_path, fail=True, plane=plane)
-    assert result.outcome is PhysicalStepOutcome.NOT_COMMITTED
+    # The in-memory tick staying at zero is not enough to prove that the
+    # durable commit outcome is known. Recovery-required manifest state makes
+    # this ambiguous until the authoritative journal/manifest can be reconciled.
+    assert result.outcome is PhysicalStepOutcome.COMMIT_UNKNOWN
     assert result.failure == "RuntimeError: deterministic solver failure"
     assert result.recovery_required is True
     assert world.causal_tick == 0
