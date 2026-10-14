@@ -10,10 +10,12 @@ composition, not delegated to a test or launcher.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from embodiment.physics3d.articulated_state import (
@@ -124,6 +126,73 @@ class CausalCycleResult:
     physical_outcome: ArticulatedPhysicalStepOutcome
     committed_cut: CommittedWorldCut
     observation_publication: ObservationPublication
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarSensorimotorCycleInputs:
+    """Initial state and fixed owner capabilities for the production cycle."""
+
+    environment_revision: str
+    solver_configuration: ArticulatedMujocoConfiguration
+    current_organism: OrganismTransitionState
+    action_composer: _OrganismActionComposer
+    receptor: EmbodimentReceptor
+    embodiment_state: EmbodimentPhysicalState
+    environment_field: IdentifiedFiniteScalarField
+    sampling_frame: FrameDescriptor
+    transduction: DimensionlessScalarFieldIdentityV1
+    sense_binding: SenseChannelBinding
+    kernel_limits: KernelLimits
+    actuator_context: object
+    actuator_surface: object
+    articulated_body: ArticulatedEmbodimentPhysicalState
+    active_morphology: ActiveArticulatedMorphology
+    differential_binding: EmbodimentDifferentialMotorBinding
+    torque_binding: EmbodimentJointTorqueBinding
+    environment_owner: StaticEnvironmentOwner
+    owner_checkpoint_store: OwnerCheckpointStore
+
+    def as_cycle_arguments(self) -> dict[str, object]:
+        return {
+            "environment_revision": self.environment_revision,
+            "solver_configuration": self.solver_configuration,
+            "current_organism": self.current_organism,
+            "action_composer": self.action_composer,
+            "receptor": self.receptor,
+            "embodiment_state": self.embodiment_state,
+            "environment_field": self.environment_field,
+            "sampling_frame": self.sampling_frame,
+            "transduction": self.transduction,
+            "sense_binding": self.sense_binding,
+            "kernel_limits": self.kernel_limits,
+            "actuator_context": self.actuator_context,
+            "actuator_surface": self.actuator_surface,
+            "articulated_body": self.articulated_body,
+            "active_morphology": self.active_morphology,
+            "differential_binding": self.differential_binding,
+            "torque_binding": self.torque_binding,
+            "environment_owner": self.environment_owner,
+            "owner_checkpoint_store": self.owner_checkpoint_store,
+        }
+
+
+class ScalarSensorimotorSessionStatus(StrEnum):
+    COMPLETED = "completed"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ScalarSensorimotorSessionResult:
+    """Operational outcome; only returned cycle results denote full publications."""
+
+    world_id: str
+    run_id: str
+    source_revisions: Mapping[str, str]
+    status: ScalarSensorimotorSessionStatus
+    cycles: tuple[CausalCycleResult, ...]
+    last_committed_cut: CommittedWorldCut | None
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,6 +607,130 @@ def run_scalar_sensorimotor_cycle_and_publish(
         )
 
 
+def run_scalar_sensorimotor_session(
+    world: DurableWorldRuntime,
+    observation_plane: ObservationPlaneLike,
+    *,
+    run_id: str,
+    cycle_inputs: ScalarSensorimotorCycleInputs,
+    source_revisions: Mapping[str, str],
+    max_cycles: int | None = 1,
+    stop_requested: Callable[[], bool] | None = None,
+    commit_id_prefix: str | None = None,
+    physical_step_id_prefix: str | None = None,
+) -> ScalarSensorimotorSessionResult:
+    """Run production causal cycles serially until bounded completion or stop.
+
+    A cycle is synchronous and is never interrupted here. Stop is sampled only
+    between cycles, so a requested stop allows the in-flight production cycle
+    (including its publication) to return or fail before the session exits.
+    ``max_cycles=None`` is continuous mode and therefore requires a stop
+    predicate. Source revisions are caller-supplied provenance, not inferred.
+    """
+    if not isinstance(world, DurableWorldRuntime):
+        raise TypeError("world must be a DurableWorldRuntime")
+    if not isinstance(cycle_inputs, ScalarSensorimotorCycleInputs):
+        raise TypeError("cycle_inputs must be ScalarSensorimotorCycleInputs")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_id must be a non-empty string")
+    if max_cycles is not None and (type(max_cycles) is not int or max_cycles < 1):
+        raise ValueError("max_cycles must be a positive integer or None")
+    if max_cycles is None and stop_requested is None:
+        raise ValueError("continuous mode requires stop_requested")
+    if stop_requested is not None and not callable(stop_requested):
+        raise TypeError("stop_requested must be callable")
+    revisions = dict(source_revisions)
+    if not revisions or any(
+        not isinstance(key, str)
+        or not key.strip()
+        or not isinstance(value, str)
+        or not value.strip()
+        for key, value in revisions.items()
+    ):
+        raise ValueError("source_revisions must map non-empty names to non-empty revisions")
+    commit_prefix = commit_id_prefix or f"{run_id}:commit:"
+    physical_step_prefix = physical_step_id_prefix or f"{run_id}:physical-step:"
+    if not commit_prefix.strip() or not physical_step_prefix.strip():
+        raise ValueError("cycle identifier prefixes must be non-empty")
+
+    def current_cut() -> CommittedWorldCut | None:
+        manifest = world.manifest
+        if manifest.status.value != "COMMITTED":
+            return None
+        owner_references = tuple(
+            reference
+            for reference in manifest.checkpoint_references
+            if reference.owner != "world-journal"
+        )
+        return world.committed_cut_for(
+            world_id=manifest.world_id,
+            causal_tick=manifest.causal_tick,
+            commit_id=manifest.commit_id,
+            expected_owner_references=owner_references,
+        )
+
+    completed: list[CausalCycleResult] = []
+    last_cut: CommittedWorldCut | None
+    error: str | None = None
+    try:
+        last_cut = current_cut()
+    except Exception as cut_exc:
+        last_cut = None
+        error = (
+            "initial committed-cut verification failed: "
+            f"{type(cut_exc).__name__}: {cut_exc}"
+        )
+
+    status = ScalarSensorimotorSessionStatus.COMPLETED
+    inputs = cycle_inputs
+    try:
+        while max_cycles is None or len(completed) < max_cycles:
+            if stop_requested is not None and stop_requested():
+                status = ScalarSensorimotorSessionStatus.STOPPED
+                break
+            target_tick = world.causal_tick + 1
+            result = run_scalar_sensorimotor_cycle_and_publish(
+                world,
+                observation_plane,
+                commit_id=f"{commit_prefix}{target_tick}",
+                physical_step_id=f"{physical_step_prefix}{target_tick}",
+                **inputs.as_cycle_arguments(),
+            )
+            completed.append(result)
+            last_cut = result.committed_cut
+            inputs = replace(
+                inputs,
+                current_organism=result.sensory_input.state,
+                embodiment_state=result.physical_outcome.body_state.root,
+                articulated_body=result.physical_outcome.body_state,
+            )
+    except Exception as exc:
+        status = ScalarSensorimotorSessionStatus.FAILED
+        error = f"{type(exc).__name__}: {exc}"
+        # A production cycle can commit before an Observation delivery error.
+        # Report that cut only if World can still verify it as the current cut;
+        # the failed cycle remains absent from ``cycles``.
+        try:
+            last_cut = current_cut()
+        except Exception as cut_exc:
+            # Keep the last previously verified cut, but make clear that it
+            # may not reflect a commit that became current before the failure.
+            error = (
+                f"{error}; current cut verification failed: "
+                f"{type(cut_exc).__name__}: {cut_exc}"
+            )
+
+    return ScalarSensorimotorSessionResult(
+        world_id=world.world_id.value,
+        run_id=run_id,
+        source_revisions=MappingProxyType(revisions),
+        status=status,
+        cycles=tuple(completed),
+        last_committed_cut=last_cut,
+        error=error,
+    )
+
+
 def project_scalar_field_after_commit(
     environment_field: IdentifiedFiniteScalarField,
     *,
@@ -598,7 +791,11 @@ def _reference_for_owner(
 __all__ = [
     "CausalCycleResult",
     "RestoredScalarSensorimotorRuntime",
+    "ScalarSensorimotorCycleInputs",
+    "ScalarSensorimotorSessionResult",
+    "ScalarSensorimotorSessionStatus",
     "project_scalar_field_after_commit",
     "restore_scalar_sensorimotor_runtime",
     "run_scalar_sensorimotor_cycle_and_publish",
+    "run_scalar_sensorimotor_session",
 ]

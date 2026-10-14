@@ -79,8 +79,11 @@ from organism.transition import (
 from world.adapters.articulated_mujoco import ArticulatedMujocoConfiguration
 from world.causal_cycle import (
     CausalCycleResult,
+    ScalarSensorimotorCycleInputs,
+    ScalarSensorimotorSessionStatus,
     restore_scalar_sensorimotor_runtime,
     run_scalar_sensorimotor_cycle_and_publish,
+    run_scalar_sensorimotor_session,
 )
 from world.durable_runtime import (
     DurableJournalSnapshotStore,
@@ -178,6 +181,10 @@ def _run(
     stop_after_first: bool = False,
     continue_from_live_state: bool = False,
     malformed_organism_checkpoint: bool = False,
+    session_cycles: int | None = None,
+    use_session: bool = False,
+    session_stop_after: int | None = None,
+    environment_revision_override: str | None = None,
     kernel_limits: KernelLimits = KernelLimits(),
     actuator_surface_material: str = SURFACE_FINGERPRINT,
     after_first_commit: Callable[
@@ -412,11 +419,8 @@ def _run(
 
     plane = ObservationPlane()
 
-    result = run_scalar_sensorimotor_cycle_and_publish(
-        world, plane,
-        commit_id="commit.acceptance.sensorimotor.tick-1",
-        physical_step_id="physical-step.acceptance.sensorimotor.tick-1",
-        environment_revision=ENVIRONMENT_REVISION,
+    cycle_inputs = ScalarSensorimotorCycleInputs(
+        environment_revision=environment_revision_override or ENVIRONMENT_REVISION,
         solver_configuration=solver,
         current_organism=organism,
         action_composer=composer,
@@ -436,11 +440,37 @@ def _run(
         environment_owner=env_owner,
         owner_checkpoint_store=owner_checkpoint_store,
     )
+    if not use_session:
+        result = run_scalar_sensorimotor_cycle_and_publish(
+            world, plane,
+            commit_id="commit.acceptance.sensorimotor.tick-1",
+            physical_step_id="physical-step.acceptance.sensorimotor.tick-1",
+            **cycle_inputs.as_cycle_arguments(),
+        )
+        session_result = None
+    else:
+        session_result = run_scalar_sensorimotor_session(
+            world,
+            plane,
+            run_id="acceptance-run",
+            max_cycles=session_cycles,
+            cycle_inputs=cycle_inputs,
+            stop_requested=(
+                (lambda: world.causal_tick >= session_stop_after)
+                if session_stop_after is not None
+                else None
+            ),
+            source_revisions={"world": "test-commit"},
+        )
+        result = session_result.cycles[0] if session_result.cycles else None
     first_messages = plane.current_messages()
-    if after_first_commit is not None:
+    if after_first_commit is not None and result is not None:
         after_first_commit(world, result, plane)
     if stop_after_first:
         return result, first_messages, None, None
+
+    if session_result is not None:
+        return session_result, first_messages, None, None
 
     if continue_from_live_state:
         # This is the independent uninterrupted control: retain the original
@@ -651,31 +681,38 @@ def _resume_in_fresh_process(directory: Path, output_path: Path) -> None:
         contact_policy="max-sliding-body-torsion-rolling/no-self-collision-v1",
     )
     plane = ObservationPlane()
-    cycle = run_scalar_sensorimotor_cycle_and_publish(
+    session = run_scalar_sensorimotor_session(
         restored.world,
         plane,
-        commit_id="commit.acceptance.sensorimotor.tick-2",
-        physical_step_id="physical-step.acceptance.sensorimotor.tick-2",
-        environment_revision=ENVIRONMENT_REVISION,
-        solver_configuration=solver,
-        current_organism=restored.organism.transition_state,
-        action_composer=restored.organism.action_composer,
-        receptor=receptor,
-        embodiment_state=restored.articulated_body.root,
-        environment_field=restored.environment_field,
-        sampling_frame=frame,
-        transduction=DimensionlessScalarFieldIdentityV1(),
-        sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
-        kernel_limits=KernelLimits(),
-        actuator_context=actuator_context,
-        actuator_surface=surface,
-        articulated_body=restored.articulated_body,
-        active_morphology=morphology,
-        differential_binding=motor_binding,
-        torque_binding=torque_binding,
-        environment_owner=restored.environment_owner,
-        owner_checkpoint_store=FileOwnerCheckpointStore(directory / "owners" / "committed"),
+        run_id="acceptance-restored-run",
+        source_revisions={"world": "test-commit"},
+        cycle_inputs=ScalarSensorimotorCycleInputs(
+            environment_revision=ENVIRONMENT_REVISION,
+            solver_configuration=solver,
+            current_organism=restored.organism.transition_state,
+            action_composer=restored.organism.action_composer,
+            receptor=receptor,
+            embodiment_state=restored.articulated_body.root,
+            environment_field=restored.environment_field,
+            sampling_frame=frame,
+            transduction=DimensionlessScalarFieldIdentityV1(),
+            sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
+            kernel_limits=KernelLimits(),
+            actuator_context=actuator_context,
+            actuator_surface=surface,
+            articulated_body=restored.articulated_body,
+            active_morphology=morphology,
+            differential_binding=motor_binding,
+            torque_binding=torque_binding,
+            environment_owner=restored.environment_owner,
+            owner_checkpoint_store=FileOwnerCheckpointStore(directory / "owners" / "committed"),
+        ),
+        max_cycles=1,
+        commit_id_prefix="commit.acceptance.sensorimotor.tick-",
+        physical_step_id_prefix="physical-step.acceptance.sensorimotor.tick-",
     )
+    assert session.status is ScalarSensorimotorSessionStatus.COMPLETED
+    cycle = session.cycles[0]
     messages = plane.current_messages()
     output_path.write_text(
         json.dumps(
@@ -1095,6 +1132,115 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
     assert first_resumed.physical_outcome.body_state.joints == pytest.approx(
         second_resumed.physical_outcome.body_state.joints
     )
+
+
+def test_world_owned_session_runs_three_production_cycles_and_publishes_each(
+    tmp_path: Path,
+) -> None:
+    session, _messages, _, _ = _run(
+        tmp_path / "three-cycle-session", session_cycles=3, use_session=True
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.COMPLETED
+    assert session.world_id == WORLD_ID
+    assert session.run_id == "acceptance-run"
+    assert session.source_revisions == {"world": "test-commit"}
+    assert tuple(result.committed_cut.causal_tick for result in session.cycles) == (1, 2, 3)
+    assert tuple(result.context.source_causal_tick for result in session.cycles) == (0, 1, 2)
+    assert len({result.committed_cut.commit_id for result in session.cycles}) == 3
+    for result in session.cycles:
+        assert result.observation_publication.committed_cut == result.committed_cut
+        assert len(result.observation_publication.delivery_sequences) == 2
+    assert session.last_committed_cut == session.cycles[-1].committed_cut
+    assert session.error is None
+
+
+def test_world_owned_session_honors_stop_between_committed_cycles(
+    tmp_path: Path,
+) -> None:
+    session, _messages, _, _ = _run(
+        tmp_path / "stopped-session",
+        use_session=True,
+        session_stop_after=3,
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.STOPPED
+    assert len(session.cycles) == 3
+    assert session.last_committed_cut == session.cycles[-1].committed_cut
+    assert session.last_committed_cut.causal_tick == 3
+    assert session.error is None
+
+
+def test_world_owned_session_reports_initial_cut_verification_failure_when_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_cut_verification(*args, **kwargs):
+        raise ManifestError("injected cut verification failure")
+
+    monkeypatch.setattr(DurableWorldRuntime, "committed_cut_for", fail_cut_verification)
+    session, _messages, _, _ = _run(
+        tmp_path / "initial-cut-verification-failure",
+        use_session=True,
+        session_stop_after=0,
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.STOPPED
+    assert session.cycles == ()
+    assert session.last_committed_cut is None
+    assert session.error is not None
+    assert "initial committed-cut verification failed" in session.error
+    assert "injected cut verification failure" in session.error
+
+
+def test_world_owned_session_reports_cycle_failure_without_claiming_uncommitted_cut(
+    tmp_path: Path,
+) -> None:
+    session, _messages, _, _ = _run(
+        tmp_path / "failed-session",
+        session_cycles=3,
+        use_session=True,
+        environment_revision_override="environment.acceptance.stale-r0",
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.FAILED
+    assert session.cycles == ()
+    assert session.error is not None
+    assert session.last_committed_cut is None or session.last_committed_cut.causal_tick == 0
+
+
+def test_world_owned_session_reports_committed_cut_when_observation_delivery_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailsOnSecondDeliveryPlane(ObservationPlane):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivery_count = 0
+
+        def publish(self, observation) -> int:
+            self.delivery_count += 1
+            if self.delivery_count == 2:
+                raise RuntimeError("injected Observation delivery failure")
+            return super().publish(observation)
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "ObservationPlane", FailsOnSecondDeliveryPlane
+    )
+    session, messages, _, _ = _run(
+        tmp_path / "post-commit-observation-failure",
+        session_cycles=1,
+        use_session=True,
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.FAILED
+    assert session.cycles == ()
+    assert session.error is not None
+    assert "ObservationPublicationFailure" in session.error
+    assert session.last_committed_cut is not None
+    assert session.last_committed_cut.causal_tick == 1
+    assert session.last_committed_cut.commit_id == "acceptance-run:commit:1"
+    # One item was acknowledged before the second delivery raised; the
+    # publication as a whole is not returned as a completed cycle.
+    assert len(messages) == 1
 
 
 def test_committed_world_publications_are_readable_through_local_observation_bridge(
