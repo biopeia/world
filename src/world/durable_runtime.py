@@ -16,6 +16,7 @@ import fcntl
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
 from pathlib import Path
 from threading import Lock, get_ident
@@ -607,6 +608,22 @@ class CommittedWorldCut:
     owner_checkpoint_references: tuple[CheckpointReference, ...]
 
 
+class TransitionCommitState(str, Enum):
+    """Read-only classification of one transition against current manifest evidence."""
+
+    NOT_COMMITTED = "NOT_COMMITTED"
+    COMMITTED = "COMMITTED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionCommitInspection:
+    """Read-only transition classification; it does not perform recovery."""
+
+    state: TransitionCommitState
+    committed_cut: CommittedWorldCut | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerCausalRecord:
     """Opaque owner-authored record committed in a World causal journal.
@@ -1046,6 +1063,95 @@ class DurableWorldRuntime:
                 presence_owner_links=manifest.presence_owner_links,
                 owner_checkpoint_references=owner_references,
             )
+
+    def inspect_transition_commit(
+        self,
+        *,
+        transition_id: str,
+        expected_source: WorldCausalManifest,
+    ) -> TransitionCommitInspection:
+        """Inspect commit evidence without retrying, recovering, or mutating World.
+
+        A source cut still current (or retained as the prior cut by this
+        transition's pending manifest) proves NOT_COMMITTED for this sample.
+        A committed target is accepted only when its manifest and referenced
+        journal snapshot agree. Any unreadable, stale, or conflicting state is
+        UNKNOWN. This does not claim crash-durability or cross-process recovery.
+        """
+        if not transition_id or not transition_id.strip():
+            raise ValueError("transition_id must not be empty")
+        try:
+            current = self._manifest_store.read()
+            if current.world_id != self.world_id.value or expected_source.world_id != self.world_id.value:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+
+            source_identity = (
+                expected_source.world_id,
+                expected_source.causal_tick,
+                expected_source.presence_ids,
+                expected_source.checkpoint_references,
+                expected_source.journal_last_sequence,
+                expected_source.journal_prefix_sha256,
+                expected_source.commit_id,
+                expected_source.registered_owner_ids,
+                expected_source.presence_owner_links,
+                expected_source.step_participant_ids,
+            )
+            current_identity = (
+                current.world_id,
+                current.causal_tick,
+                current.presence_ids,
+                current.checkpoint_references,
+                current.journal_last_sequence,
+                current.journal_prefix_sha256,
+                current.commit_id,
+                current.registered_owner_ids,
+                current.presence_owner_links,
+                current.step_participant_ids,
+            )
+            if current_identity == source_identity:
+                if current.status is ManifestStatus.COMMITTED:
+                    return TransitionCommitInspection(TransitionCommitState.NOT_COMMITTED)
+                if (
+                    current.status in {ManifestStatus.PREPARING, ManifestStatus.RECOVERY_REQUIRED}
+                    and current.pending_transition_id == transition_id
+                    and current.pending_tick == expected_source.causal_tick + 1
+                ):
+                    return TransitionCommitInspection(TransitionCommitState.NOT_COMMITTED)
+
+            if (
+                current.status is not ManifestStatus.COMMITTED
+                or current.causal_tick != expected_source.causal_tick + 1
+                or current.commit_id != transition_id
+            ):
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+
+            journal_references = tuple(
+                reference
+                for reference in current.checkpoint_references
+                if reference.owner == _JOURNAL_OWNER
+            )
+            if len(journal_references) != 1 or journal_references[0].owner_identity != self.world_id.value:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+            journal = self._journal_store.read(journal_references[0])
+            self._validate_cut(current, journal)
+            owner_references = tuple(
+                sorted(
+                    (reference for reference in current.checkpoint_references if reference.owner != _JOURNAL_OWNER),
+                    key=lambda reference: (reference.owner, reference.owner_identity),
+                )
+            )
+            cut = CommittedWorldCut(
+                world_id=current.world_id,
+                causal_tick=current.causal_tick,
+                commit_id=current.commit_id,
+                participant_ids=tuple(sorted((*current.registered_owner_ids, *current.step_participant_ids))),
+                presence_owner_links=current.presence_owner_links,
+                owner_checkpoint_references=owner_references,
+            )
+            return TransitionCommitInspection(TransitionCommitState.COMMITTED, cut)
+        except Exception:
+            return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
 
     def tick(
         self,

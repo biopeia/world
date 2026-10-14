@@ -60,6 +60,34 @@ class ObservationPublication:
 
     committed_cut: CommittedWorldCut
     delivery_sequences: tuple[int, ...]
+    complete: bool = True
+    failed_index: int | None = None
+    delivery_status_uncertain: bool = False
+    failure: str | None = None
+
+
+class ObservationPublicationFailure(RuntimeError):
+    """A sequential delivery failed after zero or more acknowledged messages.
+
+    The failing call's side effect cannot be inferred from its exception, so
+    ``delivery_status_uncertain`` is true whenever a publish call was entered.
+    Earlier returned sequence numbers are in-process acknowledgements only.
+    """
+
+    def __init__(
+        self,
+        *,
+        committed_cut: CommittedWorldCut,
+        delivery_sequences: tuple[int, ...],
+        failed_index: int,
+        failure: str,
+    ) -> None:
+        super().__init__(failure)
+        self.committed_cut = committed_cut
+        self.delivery_sequences = delivery_sequences
+        self.failed_index = failed_index
+        self.delivery_status_uncertain = True
+        self.failure = failure
 
 
 def publish_committed_owner_observations(
@@ -96,8 +124,18 @@ def publish_committed_owner_observations(
     # All contract failures are detected above before the first publication.
     # Delivery remains the Observation Plane's in-process, transport-neutral
     # operation; this API does not claim transactional multi-message delivery.
-    sequences = tuple(plane.publish(item.observation) for item in items)
-    return ObservationPublication(verified, sequences)
+    sequences: list[int] = []
+    for index, item in enumerate(items):
+        try:
+            sequences.append(plane.publish(item.observation))
+        except Exception as exc:
+            raise ObservationPublicationFailure(
+                committed_cut=verified,
+                delivery_sequences=tuple(sequences),
+                failed_index=index,
+                failure=f"{type(exc).__name__}: {exc}",
+            ) from exc
+    return ObservationPublication(verified, tuple(sequences))
 
 
 def _validate_owner_observation(cut: CommittedWorldCut, item: OwnerObservation) -> None:

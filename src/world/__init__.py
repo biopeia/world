@@ -8,6 +8,8 @@ from .durable_runtime import (
     OwnerCheckpointContract,
     PresenceLifecycleTransition,
     PresenceOwnerLink,
+    TransitionCommitInspection,
+    TransitionCommitState,
     WorldGenesisSpec,
 )
 from .journal import CausalRecord, EventJournal
@@ -24,10 +26,12 @@ from .manifest import (
 )
 from .observation_publication import (
     ObservationPublication,
+    ObservationPublicationFailure,
     OwnerObservation,
     publish_committed_owner_observations,
 )
 from .physical_step_publication import (
+    PhysicalStepOutcome,
     PhysicalStepPublicationResult,
     run_physical_step_and_publish,
 )
@@ -51,9 +55,11 @@ __all__ = [
     "ManifestRecoveryRequiredError",
     "ManifestStatus",
     "ObservationPublication",
+    "ObservationPublicationFailure",
     "OwnerCausalRecord",
     "OwnerCheckpointContract",
     "OwnerObservation",
+    "PhysicalStepOutcome",
     "PhysicalStepPublicationResult",
     "PresenceId",
     "PresenceLifecycleTransition",
@@ -62,6 +68,8 @@ __all__ = [
     "RuntimeStatus",
     "SingleWriterPreconditionError",
     "TickInProgressError",
+    "TransitionCommitInspection",
+    "TransitionCommitState",
     "WorldCausalManifest",
     "WorldCausalManifestStore",
     "WorldGenesisSpec",

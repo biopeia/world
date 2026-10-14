@@ -38,6 +38,8 @@ from world.durable_runtime import (
     DurableJournalSnapshotStore,
     DurableWorldRuntime,
     PresenceOwnerLink,
+    TransitionCommitInspection,
+    TransitionCommitState,
     WorldGenesisSpec,
 )
 from world.manifest import CheckpointReference, ManifestError, WorldCausalManifestStore
@@ -48,7 +50,10 @@ from world.physical_step import (
     PhysicalStepPorts,
     run_physical_step,
 )
-from world.physical_step_publication import run_physical_step_and_publish
+from world.physical_step_publication import (
+    PhysicalStepOutcome,
+    run_physical_step_and_publish,
+)
 from world.runtime import PresenceId, TickInProgressError, WorldId
 
 WORLD_ID = "world.post-commit-observation"
@@ -176,6 +181,9 @@ def _run(
     fail: bool = False,
     plane: ObservationPlane | None = None,
     on_projection: Callable[[DurableWorldRuntime], None] | None = None,
+    duplicate_observation: bool = False,
+    force_unknown_inspection: bool = False,
+    commit_then_raise: bool = False,
 ):
     field = _field()
     world = _world(tmp_path, field)
@@ -205,7 +213,8 @@ def _run(
             for ref in committed_cut.owner_checkpoint_references
             if ref.owner == "environment" and ref.owner_identity == RESOURCE_ID
         )
-        return (OwnerObservation(reference, observation),)
+        item = OwnerObservation(reference, observation)
+        return (item, item) if duplicate_observation else (item,)
 
     if fail:
         # The callback is wrapped to prove that failed/uncommitted work is not
@@ -214,6 +223,19 @@ def _run(
             pytest.fail("publication projection must not run after solver failure")
 
         project = forbidden_projection
+
+    if force_unknown_inspection:
+        world.inspect_transition_commit = lambda **_kwargs: TransitionCommitInspection(  # type: ignore[method-assign]
+            TransitionCommitState.UNKNOWN
+        )
+    if commit_then_raise:
+        commit_transition = world._manifest_store._commit_transition
+
+        def commit_then_fail(*args, **kwargs):
+            commit_transition(*args, **kwargs)
+            raise OSError("commit acknowledgment interrupted")
+
+        world._manifest_store._commit_transition = commit_then_fail  # type: ignore[method-assign]
 
     result = run_physical_step_and_publish(
         world,
@@ -249,6 +271,7 @@ def test_actual_owner_projection_is_published_only_from_committed_world_cut(tmp_
     world, plane, result = _run(tmp_path, on_projection=attempt_during_publication)
 
     assert world.causal_tick == 1
+    assert result.outcome is PhysicalStepOutcome.COMMITTED_AND_PUBLISHED
     assert result.committed_cut.causal_tick == 1
     assert result.publication.delivery_sequences == (1,)
     messages = plane.current_messages()
@@ -277,13 +300,14 @@ def test_reentrant_tick_during_projection_is_rejected(tmp_path):
 
     assert len(reentrant_tick_errors) == 1
     assert world.causal_tick == 1
+    assert result.outcome is PhysicalStepOutcome.COMMITTED_AND_PUBLISHED
     assert result.committed_cut.causal_tick == 1
     assert result.publication.delivery_sequences == (1,)
     assert plane.latest_sequence == 1
 
 
 def test_observation_sink_failure_leaves_committed_world_cut_authoritative(tmp_path):
-    """Characterize the post-commit boundary; this does not implement retry."""
+    """A sink failure is surfaced without changing the committed World cut."""
     committed_worlds = []
 
     class FailingObservationPlane:
@@ -293,15 +317,20 @@ def test_observation_sink_failure_leaves_committed_world_cut_authoritative(tmp_p
     def capture_committed_world(world: DurableWorldRuntime) -> None:
         committed_worlds.append(world)
 
-    with pytest.raises(RuntimeError, match="synthetic sink unavailable"):
-        _run(
-            tmp_path,
-            plane=FailingObservationPlane(),
-            on_projection=capture_committed_world,
-        )
+    world, _plane, result = _run(
+        tmp_path,
+        plane=FailingObservationPlane(),  # type: ignore[arg-type]
+        on_projection=capture_committed_world,
+    )
 
     assert len(committed_worlds) == 1
-    world = committed_worlds[0]
+    assert committed_worlds[0] is world
+    assert result.outcome is PhysicalStepOutcome.COMMITTED_PUBLICATION_INCOMPLETE
+    assert result.failure == "RuntimeError: synthetic sink unavailable"
+    assert result.publication is not None
+    assert result.publication.delivery_sequences == ()
+    assert result.publication.failed_index == 0
+    assert result.publication.delivery_status_uncertain is True
     assert world.causal_tick == 1
     assert world.status.value == "COMMITTED"
     assert world.manifest.status.value == "COMMITTED"
@@ -322,9 +351,72 @@ def test_observation_sink_failure_leaves_committed_world_cut_authoritative(tmp_p
 
 def test_solver_failure_commits_no_cut_and_publishes_nothing(tmp_path):
     plane = ObservationPlane()
-    with pytest.raises(RuntimeError, match="solver failure"):
-        _run(tmp_path, fail=True, plane=plane)
+    world, _plane, result = _run(tmp_path, fail=True, plane=plane)
+    assert result.outcome is PhysicalStepOutcome.NOT_COMMITTED
+    assert result.failure == "RuntimeError: deterministic solver failure"
+    assert result.recovery_required is True
+    assert world.causal_tick == 0
+    assert world.status.value == "RECOVERY_REQUIRED"
     assert plane.latest_sequence == 0
+
+
+def test_ambiguous_commit_inspection_is_reported_without_retry_or_publication(tmp_path):
+    plane = ObservationPlane()
+    world, _plane, result = _run(
+        tmp_path,
+        fail=True,
+        plane=plane,
+        force_unknown_inspection=True,
+    )
+    assert result.outcome is PhysicalStepOutcome.COMMIT_UNKNOWN
+    assert result.recovery_required is True
+    assert world.causal_tick == 0
+    assert plane.latest_sequence == 0
+
+
+def test_committed_manifest_after_lost_ack_is_not_reexecuted(tmp_path):
+    plane = ObservationPlane()
+    world, _plane, result = _run(
+        tmp_path,
+        plane=plane,
+        commit_then_raise=True,
+    )
+
+    assert result.outcome is PhysicalStepOutcome.COMMITTED_PUBLICATION_INCOMPLETE
+    assert result.committed_cut is not None
+    assert result.committed_cut.causal_tick == 1
+    assert result.committed_cut.commit_id == "commit-1"
+    assert world._manifest_store.read().causal_tick == 1
+    assert world._manifest_store.read().commit_id == "commit-1"
+    assert plane.latest_sequence == 0
+
+
+def test_partial_observation_delivery_does_not_repeat_causal_transition(tmp_path):
+    calls = []
+
+    class FailOnSecondPublish:
+        def publish(self, observation):
+            calls.append(observation)
+            if len(calls) == 1:
+                return 41
+            raise RuntimeError("second owner delivery failed")
+
+    world, _plane, result = _run(
+        tmp_path,
+        plane=FailOnSecondPublish(),  # type: ignore[arg-type]
+        duplicate_observation=True,
+    )
+
+    assert result.outcome is PhysicalStepOutcome.COMMITTED_PUBLICATION_INCOMPLETE
+    assert result.committed_cut is not None
+    assert result.committed_cut.causal_tick == 1
+    assert result.publication is not None
+    assert result.publication.delivery_sequences == (41,)
+    assert result.publication.failed_index == 1
+    assert result.publication.delivery_status_uncertain is True
+    assert len(calls) == 2
+    assert world.causal_tick == 1
+    assert world.records[-1].causal_tick == 1
 
 
 def test_stale_owner_reference_after_commit_is_rejected_without_publication(tmp_path):
@@ -357,8 +449,7 @@ def test_stale_owner_reference_after_commit_is_rejected_without_publication(tmp_
         stale_reference = replace(committed_reference, sha256="f" * 64)
         return (OwnerObservation(stale_reference, observation),)
 
-    with pytest.raises(ManifestError, match="not in the committed World cut"):
-        run_physical_step_and_publish(
+    result = run_physical_step_and_publish(
             world,
             plane,
             commit_id="commit-1",
@@ -372,6 +463,9 @@ def test_stale_owner_reference_after_commit_is_rejected_without_publication(tmp_
             project_owner_observations=project,
         )
 
+    assert result.outcome is PhysicalStepOutcome.COMMITTED_PUBLICATION_INCOMPLETE
+    assert result.failure is not None
+    assert "not in the committed World cut" in result.failure
     assert world.causal_tick == 1
     assert plane.latest_sequence == 0
 
