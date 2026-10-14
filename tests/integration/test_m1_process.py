@@ -142,9 +142,9 @@ def test_incompatible_dependency_revision_fails_preflight_without_mutation(tmp_p
     wrapper = "\n".join((
         "import sys",
         "import world.m1_process as process",
-        "def incompatible_revisions():",
-        "    raise RuntimeError('fixture dependency revision mismatch')",
-        "process.verified_revisions = incompatible_revisions",
+        "import world.m1_process as entrypoint",
+        "real_version = entrypoint.metadata.version",
+        "entrypoint.metadata.version = lambda name: '0.0.0' if name == 'world' else real_version(name)",
         "raise SystemExit(process.main(['--profile', sys.argv[1], '--state-root', sys.argv[2], '--cycles', '2']))",
     ))
     result = subprocess.run(
@@ -155,7 +155,7 @@ def test_incompatible_dependency_revision_fails_preflight_without_mutation(tmp_p
     records = _records(result.stdout)
     assert len(records) == 1 and records[0]["event"] == "failed"
     assert records[0]["outcome"] == "preflight_failed"
-    assert "revision mismatch" in records[0]["error"]
+    assert "does not match the source checkout" in records[0]["error"]
     assert not state.exists()
 
 
@@ -164,12 +164,10 @@ def test_runtime_failure_reports_last_committed_cut_and_nonzero_exit(tmp_path: P
     wrapper = "\n".join((
         "import sys",
         "import world.causal_cycle as cycle",
-        "real = cycle.run_scalar_sensorimotor_session",
-        "def fail_after_commit(*args, **kwargs):",
-        "    kwargs['max_cycles'] = 1",
-        "    real(*args, **kwargs)",
-        "    raise RuntimeError('injected failure after committed cycle')",
-        "cycle.run_scalar_sensorimotor_session = fail_after_commit",
+        "import world.observation_publication as publication",
+        "def fail_publication(world, plane, *, committed_cut, owner_observations):",
+        "    raise publication.ObservationPublicationFailure(committed_cut=committed_cut, delivery_sequences=(), failed_index=0, failure='injected publication failure')",
+        "cycle.publish_committed_owner_observations = fail_publication",
         "from world.m1_process import main",
         "raise SystemExit(main(['--profile', sys.argv[1], '--state-root', sys.argv[2], '--cycles', '20']))",
     ))
@@ -181,9 +179,10 @@ def test_runtime_failure_reports_last_committed_cut_and_nonzero_exit(tmp_path: P
     records = _records(result.stdout)
     committed = [record for record in records if record["event"] == "cycle_committed"]
     terminal = [record for record in records if record["event"] in {"completed", "stopped", "failed"}]
-    assert len(committed) == 1
+    assert len(committed) == 0  # No cycle is claimed fully published.
     assert len(terminal) == 1 and terminal[0]["event"] == "failed"
-    assert terminal[0]["outcome"] == "recovery_required"
-    assert terminal[0]["last_verified_committed_tick"] == committed[0]["last_verified_committed_tick"] == 1
-    assert terminal[0]["commit_id"] == committed[0]["commit_id"]
-    assert "injected failure after committed cycle" in result.stderr
+    assert terminal[0]["outcome"] == "failed"
+    assert terminal[0]["last_verified_committed_tick"] == 1
+    assert terminal[0]["commit_id"] is not None
+    assert terminal[0]["publication_uncertain"] is True
+    assert "ObservationPublicationFailure" in terminal[0]["error"]
