@@ -61,7 +61,12 @@ def test_fresh_world_process_runs_real_cycles_and_serves_postcommit_observations
     assert bridge_payload is not None
     assert bridge_payload["schema"] == "biopeia.observation.current.v1"
     assert bridge_payload["availability"] == "available"
-    assert {message["observation"]["family"]["qualified_name"] for message in bridge_payload["messages"]} <= {
+    qualified_families = {
+        ".".join((message["observation"]["claim"]["family"]["authority"],
+                  *message["observation"]["claim"]["family"]["path"]))
+        for message in bridge_payload["messages"]
+    }
+    assert qualified_families <= {
         "embodiment.body_pose", "environment.finite_scalar_field"
     }
 
