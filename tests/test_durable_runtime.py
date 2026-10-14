@@ -632,6 +632,63 @@ def test_inspect_transition_commit_reconstructs_source_presence_for_committed_re
     assert inspection.committed_cut.causal_tick == 1
 
 
+def test_inspect_transition_commit_rejects_unverified_source_participant_partition(tmp_path):
+    world_id = WorldId("world-inspect-unverified-participant-partition")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    apparatus = tmp_path / "apparatus-0.json"
+    organism = tmp_path / "organism-0.json"
+    apparatus.write_bytes(b"apparatus at tick zero")
+    organism.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(
+            _checkpoint(apparatus, owner="apparatus"),
+            _checkpoint(organism),
+        ),
+        registered_owner_ids=(
+            ("apparatus", "apparatus-identity"),
+            ("organism", "organism-identity"),
+        ),
+        presence_owner_links=(
+            PresenceOwnerLink(PresenceId("presence-a"), "organism", "organism-identity"),
+        ),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(
+            ("apparatus", "apparatus-identity"),
+            ("organism", "organism-identity"),
+        ),
+    )
+    expected_source = runtime.manifest
+    apparatus_next = tmp_path / "apparatus-1.json"
+    organism_next = tmp_path / "organism-1.json"
+    apparatus_next.write_bytes(b"apparatus at tick one")
+    organism_next.write_bytes(b"organism at tick one")
+    runtime.tick(
+        "transition-committed",
+        lambda _tick: (
+            _checkpoint(apparatus_next, owner="apparatus"),
+            _checkpoint(organism_next),
+        ),
+    )
+    forged_source = replace(
+        expected_source,
+        registered_owner_ids=(("organism", "organism-identity"),),
+        step_participant_ids=(("apparatus", "apparatus-identity"),),
+    )
+
+    inspection = runtime.inspect_transition_commit(
+        transition_id="transition-committed",
+        expected_source=forged_source,
+    )
+
+    assert inspection.state is durable_runtime_module.TransitionCommitState.UNKNOWN
+    assert inspection.committed_cut is None
+
+
 def test_committed_cut_receipt_is_unavailable_after_rejected_transition(tmp_path):
     world_id = WorldId("world-observation-rejected-transition")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")

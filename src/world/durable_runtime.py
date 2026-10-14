@@ -1242,6 +1242,13 @@ class DurableWorldRuntime:
                     key=lambda reference: (reference.owner, reference.owner_identity),
                 )
             )
+            # Causal-cut records persist the participant union, not the
+            # registered-vs-step-only partition. The current manifest can
+            # corroborate the source registration partition only when that
+            # registered roster is unchanged; otherwise this journal format
+            # cannot establish the exact predecessor identity.
+            if expected_source.registered_owner_ids != current.registered_owner_ids:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
             source_participants = tuple(
                 sorted((*expected_source.registered_owner_ids, *expected_source.step_participant_ids))
             )
