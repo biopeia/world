@@ -555,6 +555,83 @@ def test_inspect_transition_commit_rejects_a_non_predecessor_source_cut(tmp_path
     assert inspection.committed_cut is None
 
 
+@pytest.mark.parametrize("mismatch", ("presence", "journal_prefix"))
+def test_inspect_transition_commit_rejects_unverified_source_identity(tmp_path, mismatch):
+    world_id = WorldId(f"world-inspect-unverified-source-{mismatch}")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    expected_source = runtime.manifest
+    next_owner = tmp_path / "organism-1.json"
+    next_owner.write_bytes(b"organism at tick one")
+    runtime.tick("transition-committed", lambda _tick: (_checkpoint(next_owner),))
+
+    if mismatch == "presence":
+        unverified_source = replace(
+            expected_source,
+            presence_ids=("presence-b",),
+            presence_owner_links=(("presence-b", "organism", "organism-identity"),),
+        )
+    else:
+        unverified_source = replace(expected_source, journal_prefix_sha256="f" * 64)
+
+    inspection = runtime.inspect_transition_commit(
+        transition_id="transition-committed",
+        expected_source=unverified_source,
+    )
+
+    assert inspection.state is durable_runtime_module.TransitionCommitState.UNKNOWN
+    assert inspection.committed_cut is None
+
+
+def test_inspect_transition_commit_reconstructs_source_presence_for_committed_registration(tmp_path):
+    world_id = WorldId("world-inspect-committed-presence-registration")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    expected_source = runtime.manifest
+    next_owner = tmp_path / "organism-1.json"
+    next_owner.write_bytes(b"organism at tick one")
+    runtime.tick(
+        "transition-register-presence",
+        lambda _tick: (_checkpoint(next_owner),),
+        register_presence=("presence-b",),
+        presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "organism", "organism-identity"),),
+        presence_lifecycle=_presence_lifecycle("REGISTER", "presence-b"),
+    )
+
+    inspection = runtime.inspect_transition_commit(
+        transition_id="transition-register-presence",
+        expected_source=expected_source,
+    )
+
+    assert inspection.state is durable_runtime_module.TransitionCommitState.COMMITTED
+    assert inspection.committed_cut is not None
+    assert inspection.committed_cut.causal_tick == 1
+
+
 def test_committed_cut_receipt_is_unavailable_after_rejected_transition(tmp_path):
     world_id = WorldId("world-observation-rejected-transition")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
