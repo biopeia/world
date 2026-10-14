@@ -1072,11 +1072,12 @@ class DurableWorldRuntime:
     ) -> TransitionCommitInspection:
         """Inspect commit evidence without retrying, recovering, or mutating World.
 
-        A source cut still current (or retained as the prior cut by this
-        transition's pending manifest) proves NOT_COMMITTED for this sample.
-        A committed target is accepted only when its manifest and referenced
-        journal snapshot agree. Any unreadable, stale, or conflicting state is
-        UNKNOWN. This does not claim crash-durability or cross-process recovery.
+        A committed source cut still current proves NOT_COMMITTED for this
+        sample. A pending manifest is ambiguous and remains UNKNOWN. A
+        committed target is accepted only when its manifest, referenced
+        journal snapshot, and recorded predecessor cut agree. Any unreadable,
+        stale, or conflicting state is UNKNOWN. This does not claim
+        crash-durability or cross-process recovery.
         """
         if not transition_id or not transition_id.strip():
             raise ValueError("transition_id must not be empty")
@@ -1112,12 +1113,6 @@ class DurableWorldRuntime:
             if current_identity == source_identity:
                 if current.status is ManifestStatus.COMMITTED:
                     return TransitionCommitInspection(TransitionCommitState.NOT_COMMITTED)
-                if (
-                    current.status in {ManifestStatus.PREPARING, ManifestStatus.RECOVERY_REQUIRED}
-                    and current.pending_transition_id == transition_id
-                    and current.pending_tick == expected_source.causal_tick + 1
-                ):
-                    return TransitionCommitInspection(TransitionCommitState.NOT_COMMITTED)
 
             if (
                 current.status is not ManifestStatus.COMMITTED
@@ -1135,6 +1130,39 @@ class DurableWorldRuntime:
                 return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
             journal = self._journal_store.read(journal_references[0])
             self._validate_cut(current, journal)
+            source_cut_records = tuple(
+                record
+                for record in journal.records_at_tick(expected_source.causal_tick)
+                if record.record_type == _CAUSAL_CUT_RECORD_TYPE
+            )
+            if len(source_cut_records) != 1:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+            source_cut_record = source_cut_records[0]
+            _validate_causal_cut_record(source_cut_record)
+            source_owner_references = tuple(
+                sorted(
+                    (
+                        reference
+                        for reference in expected_source.checkpoint_references
+                        if reference.owner != _JOURNAL_OWNER
+                    ),
+                    key=lambda reference: (reference.owner, reference.owner_identity),
+                )
+            )
+            source_participants = tuple(
+                sorted((*expected_source.registered_owner_ids, *expected_source.step_participant_ids))
+            )
+            source_payload = source_cut_record.payload
+            if (
+                expected_source.status is not ManifestStatus.COMMITTED
+                or source_cut_record.world_id != expected_source.world_id
+                or source_payload["commit_id"] != expected_source.commit_id
+                or tuple(tuple(item) for item in source_payload["participants"])
+                != source_participants
+                or tuple(source_payload["owner_checkpoint_references"])
+                != tuple(_reference_descriptor(reference) for reference in source_owner_references)
+            ):
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
             owner_references = tuple(
                 sorted(
                     (reference for reference in current.checkpoint_references if reference.owner != _JOURNAL_OWNER),

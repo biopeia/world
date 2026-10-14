@@ -477,6 +477,84 @@ def test_receipt_lookup_does_not_convert_live_preparing_transition_to_recovery_r
     assert manifest_store.read().status is ManifestStatus.COMMITTED
 
 
+def test_inspect_transition_commit_treats_pending_matching_transition_as_unknown(tmp_path):
+    world_id = WorldId("world-inspect-pending-transition")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    expected_source = runtime.manifest
+
+    manifest_store._begin_transition(
+        "transition-pending",
+        expected_manifest=expected_source,
+    )
+
+    inspection = runtime.inspect_transition_commit(
+        transition_id="transition-pending",
+        expected_source=expected_source,
+    )
+
+    assert manifest_store.read().status is ManifestStatus.PREPARING
+    assert inspection.state is durable_runtime_module.TransitionCommitState.UNKNOWN
+    assert inspection.committed_cut is None
+
+
+def test_inspect_transition_commit_rejects_a_non_predecessor_source_cut(tmp_path):
+    world_id = WorldId("world-inspect-divergent-source")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    expected_source = runtime.manifest
+    next_owner = tmp_path / "organism-1.json"
+    next_owner.write_bytes(b"organism at tick one")
+    runtime.tick("transition-committed", lambda _tick: (_checkpoint(next_owner),))
+
+    owner_reference = next(
+        reference
+        for reference in expected_source.checkpoint_references
+        if reference.owner == "organism"
+    )
+    divergent_source = replace(
+        expected_source,
+        checkpoint_references=tuple(
+            replace(reference, sha256="0" * 64)
+            if reference == owner_reference
+            else reference
+            for reference in expected_source.checkpoint_references
+        ),
+    )
+
+    inspection = runtime.inspect_transition_commit(
+        transition_id="transition-committed",
+        expected_source=divergent_source,
+    )
+
+    assert inspection.state is durable_runtime_module.TransitionCommitState.UNKNOWN
+    assert inspection.committed_cut is None
+
+
 def test_committed_cut_receipt_is_unavailable_after_rejected_transition(tmp_path):
     world_id = WorldId("world-observation-rejected-transition")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
