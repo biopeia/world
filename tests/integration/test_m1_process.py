@@ -137,6 +137,28 @@ def test_existing_state_target_is_byte_for_byte_unchanged_on_preflight_failure(t
     assert after == before
 
 
+def test_incompatible_dependency_revision_fails_preflight_without_mutation(tmp_path: Path) -> None:
+    state = tmp_path / "not-created"
+    wrapper = "\n".join((
+        "import sys",
+        "import world.m1_process as process",
+        "def incompatible_revisions():",
+        "    raise RuntimeError('fixture dependency revision mismatch')",
+        "process.verified_revisions = incompatible_revisions",
+        "raise SystemExit(process.main(['--profile', sys.argv[1], '--state-root', sys.argv[2], '--cycles', '2']))",
+    ))
+    result = subprocess.run(
+        [sys.executable, "-c", wrapper, str(PROFILE), str(state)],
+        cwd=Path(__file__).parents[2], capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 2
+    records = _records(result.stdout)
+    assert len(records) == 1 and records[0]["event"] == "failed"
+    assert records[0]["outcome"] == "preflight_failed"
+    assert "revision mismatch" in records[0]["error"]
+    assert not state.exists()
+
+
 def test_runtime_failure_reports_last_committed_cut_and_nonzero_exit(tmp_path: Path) -> None:
     state = tmp_path / "state"
     wrapper = "\n".join((
