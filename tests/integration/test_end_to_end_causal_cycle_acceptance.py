@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -52,6 +53,7 @@ from environment import (
     StaticPhysicalScene,
 )
 from modality import DimensionlessScalarFieldIdentityV1
+from observation.http_bridge import LocalObservationReadBridge
 from observation.plane import ObservationPlane
 from organism.actuation import (
     ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
@@ -76,6 +78,7 @@ from organism.transition import (
 
 from world.adapters.articulated_mujoco import ArticulatedMujocoConfiguration
 from world.causal_cycle import (
+    CausalCycleResult,
     restore_scalar_sensorimotor_runtime,
     run_scalar_sensorimotor_cycle_and_publish,
 )
@@ -177,6 +180,10 @@ def _run(
     malformed_organism_checkpoint: bool = False,
     kernel_limits: KernelLimits = KernelLimits(),
     actuator_surface_material: str = SURFACE_FINGERPRINT,
+    after_first_commit: Callable[
+        [DurableWorldRuntime, CausalCycleResult, ObservationPlane], None
+    ]
+    | None = None,
 ):
     frame = _frame()
     spec = _spec()
@@ -430,6 +437,8 @@ def _run(
         owner_checkpoint_store=owner_checkpoint_store,
     )
     first_messages = plane.current_messages()
+    if after_first_commit is not None:
+        after_first_commit(world, result, plane)
     if stop_after_first:
         return result, first_messages, None, None
 
@@ -1086,3 +1095,142 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
     assert first_resumed.physical_outcome.body_state.joints == pytest.approx(
         second_resumed.physical_outcome.body_state.joints
     )
+
+
+def test_committed_world_publications_are_readable_through_local_observation_bridge(
+    tmp_path: Path,
+) -> None:
+    reads: list[dict[str, object]] = []
+
+    def read_after_commit(
+        world: DurableWorldRuntime,
+        result: CausalCycleResult,
+        plane: ObservationPlane,
+    ) -> None:
+        committed_cut = result.committed_cut
+        publication = result.observation_publication
+        assert publication.committed_cut == committed_cut
+        world_before = world.causal_tick
+        manifest_before = WorldCausalManifestStore(
+            tmp_path / "bridge-read" / "manifest.json"
+        ).read()
+        retained_before = plane.current_messages()
+        with LocalObservationReadBridge.create(
+            plane,
+            host="127.0.0.1",
+            port=0,
+            allowed_origin="http://127.0.0.1:4173",
+        ) as bridge:
+            host, port = bridge.address
+            request = urllib.request.Request(
+                f"http://{host}:{port}/v1/current",
+                headers={"Origin": "http://127.0.0.1:4173"},
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                assert response.status == 200
+                assert response.headers["Cache-Control"] == "no-store"
+                first = json.loads(response.read())
+            with urllib.request.urlopen(request, timeout=2) as response:
+                second = json.loads(response.read())
+
+        assert first == second
+        assert first["schema"] == "biopeia.observation.current.v1"
+        assert first["scope"] == "bounded_in_memory_current_subset"
+        assert first["absence_semantics"] == "not_evidence_of_source_absence"
+        assert len(first["messages"]) == 2
+        assert [item["delivery_sequence"] for item in first["messages"]] == [
+            message.sequence for message in retained_before
+        ]
+        assert [item["delivery_sequence"] for item in first["messages"]] == list(
+            publication.delivery_sequences
+        )
+        observations = [item["observation"] for item in first["messages"]]
+        family_names = {
+            f"{observation['claim']['family']['authority']}."
+            f"{'.'.join(observation['claim']['family']['path'])}"
+            for observation in observations
+        }
+        assert family_names == {"embodiment.body_pose", "environment.finite_scalar_field"}
+        assert all(
+            any(
+                item["domain"] == "world"
+                and item["kind"] in {"world_causal_tick", "world_target_causal_tick"}
+                and item["value"] == committed_cut.causal_tick
+                for item in observation["context_time"]
+            )
+            for observation in observations
+        )
+        body_observation = next(
+            observation
+            for observation in observations
+            if observation["claim"]["family"]["authority"] == "embodiment"
+        )
+        field_observation = next(
+            observation
+            for observation in observations
+            if observation["claim"]["family"]["authority"] == "environment"
+        )
+        assert body_observation["claim"]["family"]["contract"] == {
+            "contract_id": "embodiment.body_pose",
+            "revision": "v1",
+        }
+        assert field_observation["claim"]["family"]["contract"] == {
+            "contract_id": "biopeia.environment.finite-scalar-field",
+            "revision": "1",
+        }
+        body_projection = dict(
+            body_observation["lineage"]["transformation"]["effective_configuration"]
+        )
+        field_projection = dict(
+            field_observation["lineage"]["transformation"]["effective_configuration"]
+        )
+        assert body_projection["world_id"] == committed_cut.world_id
+        assert body_projection["causal_tick"] == str(committed_cut.causal_tick)
+        assert body_projection["body_id"] == BODY_ID
+        assert body_projection["embodiment_episode_id"] == EPISODE_ID
+        assert body_projection["morphology_revision"] == MORPHOLOGY_REVISION
+        assert field_projection["world_id"] == committed_cut.world_id
+        assert field_projection["physical_step_id"] == "physical-step.acceptance.sensorimotor.tick-1"
+        assert any(
+            reference.owner == "embodiment"
+            and reference.sha256
+            in {
+                parent["reference"]
+                for observation in observations
+                if observation["claim"]["family"]["authority"] == "embodiment"
+                and observation["claim"]["family"]["path"] == ["body_pose"]
+                for parent in observation["lineage"]["parents"]
+            }
+            for reference in committed_cut.owner_checkpoint_references
+        )
+        assert any(
+            reference.owner == "environment"
+            and reference.owner_identity == RESOURCE_ID
+            and reference.sha256
+            in {
+                parent["reference"]
+                for observation in observations
+                if observation["claim"]["family"]["authority"] == "environment"
+                and observation["claim"]["family"]["path"] == ["finite_scalar_field"]
+                for parent in observation["lineage"]["parents"]
+            }
+            for reference in committed_cut.owner_checkpoint_references
+        )
+        assert world.causal_tick == world_before == committed_cut.causal_tick == 1
+        assert WorldCausalManifestStore(
+            tmp_path / "bridge-read" / "manifest.json"
+        ).read() == manifest_before
+        assert plane.current_messages() == retained_before
+        reads.append(first)
+
+    result, messages, resumed, _ = _run(
+        tmp_path / "bridge-read",
+        stop_after_first=True,
+        continue_from_live_state=True,
+        after_first_commit=read_after_commit,
+    )
+    assert resumed is None
+    assert result.committed_cut.causal_tick == 1
+    assert len(messages) == 2
+    assert len(reads) == 1
