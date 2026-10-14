@@ -16,6 +16,7 @@ import fcntl
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
 from pathlib import Path
 from threading import Lock, get_ident
@@ -607,6 +608,22 @@ class CommittedWorldCut:
     owner_checkpoint_references: tuple[CheckpointReference, ...]
 
 
+class TransitionCommitState(str, Enum):
+    """Read-only classification of one transition against current manifest evidence."""
+
+    NOT_COMMITTED = "NOT_COMMITTED"
+    COMMITTED = "COMMITTED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionCommitInspection:
+    """Read-only transition classification; it does not perform recovery."""
+
+    state: TransitionCommitState
+    committed_cut: CommittedWorldCut | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerCausalRecord:
     """Opaque owner-authored record committed in a World causal journal.
@@ -1046,6 +1063,223 @@ class DurableWorldRuntime:
                 presence_owner_links=manifest.presence_owner_links,
                 owner_checkpoint_references=owner_references,
             )
+
+    def inspect_transition_commit(
+        self,
+        *,
+        transition_id: str,
+        expected_source: WorldCausalManifest,
+    ) -> TransitionCommitInspection:
+        """Inspect commit evidence without retrying, recovering, or mutating World.
+
+        A committed source cut still current proves NOT_COMMITTED for this
+        sample. A pending manifest is ambiguous and remains UNKNOWN. A
+        committed target is accepted only when its manifest, referenced
+        journal snapshot, and recorded predecessor cut agree. Any unreadable,
+        stale, or conflicting state is UNKNOWN. This does not claim
+        crash-durability or cross-process recovery.
+        """
+        if not transition_id or not transition_id.strip():
+            raise ValueError("transition_id must not be empty")
+        try:
+            current = self._manifest_store.read()
+            if current.world_id != self.world_id.value or expected_source.world_id != self.world_id.value:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+
+            source_identity = (
+                expected_source.world_id,
+                expected_source.causal_tick,
+                expected_source.presence_ids,
+                expected_source.checkpoint_references,
+                expected_source.journal_last_sequence,
+                expected_source.journal_prefix_sha256,
+                expected_source.commit_id,
+                expected_source.registered_owner_ids,
+                expected_source.presence_owner_links,
+                expected_source.step_participant_ids,
+            )
+            current_identity = (
+                current.world_id,
+                current.causal_tick,
+                current.presence_ids,
+                current.checkpoint_references,
+                current.journal_last_sequence,
+                current.journal_prefix_sha256,
+                current.commit_id,
+                current.registered_owner_ids,
+                current.presence_owner_links,
+                current.step_participant_ids,
+            )
+            if current_identity == source_identity:
+                if current.status is ManifestStatus.COMMITTED:
+                    return TransitionCommitInspection(TransitionCommitState.NOT_COMMITTED)
+
+            if (
+                current.status is not ManifestStatus.COMMITTED
+                or current.causal_tick != expected_source.causal_tick + 1
+                or current.commit_id != transition_id
+            ):
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+
+            journal_references = tuple(
+                reference
+                for reference in current.checkpoint_references
+                if reference.owner == _JOURNAL_OWNER
+            )
+            if len(journal_references) != 1 or journal_references[0].owner_identity != self.world_id.value:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+            journal = self._journal_store.read(journal_references[0])
+            self._validate_cut(current, journal)
+            source_cut_records = tuple(
+                record
+                for record in journal.records_at_tick(expected_source.causal_tick)
+                if record.record_type == _CAUSAL_CUT_RECORD_TYPE
+            )
+            if len(source_cut_records) != 1:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+            source_cut_record = source_cut_records[0]
+            _validate_causal_cut_record(source_cut_record)
+            source_cut_sequence = next(
+                index
+                for index, record in enumerate(journal.replay())
+                if record is source_cut_record
+            )
+            source_prefix_count = (expected_source.journal_last_sequence + 1) if (
+                expected_source.journal_last_sequence is not None
+            ) else 0
+            if (
+                expected_source.journal_last_sequence is None
+                or source_prefix_count <= source_cut_sequence
+                or source_prefix_count > len(journal)
+                or journal.prefix_digest(source_prefix_count) != expected_source.journal_prefix_sha256
+                or any(
+                    record.causal_tick > expected_source.causal_tick
+                    for record in journal.replay()[:source_prefix_count]
+                )
+                or journal.record_at(source_prefix_count - 1).causal_tick != expected_source.causal_tick
+            ):
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+
+            # Reconstruct the source presence projection by reversing only
+            # committed lifecycle records after that cut. The journal does not
+            # make presence identity inferable from owner references alone.
+            source_presence = set(current.presence_ids)
+            source_presence_links = {
+                presence: (owner, identity)
+                for presence, owner, identity in current.presence_owner_links
+            }
+            later_lifecycle_records = tuple(
+                record
+                for record in journal.replay()
+                if record.record_type == "world.presence.lifecycle.committed"
+                and expected_source.causal_tick < record.causal_tick <= current.causal_tick
+            )
+            for lifecycle_record in reversed(later_lifecycle_records):
+                payload = lifecycle_record.payload
+                if (
+                    lifecycle_record.world_id != current.world_id
+                    or lifecycle_record.actor_id != "world"
+                    or not isinstance(payload, Mapping)
+                    or payload.get("authority") != "world"
+                    or payload.get("source_tick") != lifecycle_record.causal_tick - 1
+                    or payload.get("target_tick") != lifecycle_record.causal_tick
+                ):
+                    return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+                affected_presence = payload.get("affected_presence_id")
+                affected_owner = payload.get("affected_owner")
+                transition_type = payload.get("transition_type")
+                if (
+                    not isinstance(affected_presence, str)
+                    or not affected_presence
+                    or not isinstance(affected_owner, Mapping)
+                    or set(affected_owner) != {"owner_id", "owner_identity"}
+                    or not all(
+                        isinstance(affected_owner.get(field), str) and affected_owner[field]
+                        for field in ("owner_id", "owner_identity")
+                    )
+                    or transition_type not in {"REGISTER", "TERMINATE"}
+                ):
+                    return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+                recorded_resulting_presence = payload.get("resulting_active_presence_ids")
+                recorded_resulting_links = payload.get("resulting_presence_owner_links")
+                if (
+                    not isinstance(recorded_resulting_presence, tuple)
+                    or not isinstance(recorded_resulting_links, tuple)
+                    or tuple(sorted(source_presence)) != tuple(recorded_resulting_presence)
+                    or tuple(
+                        (presence, *source_presence_links[presence])
+                        for presence in sorted(source_presence_links)
+                    ) != tuple(tuple(link) for link in recorded_resulting_links)
+                ):
+                    return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+                owner_link = (affected_owner["owner_id"], affected_owner["owner_identity"])
+                if transition_type == "REGISTER":
+                    if source_presence_links.get(affected_presence) != owner_link:
+                        return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+                    source_presence.discard(affected_presence)
+                    source_presence_links.pop(affected_presence, None)
+                else:
+                    if affected_presence in source_presence or affected_presence in source_presence_links:
+                        return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+                    source_presence.add(affected_presence)
+                    source_presence_links[affected_presence] = owner_link
+
+            if (
+                tuple(sorted(source_presence)) != tuple(sorted(expected_source.presence_ids))
+                or tuple(
+                    (presence, *source_presence_links[presence])
+                    for presence in sorted(source_presence_links)
+                ) != tuple(sorted(expected_source.presence_owner_links))
+            ):
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+            source_owner_references = tuple(
+                sorted(
+                    (
+                        reference
+                        for reference in expected_source.checkpoint_references
+                        if reference.owner != _JOURNAL_OWNER
+                    ),
+                    key=lambda reference: (reference.owner, reference.owner_identity),
+                )
+            )
+            # Causal-cut records persist the participant union, not the
+            # registered-vs-step-only partition. The current manifest can
+            # corroborate the source registration partition only when that
+            # registered roster is unchanged; otherwise this journal format
+            # cannot establish the exact predecessor identity.
+            if expected_source.registered_owner_ids != current.registered_owner_ids:
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+            source_participants = tuple(
+                sorted((*expected_source.registered_owner_ids, *expected_source.step_participant_ids))
+            )
+            source_payload = source_cut_record.payload
+            if (
+                expected_source.status is not ManifestStatus.COMMITTED
+                or source_cut_record.world_id != expected_source.world_id
+                or source_payload["commit_id"] != expected_source.commit_id
+                or tuple(tuple(item) for item in source_payload["participants"])
+                != source_participants
+                or tuple(source_payload["owner_checkpoint_references"])
+                != tuple(_reference_descriptor(reference) for reference in source_owner_references)
+            ):
+                return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
+            owner_references = tuple(
+                sorted(
+                    (reference for reference in current.checkpoint_references if reference.owner != _JOURNAL_OWNER),
+                    key=lambda reference: (reference.owner, reference.owner_identity),
+                )
+            )
+            cut = CommittedWorldCut(
+                world_id=current.world_id,
+                causal_tick=current.causal_tick,
+                commit_id=current.commit_id,
+                participant_ids=tuple(sorted((*current.registered_owner_ids, *current.step_participant_ids))),
+                presence_owner_links=current.presence_owner_links,
+                owner_checkpoint_references=owner_references,
+            )
+            return TransitionCommitInspection(TransitionCommitState.COMMITTED, cut)
+        except Exception:
+            return TransitionCommitInspection(TransitionCommitState.UNKNOWN)
 
     def tick(
         self,
