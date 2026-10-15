@@ -550,7 +550,7 @@ def construct_fresh_runtime(
         iterations=solver_profile["iterations"], tolerance=solver_profile["tolerance"],
         solref=tuple(solver_profile["solref"]), solimp=tuple(solver_profile["solimp"]),
         contact_policy=solver_profile["contact_policy"],
-        velocity_regulation_policy="m1-fixed-single-hinge-grid-v1",
+        velocity_regulation_policy="m1-fixed-single-hinge-grid-v2",
     )
 
     contracts: dict[tuple[str, str], Any] = {

@@ -57,7 +57,8 @@ def test_fresh_world_process_runs_real_cycles_and_serves_postcommit_observations
     assert [record["last_verified_committed_tick"] for record in committed] == list(range(1, 21))
     for record in committed:
         regulation = record["velocity_regulation"]
-        assert regulation["policy"] == "m1-fixed-single-hinge-grid-v1"
+        assert regulation["policy"] == "m1-fixed-single-hinge-grid-v2"
+        assert regulation["solver_config_revision"] == "mujoco-3.15.0-m1-operator-r3-grid-v2"
         assert abs(regulation["applied_torque_nm"]) <= regulation["effort_limit_nm"]
         assert abs(regulation["candidate_velocity_rad_per_s"]) <= regulation["velocity_cap_rad_per_s"]
     terminal = [record for record in records if record["event"] in {"completed", "stopped", "failed"}]

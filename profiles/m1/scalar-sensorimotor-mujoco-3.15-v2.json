@@ -138,7 +138,7 @@
   "solver": {
     "engine": "mujoco",
     "version": "3.15.0",
-    "revision": "mujoco-3.15.0-m1-operator-r3",
+    "revision": "mujoco-3.15.0-m1-operator-r3-grid-v2",
     "timestep_s": 0.01,
     "iterations": 50,
     "tolerance": 1e-10,

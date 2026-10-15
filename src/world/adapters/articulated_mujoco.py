@@ -57,20 +57,35 @@ from world.physical_step import (
 )
 
 
-def _select_compliant_torque(requested: float, effort: float, cap: float, trial):
-    """Choose nearest compliant value from a deterministic bounded grid."""
-    requested_velocity = trial(requested)
-    if requested_velocity is not None and abs(requested_velocity) <= cap:
-        return requested, requested_velocity
+def _select_compliant_torque(
+    requested: float,
+    effort: float,
+    lower: float,
+    upper: float,
+    velocity_cap: float,
+    trial,
+):
+    """Choose the nearest tested torque satisfying owner morphology bounds."""
+    requested_state = trial(requested)
+    if (
+        requested_state is not None
+        and lower <= requested_state[0] <= upper
+        and abs(requested_state[1]) <= velocity_cap
+    ):
+        return requested, requested_state
     candidates = [requested]
     candidates.extend(-effort + (2 * effort * i / 1000) for i in range(1001))
     feasible = []
     for applied in candidates:
-        velocity = trial(applied)
-        if velocity is not None and abs(velocity) <= cap:
-            feasible.append((abs(applied - requested), applied, velocity))
+        state = trial(applied)
+        if (
+            state is not None
+            and lower <= state[0] <= upper
+            and abs(state[1]) <= velocity_cap
+        ):
+            feasible.append((abs(applied - requested), applied, state))
     if not feasible:
-        raise ValueError("no tested applied torque produces a velocity-compliant candidate")
+        raise ValueError("no tested applied torque produces a morphology-compliant candidate")
     _, applied, velocity = min(feasible, key=lambda item: (item[0], item[1]))
     return applied, velocity
 
@@ -187,7 +202,11 @@ class ArticulatedMujocoConfiguration:
             raise ValueError("invalid explicit constraint impedance")
         if self.contact_policy != "max-sliding-body-torsion-rolling/no-self-collision-v1":
             raise ValueError("unsupported explicit contact policy")
-        if self.velocity_regulation_policy not in {"none", "m1-fixed-single-hinge-grid-v1"}:
+        if self.velocity_regulation_policy not in {
+            "none",
+            "m1-fixed-single-hinge-grid-v1",
+            "m1-fixed-single-hinge-grid-v2",
+        }:
             raise ValueError("unsupported velocity regulation policy")
 
 
@@ -301,6 +320,17 @@ def execute_articulated_mujoco_step(
         joint.range = (limits.lower_rad, limits.upper_rad)
         joint.solref_limit = configuration.solref
         joint.solimp_limit = configuration.solimp
+        if configuration.velocity_regulation_policy == "m1-fixed-single-hinge-grid-v2":
+            # MuJoCo activates joint-limit constraints at the boundary. With a
+            # finite causal timestep, a near-limit state at the allowed peak
+            # velocity can cross the Embodiment range before the next state is
+            # observable. Activate the unchanged range's constraint early by
+            # at most one timestep of the owner velocity cap. This is a solver
+            # margin, not a changed morphology range or a qpos clamp.
+            joint.margin = min(
+                (limits.upper_rad - limits.lower_rad) / 2,
+                limits.max_velocity_rad_per_s * configuration.timestep_s,
+            )
 
     body_geoms = tuple(spec.geoms)
     for index, geom in enumerate(body_geoms):
@@ -366,9 +396,8 @@ def execute_articulated_mujoco_step(
         joint_id = body.joints[0].joint_id
         joint_native = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
         dof = int(model.jnt_dofadr[joint_native])
-        velocity_cap = next(
-            item.max_velocity_rad_per_s for item in body.joint_ranges if item.joint_id == joint_id
-        )
+        joint_range = next(item for item in body.joint_ranges if item.joint_id == joint_id)
+        velocity_cap = joint_range.max_velocity_rad_per_s
         effort_cap = float(topology[joint_id].find("limit").attrib["effort"])
         requested_torque = float(data.qfrc_applied[dof])
         if abs(float(data.qvel[dof])) > velocity_cap:
@@ -377,27 +406,55 @@ def execute_articulated_mujoco_step(
         source_qvel = np.array(data.qvel, copy=True)
         source_qfrc = np.array(data.qfrc_applied, copy=True)
 
+        qpos_address = int(model.jnt_qposadr[joint_native])
+
         def trial(applied: float):
-            return _mujoco_trial(mujoco, model, source_qpos, source_qvel, source_qfrc, dof, applied)
+            result = _mujoco_trial(
+                mujoco, model, source_qpos, source_qvel, source_qfrc, dof, applied
+            )
+            if result is None:
+                return None
+            return float(result.qpos[qpos_address]), float(result.qvel[dof])
 
         # Deterministic bounded grid is a tested-candidate search, not a proof
         # that no feasible torque exists between samples. Preserve the requested
         # value exactly when it is already compliant.
-        applied_torque, candidate_velocity = _select_compliant_torque(
-            requested_torque, effort_cap, velocity_cap,
-            lambda applied: (None if (result := trial(applied)) is None else float(result.qvel[dof])),
+        applied_torque, candidate_state = _select_compliant_torque(
+            requested_torque,
+            effort_cap,
+            joint_range.lower_rad,
+            joint_range.upper_rad,
+            velocity_cap,
+            trial,
         )
-        data = trial(applied_torque)
+        data = _mujoco_trial(
+            mujoco, model, source_qpos, source_qvel, source_qfrc, dof, applied_torque
+        )
+        if data is None:
+            raise ValueError("selected torque no longer produces a valid MuJoCo candidate")
         # Keep regulation evidence World-owned and inspectable without rewriting
         # the Organism command or Embodiment's state/limits.
         regulation = {
-            "policy": "m1-fixed-single-hinge-grid-v1",
+            "policy": configuration.velocity_regulation_policy,
+            "world_id": context.world_id,
+            "source_causal_tick": context.source_causal_tick,
+            "target_causal_tick": context.target_causal_tick,
+            "physical_step_id": context.physical_step_id,
+            "body_id": context.body_id,
+            "embodiment_episode_id": context.embodiment_episode_id,
+            "morphology_revision": context.morphology_revision,
+            "solver_config_revision": context.solver_config_revision,
             "joint_id": joint_id,
+            "source_position_rad": float(source_qpos[qpos_address]),
+            "source_velocity_rad_per_s": float(source_qvel[dof]),
             "requested_torque_nm": requested_torque,
             "applied_torque_nm": float(applied_torque),
             "effort_limit_nm": effort_cap,
+            "position_range_rad": [joint_range.lower_rad, joint_range.upper_rad],
+            "joint_limit_activation_margin_rad": float(model.jnt_margin[joint_native]),
+            "candidate_position_rad": candidate_state[0],
             "velocity_cap_rad_per_s": velocity_cap,
-            "candidate_velocity_rad_per_s": candidate_velocity,
+            "candidate_velocity_rad_per_s": candidate_state[1],
         }
     if not np.all(np.isfinite(data.qpos)) or not np.all(np.isfinite(data.qvel)) or any(warning.number for warning in data.warning):
         raise ValueError("MuJoCo produced invalid/warning-reset numerical state")
