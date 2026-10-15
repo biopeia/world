@@ -23,7 +23,7 @@ wheels = [
 [[package]]
 name = "embodiment"
 version = "0.1.0a1"
-source = { git = "https://github.com/biopeia/embodiment.git?rev=main#55475dc45aafe525737b2bf29bbf6e11997b940c" }
+source = { git = "https://github.com/biopeia/embodiment.git?rev=main#d73315d87bbb3f2eea14e8c33812b37b59a5d72f" }
 
 [[package]]
 name = "environment"
@@ -83,7 +83,7 @@ wheels = [
 [[package]]
 name = "modality"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/modality.git?rev=main#93a4c3a4ea71dcf65269ce730aab736238fd3ea7" }
+source = { git = "https://github.com/biopeia/modality.git?rev=main#62af4aba07146d5dfdc978af07bb72111112d873" }
 
 [[package]]
 name = "mujoco"
@@ -201,12 +201,12 @@ wheels = [
 [[package]]
 name = "observation"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/observation.git?rev=main#2f4751f53678f2210930770605844cac766b1da4" }
+source = { git = "https://github.com/biopeia/observation.git?rev=main#a8b43af65b79ca4e2455bfc1ff1b55faf3d4d353" }
 
 [[package]]
 name = "organism"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/organism.git?rev=main#b674450dd6678d7a0a00a41591648511814709ba" }
+source = { git = "https://github.com/biopeia/organism.git?rev=main#d8ed534d48188fb2f629faaa8dd85b95063a0c2d" }
 
 [[package]]
 name = "packaging"
