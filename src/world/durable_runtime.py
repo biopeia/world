@@ -741,6 +741,7 @@ class DurableWorldRuntime:
         self._journal_store = journal_store
         self._manifest = manifest
         self._journal = journal
+        self._owner_causal_record_identity_index = self._owner_causal_record_keys(journal.replay())
         self._owner_checkpoint_verifier = owner_checkpoint_verifier
         self._owner_checkpoint_contracts = dict(owner_checkpoint_contracts)
         self._tick_guard = Lock()
@@ -1462,11 +1463,8 @@ class DurableWorldRuntime:
                     actor_id="world" if presence_lifecycle is not None else self.presence_id,
                     payload={"presence_id": self.presence_id},
                 )
-                candidate_journal = EventJournal.from_snapshot(self._journal.snapshot())
-                existing_owner_record_keys = self._owner_causal_record_keys(
-                    candidate_journal.replay()
-                )
-                if existing_owner_record_keys.intersection(owner_record_keys):
+                candidate_journal = self._journal.candidate()
+                if self._owner_causal_record_identity_index.intersection(owner_record_keys):
                     raise ManifestError("owner causal record identity was already committed in this World")
                 candidate_journal.append(record)
                 candidate_journal.append(
@@ -1583,7 +1581,8 @@ class DurableWorldRuntime:
                         proposed_contracts,
                     ),
                 )
-                self._journal = candidate_journal
+                self._journal = candidate_journal.commit()
+                self._owner_causal_record_identity_index.update(owner_record_keys)
                 self._manifest = candidate
                 self._owner_checkpoint_contracts = {
                     key: proposed_contracts[key] for key in registered

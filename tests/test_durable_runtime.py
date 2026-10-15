@@ -319,7 +319,7 @@ def _presence_lifecycle(transition_type, presence_id):
     )
 
 
-def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_manifest(tmp_path):
+def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_manifest(tmp_path, monkeypatch):
     world_id = WorldId("world-durable")
     manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
     journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
@@ -335,6 +335,12 @@ def test_durable_tick_publishes_journal_and_owner_checkpoint_before_complete_man
         owner_checkpoint_verifier=_verifier,
         owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
     )
+
+    def reject_full_snapshot(*_args, **_kwargs):
+        raise AssertionError("durable tick must not copy the complete journal prefix")
+
+    monkeypatch.setattr(EventJournal, "snapshot", reject_full_snapshot)
+    monkeypatch.setattr(EventJournal, "from_snapshot", classmethod(reject_full_snapshot))
 
     def write_tick_one(tick: int):
         assert tick == 1

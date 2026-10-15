@@ -60,6 +60,29 @@ def test_staged_records_commit_or_abort_as_a_batch():
     assert len(journal) == 2
 
 
+def test_candidate_is_an_append_overlay_until_explicit_commit():
+    journal = EventJournal()
+    original = record(record_id="base", causal_tick=0)
+    journal.append(original)
+    committed_digest = journal.prefix_digest()
+
+    candidate = journal.candidate()
+    appended = record(record_id="candidate", causal_tick=1)
+    candidate.append(appended)
+
+    assert len(journal) == 1
+    assert journal.replay() == (original,)
+    assert len(candidate) == 2
+    assert candidate.record_at(0) is original
+    assert candidate.record_at(1) is appended
+    assert candidate.prefix_digest(1) == committed_digest
+    assert candidate.prefix_digest() != committed_digest
+
+    assert candidate.commit() is journal
+    assert journal.replay() == (original, appended)
+    assert journal.prefix_digest() == candidate.prefix_digest()
+
+
 def test_indexed_queries_match_append_order():
     journal = EventJournal()
     records = [
