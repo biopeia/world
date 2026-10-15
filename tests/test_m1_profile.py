@@ -8,7 +8,7 @@ import pytest
 
 from world.m1_profile import ProfileError, _validate_profile, load_operator_profile
 
-PROFILE = Path(__file__).parents[1] / "profiles/m1/scalar-sensorimotor-mujoco-3.15-v1.json"
+PROFILE = Path(__file__).parents[1] / "profiles/m1/scalar-sensorimotor-mujoco-3.15-v2.json"
 
 
 def _profile() -> dict:

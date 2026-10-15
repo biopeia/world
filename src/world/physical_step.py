@@ -66,6 +66,9 @@ class PhysicalStepCandidate[BodyCandidate, EnvironmentCandidate]:
 
     body: BodyCandidate
     environment: EnvironmentCandidate
+    # Optional World-owned solver evidence; semantic owner state remains
+    # exclusively in body/environment candidates.
+    evidence: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -515,8 +515,11 @@ def construct_fresh_runtime(
         body_cfg["body_id"], body_cfg["episode_id"], body_cfg["morphology_revision"],
         surface.contract_fingerprint,
     )
+    differential_cfg = body_cfg["differential_binding"]
     engine = CompetenceDevelopmentEngine(
-        surface.actuator_ids, organism_id=str(organism_id), embodiment_fingerprint=actuator_context.fingerprint
+        surface.actuator_ids,
+        organism_id=str(organism_id),
+        embodiment_fingerprint=actuator_context.fingerprint,
     )
     composer = OrganismExplorationComposer(organism_id=str(organism_id), engine=engine)
     receptor_cfg = body_cfg["receptor"]
@@ -525,7 +528,6 @@ def construct_fresh_runtime(
         embodiment_episode_id=body_cfg["episode_id"], morphology_revision=body_cfg["morphology_revision"],
         body_frame=receptor_cfg["body_frame"], position_in_body_frame_m=tuple(receptor_cfg["position_in_body_frame_m"]),
     )
-    differential_cfg = body_cfg["differential_binding"]
     differential_binding = EmbodimentDifferentialMotorBinding(
         binding_id=differential_cfg["id"], body_id=body_cfg["body_id"],
         embodiment_episode_id=body_cfg["episode_id"], morphology_revision=body_cfg["morphology_revision"],
@@ -548,6 +550,7 @@ def construct_fresh_runtime(
         iterations=solver_profile["iterations"], tolerance=solver_profile["tolerance"],
         solref=tuple(solver_profile["solref"]), solimp=tuple(solver_profile["solimp"]),
         contact_policy=solver_profile["contact_policy"],
+        velocity_regulation_policy="m1-fixed-single-hinge-grid-v1",
     )
 
     contracts: dict[tuple[str, str], Any] = {

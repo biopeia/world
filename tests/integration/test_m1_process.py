@@ -8,7 +8,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-PROFILE = Path(__file__).parents[2] / "profiles/m1/scalar-sensorimotor-mujoco-3.15-v1.json"
+PROFILE = Path(__file__).parents[2] / "profiles/m1/scalar-sensorimotor-mujoco-3.15-v2.json"
 
 
 def _records(output: str) -> list[dict]:
@@ -55,6 +55,11 @@ def test_fresh_world_process_runs_real_cycles_and_serves_postcommit_observations
     committed = [record for record in records if record["event"] == "cycle_committed"]
     assert len(committed) == 20
     assert [record["last_verified_committed_tick"] for record in committed] == list(range(1, 21))
+    for record in committed:
+        regulation = record["velocity_regulation"]
+        assert regulation["policy"] == "m1-fixed-single-hinge-grid-v1"
+        assert abs(regulation["applied_torque_nm"]) <= regulation["effort_limit_nm"]
+        assert abs(regulation["candidate_velocity_rad_per_s"]) <= regulation["velocity_cap_rad_per_s"]
     terminal = [record for record in records if record["event"] in {"completed", "stopped", "failed"}]
     assert len(terminal) == 1 and terminal[0]["event"] == "completed"
     assert terminal[0]["last_verified_committed_tick"] == 20
@@ -90,7 +95,7 @@ def test_preflight_failure_does_not_create_or_mutate_state_root(tmp_path: Path) 
 def test_sigterm_stops_after_a_verified_cycle_boundary(tmp_path: Path) -> None:
     state = tmp_path / "state"
     process = subprocess.Popen(
-        [sys.executable, "-m", "world.m1_process", "--profile", str(PROFILE), "--state-root", str(state), "--cycles", "10000"],
+        [sys.executable, "-m", "world.m1_process", "--profile", str(PROFILE), "--state-root", str(state)],
         cwd=Path(__file__).parents[2], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     assert process.stdout is not None
@@ -117,6 +122,7 @@ def test_sigterm_stops_after_a_verified_cycle_boundary(tmp_path: Path) -> None:
     assert committed
     assert terminal[0]["last_verified_committed_tick"] == committed[-1]["last_verified_committed_tick"]
     assert terminal[0]["commit_id"] == committed[-1]["commit_id"]
+    assert terminal[0]["completed_cycle_count"] == len(committed)
 
 
 def test_signal_during_observation_bridge_teardown_does_not_interrupt_close(tmp_path: Path) -> None:
@@ -180,7 +186,7 @@ def test_existing_state_target_is_byte_for_byte_unchanged_on_preflight_failure(t
     assert after == before
 
 
-def test_incompatible_dependency_revision_fails_preflight_without_mutation(tmp_path: Path) -> None:
+def test_incompatible_installed_world_version_fails_preflight_without_mutation(tmp_path: Path) -> None:
     state = tmp_path / "not-created"
     wrapper = "\n".join((
         "import sys",
@@ -198,7 +204,7 @@ def test_incompatible_dependency_revision_fails_preflight_without_mutation(tmp_p
     records = _records(result.stdout)
     assert len(records) == 1 and records[0]["event"] == "failed"
     assert records[0]["outcome"] == "preflight_failed"
-    assert "does not match the source checkout" in records[0]["error"]
+    assert "installed World distribution version does not match" in records[0]["error"]
     assert not state.exists()
 
 

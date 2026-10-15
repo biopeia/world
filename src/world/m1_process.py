@@ -1,10 +1,11 @@
-"""Bounded, fresh-session M1 World process and JSONL protocol."""
+"""Fresh-session M1 World process and JSONL lifecycle protocol."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata as metadata
 import json
+import hashlib
 import signal
 import subprocess
 import sys
@@ -18,7 +19,7 @@ MAX_CYCLES = 10_000
 
 
 def verified_revisions() -> dict[str, str]:
-    """Resolve installed cross-domain VCS commits and the clean World source SHA."""
+    """Record current source/package revisions as provenance, not admission pins."""
     import tomllib
 
     root = Path(__file__).resolve().parents[2]
@@ -30,33 +31,39 @@ def verified_revisions() -> dict[str, str]:
             capture_output=True,
             text=True,
         ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"World source revision cannot be verified: {exc}") from exc
-    if len(world_revision) != 40 or dirty:
-        raise RuntimeError("World source checkout must have an exact commit and clean worktree")
+    if len(world_revision) != 40:
+        raise RuntimeError("World source revision must be a full Git commit id")
 
     world_version = project["version"]
     if metadata.version("world") != world_version:
         raise RuntimeError("installed World distribution version does not match the source checkout")
-    revisions = {"world": world_revision, "world_package_version": world_version}
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    digest = hashlib.sha256()
+    if status:
+        diff = subprocess.run(["git", "-C", str(root), "diff", "HEAD", "--binary"],
+                              check=True, capture_output=True).stdout
+        digest.update(diff)
+        paths = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+                               check=True, capture_output=True).stdout.split(b"\0")
+        for raw_path in sorted(path for path in paths if path):
+            path = root / raw_path.decode("utf-8", errors="surrogateescape")
+            if path.is_file() and not path.is_symlink():
+                digest.update(raw_path + b"\0" + path.read_bytes())
+    revisions = {"world": world_revision, "world_package_version": world_version,
+                 "world_worktree": "dirty" if status else "clean"}
+    if status:
+        revisions["world_worktree_sha256"] = digest.hexdigest()
     for requirement in project["optional-dependencies"]["runtime"]:
         name, uri = requirement.split(" @ ", 1)
-        expected_revision = uri.rsplit("@", 1)[1]
         distribution = metadata.distribution(name)
         direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
         actual_revision = direct_url.get("vcs_info", {}).get("commit_id")
-        if actual_revision != expected_revision:
-            raise RuntimeError(
-                f"{name} installed VCS revision cannot be verified: "
-                f"expected {expected_revision}, got {actual_revision}"
-            )
-        revisions[name] = actual_revision
+        revisions[name] = actual_revision or "unavailable"
         revisions[f"{name}_package_version"] = metadata.version(name)
 
     import mujoco
@@ -100,9 +107,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True, help="explicit operator profile JSON path")
     parser.add_argument("--state-root", required=True, help="new, non-existing durable state directory")
-    parser.add_argument("--cycles", required=True, type=int, help="positive finite cycle count")
+    parser.add_argument(
+        "--cycles", type=int,
+        help=f"optional finite cycle count (1-{MAX_CYCLES}); omitted means continuous until stopped",
+    )
     args = parser.parse_args(argv)
-    if not 1 <= args.cycles <= MAX_CYCLES:
+    if args.cycles is not None and not 1 <= args.cycles <= MAX_CYCLES:
         parser.error(f"--cycles must be between 1 and {MAX_CYCLES}")
 
     run_id = str(uuid.uuid4())
@@ -156,7 +166,6 @@ def main(argv: list[str] | None = None) -> int:
         from .causal_cycle import run_scalar_sensorimotor_session
 
         def on_cycle(result: object) -> None:
-            del result  # The independently reverified current World cut is authoritative.
             manifest = runtime.world.manifest
             cut = runtime.world.committed_cut_for(
                 world_id=manifest.world_id,
@@ -172,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
                 tick=cut.causal_tick, commit_id=cut.commit_id,
                 outcome="committed_and_published", profile_id=profile_id,
                 profile_sha256=profile_sha256,
+                velocity_regulation=result.physical_outcome.solver_evidence,
             )
 
         result = run_scalar_sensorimotor_session(
@@ -183,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             max_cycles=args.cycles,
             stop_requested=lambda: stop_requested["value"],
             on_cycle_result=on_cycle,
+            retain_cycle_results=args.cycles is not None,
         )
         cut = result.last_committed_cut
         event = result.status.value
@@ -193,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             outcome=event, profile_id=profile_id, profile_sha256=profile_sha256,
             error=result.error,
             publication_uncertain=result.publication_delivery_status_uncertain,
+            completed_cycle_count=result.completed_cycle_count,
         )
         return 1 if event == "failed" else 0
     except Exception as exc:

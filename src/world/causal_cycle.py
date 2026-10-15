@@ -100,6 +100,7 @@ class _OrganismActionComposer(Protocol):
         target_causal_tick: int,
         physical_step_id: str,
         commit_id: str,
+        required_complete_groups: tuple[tuple[str, ...], ...] = (),
     ) -> _ActionCandidate: ...
 
     def checkpoint_for_candidate(
@@ -192,6 +193,7 @@ class ScalarSensorimotorSessionResult:
     source_revisions: Mapping[str, str]
     status: ScalarSensorimotorSessionStatus
     cycles: tuple[CausalCycleResult, ...]
+    completed_cycle_count: int
     last_committed_cut: CommittedWorldCut | None
     error: str | None = None
     failure_kind: str | None = None
@@ -469,6 +471,10 @@ def run_scalar_sensorimotor_cycle_and_publish(
             target_causal_tick=context.target_causal_tick,
             physical_step_id=context.physical_step_id,
             commit_id=commit_id,
+            required_complete_groups=tuple(
+                (pair.positive_actuator_id, pair.negative_actuator_id)
+                for pair in differential_binding.pairs
+            ),
         )
         command = candidate.motor_command
         if command is None:
@@ -620,6 +626,7 @@ def run_scalar_sensorimotor_session(
     max_cycles: int | None = 1,
     stop_requested: Callable[[], bool] | None = None,
     on_cycle_result: Callable[[CausalCycleResult], None] | None = None,
+    retain_cycle_results: bool = True,
     commit_id_prefix: str | None = None,
     physical_step_id_prefix: str | None = None,
 ) -> ScalarSensorimotorSessionResult:
@@ -629,7 +636,9 @@ def run_scalar_sensorimotor_session(
     between cycles, so a requested stop allows the in-flight production cycle
     (including its publication) to return or fail before the session exits.
     ``max_cycles=None`` is continuous mode and therefore requires a stop
-    predicate. Source revisions are caller-supplied provenance, not inferred.
+    predicate. Set ``retain_cycle_results=False`` for continuous callers that
+    consume each result through ``on_cycle_result``; this bounds memory use.
+    Source revisions are caller-supplied provenance, not inferred.
     """
     if not isinstance(world, DurableWorldRuntime):
         raise TypeError("world must be a DurableWorldRuntime")
@@ -645,6 +654,8 @@ def run_scalar_sensorimotor_session(
         raise TypeError("stop_requested must be callable")
     if on_cycle_result is not None and not callable(on_cycle_result):
         raise TypeError("on_cycle_result must be callable")
+    if type(retain_cycle_results) is not bool:
+        raise TypeError("retain_cycle_results must be a boolean")
     revisions = dict(source_revisions)
     if not revisions or any(
         not isinstance(key, str)
@@ -676,6 +687,7 @@ def run_scalar_sensorimotor_session(
         )
 
     completed: list[CausalCycleResult] = []
+    completed_count = 0
     last_cut: CommittedWorldCut | None
     error: str | None = None
     try:
@@ -692,7 +704,7 @@ def run_scalar_sensorimotor_session(
     publication_delivery_status_uncertain = False
     inputs = cycle_inputs
     try:
-        while max_cycles is None or len(completed) < max_cycles:
+        while max_cycles is None or completed_count < max_cycles:
             if stop_requested is not None and stop_requested():
                 status = ScalarSensorimotorSessionStatus.STOPPED
                 break
@@ -704,7 +716,9 @@ def run_scalar_sensorimotor_session(
                 physical_step_id=f"{physical_step_prefix}{target_tick}",
                 **inputs.as_cycle_arguments(),
             )
-            completed.append(result)
+            completed_count += 1
+            if retain_cycle_results:
+                completed.append(result)
             last_cut = result.committed_cut
             if on_cycle_result is not None:
                 on_cycle_result(result)
@@ -724,7 +738,10 @@ def run_scalar_sensorimotor_session(
         # Report that cut only if World can still verify it as the current cut;
         # the failed cycle remains absent from ``cycles``.
         try:
-            last_cut = current_cut()
+            # RECOVERY_REQUIRED makes the current pending manifest unsuitable
+            # as a committed-cut receipt. Preserve the last cut that this
+            # session already verified instead of erasing it with None.
+            last_cut = current_cut() or last_cut
         except Exception as cut_exc:
             # Keep the last previously verified cut, but make clear that it
             # may not reflect a commit that became current before the failure.
@@ -739,6 +756,7 @@ def run_scalar_sensorimotor_session(
         source_revisions=MappingProxyType(revisions),
         status=status,
         cycles=tuple(completed),
+        completed_cycle_count=completed_count,
         last_committed_cut=last_cut,
         error=error,
         failure_kind=failure_kind,

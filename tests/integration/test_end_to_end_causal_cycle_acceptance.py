@@ -92,6 +92,7 @@ from world.durable_runtime import (
     WorldGenesisSpec,
 )
 from world.manifest import CheckpointReference, ManifestError, WorldCausalManifestStore
+from world.manifest import ManifestStatus
 from world.owner_checkpoint_store import FileOwnerCheckpointStore
 from world.runtime import PresenceId, WorldId
 
@@ -185,6 +186,7 @@ def _run(
     use_session: bool = False,
     session_stop_after: int | None = None,
     on_cycle_result: Callable[[CausalCycleResult], None] | None = None,
+    retain_cycle_results: bool = True,
     environment_revision_override: str | None = None,
     kernel_limits: KernelLimits = KernelLimits(),
     actuator_surface_material: str = SURFACE_FINGERPRINT,
@@ -462,6 +464,7 @@ def _run(
                 else None
             ),
             on_cycle_result=on_cycle_result,
+            retain_cycle_results=retain_cycle_results,
             source_revisions={"world": "test-commit"},
         )
         result = session_result.cycles[0] if session_result.cycles else None
@@ -1173,6 +1176,26 @@ def test_world_owned_session_honors_stop_between_committed_cycles(
     assert session.error is None
 
 
+def test_continuous_world_session_can_stream_without_retaining_cycle_results(
+    tmp_path: Path,
+) -> None:
+    observed: list[CausalCycleResult] = []
+    session, _messages, _, _ = _run(
+        tmp_path / "streaming-continuous-session",
+        use_session=True,
+        session_cycles=None,
+        session_stop_after=3,
+        on_cycle_result=observed.append,
+        retain_cycle_results=False,
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.STOPPED
+    assert session.completed_cycle_count == 3
+    assert session.cycles == ()
+    assert tuple(result.committed_cut.causal_tick for result in observed) == (1, 2, 3)
+    assert session.last_committed_cut == observed[-1].committed_cut
+
+
 def test_world_owned_session_reports_initial_cut_verification_failure_when_stopped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1208,6 +1231,48 @@ def test_world_owned_session_reports_cycle_failure_without_claiming_uncommitted_
     assert session.cycles == ()
     assert session.error is not None
     assert session.last_committed_cut is None or session.last_committed_cut.causal_tick == 0
+
+
+def test_world_owned_session_preserves_last_verified_cut_when_recovery_is_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import world.causal_cycle as causal_cycle
+
+    real_cycle = causal_cycle.run_scalar_sensorimotor_cycle_and_publish
+    attempted = 0
+
+    def fail_after_pending_transition(world, *args, **kwargs):
+        nonlocal attempted
+        attempted += 1
+        if attempted == 1:
+            return real_cycle(world, *args, **kwargs)
+        pending = replace(
+            world.manifest,
+            status=ManifestStatus.RECOVERY_REQUIRED,
+            pending_transition_id="acceptance-run:commit:2",
+            pending_tick=2,
+            failure="injected interrupted transition",
+        )
+        world._manifest = pending
+        raise RuntimeError("injected failure after recovery became required")
+
+    monkeypatch.setattr(
+        causal_cycle,
+        "run_scalar_sensorimotor_cycle_and_publish",
+        fail_after_pending_transition,
+    )
+    session, _messages, _, _ = _run(
+        tmp_path / "preserve-last-verified-cut-on-recovery",
+        use_session=True,
+        session_cycles=3,
+    )
+
+    assert session.status is ScalarSensorimotorSessionStatus.FAILED
+    assert session.completed_cycle_count == 1
+    assert session.last_committed_cut is not None
+    assert session.last_committed_cut.causal_tick == 1
+    assert session.last_committed_cut.commit_id == "acceptance-run:commit:1"
+    assert "injected failure after recovery became required" in (session.error or "")
 
 
 def test_world_owned_session_reports_committed_cut_when_observation_delivery_fails(

@@ -21,8 +21,7 @@ jobs:
       - run: python -m pip install --no-deps dist/*.whl
       - run: python -m pytest
 
-  # Verifies World's coordination of the other authorities at the revisions
-  # pinned in the integration extra.
+  # Verifies World's coordination at the exact revisions in uv.lock.
   integration:
     runs-on: ubuntu-latest
     steps:
@@ -30,12 +29,11 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      # All integration dependencies are pinned in pyproject.toml and their
-      # source repositories are public. Anonymous read access keeps this
-      # required check runnable for Dependabot without granting credentials.
-      - name: Install with the pinned integration dependencies
+      # Public source repositories allow anonymous read access. uv.lock records
+      # the exact dependency revisions used for the integration evidence.
+      - name: Install locked integration dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[integration]'
-      - run: python -m pytest tests/integration
+          python -m pip install --upgrade pip uv
+          uv sync --locked --extra integration
+      - run: uv run --no-sync python -m pytest tests/integration
 

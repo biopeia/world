@@ -156,7 +156,9 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     body = ArticulatedEmbodimentPhysicalState(
         root=root,
         morphology=morphology,
-        joints=(JointKinematicState("joint.hinge", 0.0, 0.0),),
+        # Start just below Embodiment's speed cap so this outward command
+        # exercises real MuJoCo torque regulation rather than the fast path.
+        joints=(JointKinematicState("joint.hinge", 0.0, 1.99),),
     )
     environment = StaticEnvironmentOwner(
         StaticPhysicalScene(
@@ -208,6 +210,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         solref=(0.02, 1.0),
         solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
         contact_policy="max-sliding-body-torsion-rolling/no-self-collision-v1",
+        velocity_regulation_policy="m1-fixed-single-hinge-grid-v1",
     )
 
     owner_directory = tmp_path / "owner-checkpoints"
@@ -303,6 +306,16 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert runtime.causal_tick == outcome.record.causal_tick == 1
     assert outcome.body_state.causal_tick == 1
     assert outcome.body_state.joints[0].position_rad != 0.0
+    assert body.causal_tick == 0
+    assert body.joints[0] == JointKinematicState("joint.hinge", 0.0, 1.99)
+    assert outcome.solver_evidence is not None
+    assert outcome.solver_evidence["policy"] == "m1-fixed-single-hinge-grid-v1"
+    assert outcome.solver_evidence["requested_torque_nm"] == pytest.approx(0.5)
+    assert outcome.solver_evidence["applied_torque_nm"] != pytest.approx(
+        outcome.solver_evidence["requested_torque_nm"]
+    )
+    assert abs(outcome.solver_evidence["applied_torque_nm"]) <= outcome.solver_evidence["effort_limit_nm"]
+    assert abs(outcome.solver_evidence["candidate_velocity_rad_per_s"]) <= outcome.solver_evidence["velocity_cap_rad_per_s"]
     assert environment.last_adopted_tick == 0
 
     stale_command = replace(
