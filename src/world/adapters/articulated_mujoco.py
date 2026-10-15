@@ -55,6 +55,7 @@ from world.physical_step import (
     PhysicalStepPorts,
     run_physical_step,
 )
+from world.spatial_projection import CommittedRenderPoseProjection, associate_render_pose_candidate
 
 
 def _select_compliant_torque(
@@ -117,6 +118,7 @@ def advance_articulated_mujoco_step_from_motor_command(
     torque_binding: EmbodimentJointTorqueBinding,
     environment_owner: StaticEnvironmentOwner,
     configuration: ArticulatedMujocoConfiguration,
+    render_morphology_projection: object | None = None,
     write_checkpoints: Callable[
         [PhysicalStepContext, ArticulatedEmbodimentPhysicalState, StaticEnvironmentOwner],
         Iterable[CheckpointReference],
@@ -159,6 +161,7 @@ def advance_articulated_mujoco_step_from_motor_command(
         torque=torque,
         environment_owner=environment_owner,
         configuration=configuration,
+        render_morphology_projection=render_morphology_projection,
         write_checkpoints=write_checkpoints,
     )
 
@@ -222,6 +225,8 @@ def execute_articulated_mujoco_step(
     environment: EnvironmentPhysicalProjection,
     *,
     configuration: ArticulatedMujocoConfiguration,
+    render_morphology_projection: object | None = None,
+    render_pose_sink: Callable[[object], None] | None = None,
 ) -> PhysicalStepCandidate[SolverArticulatedCandidate, StaticSceneCandidate]:
     """Solve one step; return unaccepted candidates, never mutate owner state.
 
@@ -459,6 +464,14 @@ def execute_articulated_mujoco_step(
     if not np.all(np.isfinite(data.qpos)) or not np.all(np.isfinite(data.qvel)) or any(warning.number for warning in data.warning):
         raise ValueError("MuJoCo produced invalid/warning-reset numerical state")
     mujoco.mj_forward(model, data)
+    if render_morphology_projection is not None:
+        if render_pose_sink is None:
+            raise ValueError("render pose extraction requires an internal result sink")
+        render_pose_sink(
+            _render_pose_candidate_from_mujoco(
+                mujoco, model, data, context, render_morphology_projection
+            )
+        )
     velocity = np.empty(6)
     mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, root_id, velocity, 0)
     # mj_objectVelocity is centered on the body inertial frame, not its origin.
@@ -490,6 +503,10 @@ class ArticulatedPhysicalStepOutcome:
     record: CausalRecord
     body_state: ArticulatedEmbodimentPhysicalState
     solver_evidence: dict[str, object] | None = None
+    render_pose_projection: CommittedRenderPoseProjection | None = None
+    # A committed physical transition remains successful if optional render
+    # enrichment cannot be completed. This field makes that limitation explicit.
+    render_pose_error: str | None = None
 
 
 def advance_articulated_mujoco_step(
@@ -501,6 +518,7 @@ def advance_articulated_mujoco_step(
     torque: JointTorqueCandidate,
     environment_owner: StaticEnvironmentOwner,
     configuration: ArticulatedMujocoConfiguration,
+    render_morphology_projection: object | None = None,
     write_checkpoints: Callable[
         [PhysicalStepContext, ArticulatedEmbodimentPhysicalState, StaticEnvironmentOwner],
         Iterable[CheckpointReference],
@@ -519,8 +537,16 @@ def advance_articulated_mujoco_step(
     Embodiment's body projection and action torque are likewise source-scoped;
     World commits the resulting transition at the target causal tick.
     """
+    if render_morphology_projection is not None:
+        _validate_render_projection_identity(
+            render_morphology_projection,
+            body_id=body_state.root.body_id,
+            embodiment_episode_id=body_state.root.embodiment_episode_id,
+            morphology_revision=body_state.morphology_revision,
+        )
     accepted: dict[str, ArticulatedEmbodimentPhysicalState] = {}
     solver_evidence: dict[str, object] = {}
+    render_pose_candidates: list[object] = []
 
     def project_body(context: PhysicalStepContext) -> ArticulatedPhysicalInput:
         if body_state.causal_tick != context.source_causal_tick:
@@ -554,7 +580,11 @@ def advance_articulated_mujoco_step(
             body_projection,
             environment_projection,
             configuration=configuration,
+            render_morphology_projection=render_morphology_projection,
+            render_pose_sink=render_pose_candidates.append if render_morphology_projection is not None else None,
         )
+        if render_morphology_projection is not None and len(render_pose_candidates) != 1:
+            raise RuntimeError("physical solver must produce exactly one transient render pose candidate")
         solver_evidence.update(candidate.evidence or {})
         return candidate
 
@@ -577,22 +607,121 @@ def advance_articulated_mujoco_step(
             raise RuntimeError("Embodiment did not publish an adopted state")
         return tuple(write_checkpoints(context, adopted, environment_owner))
 
-    record = run_physical_step(
-        world,
-        commit_id=commit_id,
-        physical_step_id=physical_step_id,
-        body_id=body_state.root.body_id,
-        embodiment_episode_id=body_state.root.embodiment_episode_id,
-        morphology_revision=body_state.morphology_revision,
-        environment_revision=environment_owner.scene.environment_revision,
-        solver_config_revision=configuration.revision,
-        ports=PhysicalStepPorts(
-            project_body=project_body,
-            project_environment=project_environment,
-            execute_solver=execute_solver,
-            adopt_body=adopt_body,
-            adopt_environment=adopt_environment,
-            write_checkpoints=persist,
-        ),
+    # The committed-cut lookup and transient projection must refer to the cut
+    # this call just produced, even if another caller tries to advance World.
+    # The guard's single-tick allowance is deliberately scoped over commit and
+    # enrichment; it is not a durable publication or history mechanism.
+    committed_projection = None
+    render_pose_error = None
+    with world.committed_cut_publication_guard():
+        record = run_physical_step(
+            world,
+            commit_id=commit_id,
+            physical_step_id=physical_step_id,
+            body_id=body_state.root.body_id,
+            embodiment_episode_id=body_state.root.embodiment_episode_id,
+            morphology_revision=body_state.morphology_revision,
+            environment_revision=environment_owner.scene.environment_revision,
+            solver_config_revision=configuration.revision,
+            ports=PhysicalStepPorts(
+                project_body=project_body,
+                project_environment=project_environment,
+                execute_solver=execute_solver,
+                adopt_body=adopt_body,
+                adopt_environment=adopt_environment,
+                write_checkpoints=persist,
+            ),
+        )
+        if render_morphology_projection is not None:
+            try:
+                cut = world.committed_cut_for(
+                    world_id=record.world_id,
+                    causal_tick=record.causal_tick,
+                    commit_id=commit_id,
+                )
+                references = tuple(
+                    reference
+                    for reference in cut.owner_checkpoint_references
+                    if reference.owner == "embodiment" and reference.owner_identity == body_state.root.body_id
+                )
+                if len(references) != 1:
+                    raise ValueError("committed cut must contain exactly one Embodiment checkpoint for this body")
+                committed_projection = associate_render_pose_candidate(
+                    world, cut, references[0], render_pose_candidates[0]
+                )
+            except Exception as exc:
+                # Do not turn a confirmed physical commit into an ambiguous
+                # failed call merely because the optional transient view failed.
+                render_pose_error = f"{type(exc).__name__}: {exc}"
+    return ArticulatedPhysicalStepOutcome(
+        record, accepted["body"], dict(solver_evidence), committed_projection, render_pose_error
     )
-    return ArticulatedPhysicalStepOutcome(record, accepted["body"], dict(solver_evidence))
+
+
+def _render_pose_candidate_from_mujoco(
+    mujoco, model, data, context: PhysicalStepContext, projection: object
+) -> object:
+    """Create Embodiment's candidate from actual MuJoCo body transforms.
+
+    The projection is owner supplied and carries the geometry revision. World
+    maps only its authored renderable segment IDs to exact compiled body names;
+    it never synthesizes geometry or transforms.
+    """
+    segments = getattr(projection, "segments", None)
+    validate = getattr(projection, "validate_dynamic_pose_candidate", None)
+    if not isinstance(segments, tuple) or not callable(validate):
+        raise TypeError("render morphology projection must be an owner-authored validated projection")
+    identities = (
+        (getattr(projection, "body_id", None), context.body_id),
+        (getattr(projection, "embodiment_episode_id", None), context.embodiment_episode_id),
+        (getattr(projection, "morphology_revision", None), context.morphology_revision),
+    )
+    if any(actual != expected for actual, expected in identities):
+        raise ValueError("owner render projection identity does not match World physical-step context")
+    poses = []
+    segment_ids = []
+    for segment in segments:
+        segment_id = getattr(segment, "segment_id", None)
+        if type(segment_id) is not str or not segment_id.strip() or segment_id in segment_ids:
+            raise ValueError("renderable segment IDs must be unique non-empty strings")
+        segment_ids.append(segment_id)
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, segment_id)
+        if body_id <= 0:
+            raise ValueError(f"renderable segment {segment_id!r} is not an exact MuJoCo body")
+        qw, qx, qy, qz = (float(value) for value in data.xquat[body_id])
+        poses.append(
+            _make_render_link_pose(
+                segment_id,
+                tuple(float(value) for value in data.xpos[body_id]),
+                (qx, qy, qz, qw),
+            )
+        )
+    candidate = validate(world_context=context, poses=tuple(poses))
+    return candidate
+
+
+def _validate_render_projection_identity(
+    projection: object, *, body_id: str, embodiment_episode_id: str, morphology_revision: str
+) -> None:
+    """Reject owner projection identity mismatch before opening a World transition."""
+    validate = getattr(projection, "validate_dynamic_pose_candidate", None)
+    segments = getattr(projection, "segments", None)
+    if not isinstance(segments, tuple) or not callable(validate):
+        raise TypeError("render morphology projection must be an owner-authored validated projection")
+    expected = (body_id, embodiment_episode_id, morphology_revision)
+    actual = (
+        getattr(projection, "body_id", None),
+        getattr(projection, "embodiment_episode_id", None),
+        getattr(projection, "morphology_revision", None),
+    )
+    if actual != expected:
+        raise ValueError("owner render projection identity does not match World physical-step context")
+
+
+def _make_render_link_pose(segment_id: str, translation_m: tuple[float, ...], orientation_xyzw: tuple[float, ...]):
+    """Instantiate the owner-owned candidate value without pinning its package."""
+    # Import only when this optional capability is requested. Embodiment owns
+    # RenderLinkPose validation and the dependency is not required by base World.
+    from embodiment.physics3d.spatial_render import RenderLinkPose
+
+    return RenderLinkPose(segment_id, translation_m, orientation_xyzw)

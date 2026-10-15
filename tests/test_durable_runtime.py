@@ -28,6 +28,7 @@ from world import (
     PresenceOwnerLink,
     RecoveryRequiredError,
     SingleWriterPreconditionError,
+    TickInProgressError,
     WorldCausalManifest,
     WorldCausalManifestStore,
     WorldGenesisSpec,
@@ -228,6 +229,48 @@ def test_corrupted_earlier_committed_prefix_blocks_next_causal_commit(tmp_path):
     assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
     assert runtime.manifest.causal_tick == committed_manifest.causal_tick == 2
     assert not journal_store.verify(journal_ref)
+
+
+def test_committed_cut_publication_guard_is_reentrant_only_for_owner_thread(tmp_path):
+    world_id = WorldId("world-publication-guard-reentrant")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial_owner = tmp_path / "organism-0.json"
+    initial_owner.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(_checkpoint(initial_owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+
+    def write_owner(tick: int):
+        state = tmp_path / f"organism-{tick}.json"
+        state.write_bytes(f"organism at tick {tick}".encode())
+        return (_checkpoint(state),)
+
+    with runtime.committed_cut_publication_guard():
+        owner_thread_id = runtime._publication_guard_thread_id
+        assert runtime._publication_guard_depth == 1
+        with runtime.committed_cut_publication_guard():
+            assert runtime._publication_guard_thread_id == owner_thread_id
+            assert runtime._publication_guard_depth == 2
+            runtime.tick("transition-1", write_owner)
+            with pytest.raises(TickInProgressError, match="another tick"):
+                runtime.tick("transition-2", write_owner)
+        assert runtime._publication_guard_depth == 1
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            competing = pool.submit(runtime.committed_cut_publication_guard().__enter__)
+            with pytest.raises(TickInProgressError, match="publication is already in progress"):
+                competing.result()
+        assert runtime._publication_guard_depth == 1
+
+    assert runtime._publication_guard_thread_id is None
+    assert runtime._publication_guard_depth == 0
 
 
 def test_non_lf_committed_record_terminator_blocks_append_without_mutation(tmp_path):

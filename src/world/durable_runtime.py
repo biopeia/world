@@ -751,6 +751,7 @@ class DurableWorldRuntime:
         self._owner_checkpoint_contracts = dict(owner_checkpoint_contracts)
         self._tick_guard = Lock()
         self._publication_guard_thread_id: int | None = None
+        self._publication_guard_depth = 0
         self._publication_guard_tick_used = False
         self._latched_failure: str | None = None
         self._validate_cut(manifest, journal)
@@ -976,18 +977,29 @@ class DurableWorldRuntime:
         but a second tick from that thread is rejected until publication leaves
         the scope. Competing threads fail with ``TickInProgressError``.
         """
+        current_thread_id = get_ident()
         if self._publication_guard_thread_id is not None:
-            raise TickInProgressError("a World causal publication is already in progress")
+            if self._publication_guard_thread_id != current_thread_id:
+                raise TickInProgressError("a World causal publication is already in progress")
+            self._publication_guard_depth += 1
+            try:
+                yield
+            finally:
+                self._publication_guard_depth -= 1
+            return
         if not self._tick_guard.acquire(blocking=False):
             raise TickInProgressError("a World causal tick is already in progress")
-        self._publication_guard_thread_id = get_ident()
+        self._publication_guard_thread_id = current_thread_id
+        self._publication_guard_depth = 1
         self._publication_guard_tick_used = False
         try:
             yield
         finally:
-            self._publication_guard_thread_id = None
-            self._publication_guard_tick_used = False
-            self._tick_guard.release()
+            self._publication_guard_depth -= 1
+            if self._publication_guard_depth == 0:
+                self._publication_guard_thread_id = None
+                self._publication_guard_tick_used = False
+                self._tick_guard.release()
 
     def committed_cut_for(
         self,
