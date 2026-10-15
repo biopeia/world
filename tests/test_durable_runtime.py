@@ -2080,6 +2080,39 @@ def test_presence_roster_is_published_only_through_world_lifecycle_tick(tmp_path
     assert runtime.manifest.presence_owner_links == (("presence-a", "organism", "organism-identity"),)
 
 
+def test_lifecycle_transition_duplicate_check_does_not_replay_journal(tmp_path, monkeypatch):
+    world_id = WorldId("world-lifecycle-index")
+    store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    owner = tmp_path / "owner-0.json"
+    owner.write_bytes(b"owner")
+    runtime = _initialize(
+        world_id, "presence-a", store, journal,
+        initial_owner_references=(_checkpoint(owner),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    next_owner = tmp_path / "owner-1.json"
+    next_owner.write_bytes(b"owner after lifecycle")
+
+    def fail_replay(_self):
+        raise AssertionError("lifecycle duplicate check replayed the committed journal")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(EventJournal, "replay", fail_replay)
+        runtime.tick(
+            "register-presence-b",
+            lambda _tick: (_checkpoint(next_owner),),
+            register_presence=("presence-b",),
+            presence_owner_updates=(PresenceOwnerLink(PresenceId("presence-b"), "organism", "organism-identity"),),
+            presence_lifecycle=_presence_lifecycle("REGISTER", "presence-b"),
+        )
+
+    assert runtime.causal_tick == 1
+    assert runtime.manifest.presence_ids == ("presence-a", "presence-b")
+
+
 def test_last_presence_can_terminate_world_remains_active_and_later_registers(tmp_path):
     world_id = WorldId("world-empty-remains-active")
     store = WorldCausalManifestStore(tmp_path / "manifest.json")

@@ -742,6 +742,11 @@ class DurableWorldRuntime:
         self._manifest = manifest
         self._journal = journal
         self._owner_causal_record_identity_index = self._owner_causal_record_keys(journal.replay())
+        self._presence_lifecycle_transition_ids = {
+            record.payload.get("lifecycle_transition_id")
+            for record in journal
+            if record.record_type == "world.presence.lifecycle.committed"
+        }
         self._owner_checkpoint_verifier = owner_checkpoint_verifier
         self._owner_checkpoint_contracts = dict(owner_checkpoint_contracts)
         self._tick_guard = Lock()
@@ -1400,11 +1405,7 @@ class DurableWorldRuntime:
                 raise ManifestError("each active presence owner must be in the proposed registered owner roster")
             if lifecycle_owner is not None and lifecycle_owner not in registered and lifecycle_owner not in step_only:
                 raise ManifestError("presence lifecycle owner must participate in the lifecycle commit")
-            if presence_lifecycle is not None and any(
-                item.record_type == "world.presence.lifecycle.committed"
-                and item.payload.get("lifecycle_transition_id") == transition_id
-                for item in self._journal.replay()
-            ):
+            if presence_lifecycle is not None and transition_id in self._presence_lifecycle_transition_ids:
                 raise ManifestError("presence lifecycle transition identity is already committed")
             registered_tuple = tuple(sorted(registered))
             step_tuple = tuple(sorted(step_only))
@@ -1583,6 +1584,8 @@ class DurableWorldRuntime:
                 )
                 self._journal = candidate_journal.commit()
                 self._owner_causal_record_identity_index.update(owner_record_keys)
+                if presence_lifecycle is not None:
+                    self._presence_lifecycle_transition_ids.add(transition_id)
                 self._manifest = candidate
                 self._owner_checkpoint_contracts = {
                     key: proposed_contracts[key] for key in registered
