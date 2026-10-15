@@ -130,12 +130,15 @@ def _reference(directory: Path, owner: str, identity: str, schema: str, tick: in
     [
         (0.9876290543817445, 1.9999654107650564, 0.75, 0.25, 0.5),
         (-0.9876290543817445, -1.9999654107650564, 0.25, 0.75, -0.5),
+        (0.9876290543817445, 1.9999654107650564, 0.25, 0.75, -0.5),
+        (-0.9876290543817445, -1.9999654107650564, 0.75, 0.25, 0.5),
     ],
 )
+@pytest.mark.parametrize("failure_kind", ("position", "velocity"))
 def test_production_join_adopts_commits_and_rejects_solver_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     initial_position: float, initial_velocity: float,
-    positive: float, negative: float, expected_torque: float,
+    positive: float, negative: float, expected_torque: float, failure_kind: str,
 ) -> None:
     spec = _body_spec()
     morphology = ActiveArticulatedMorphology.from_spec(
@@ -144,6 +147,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         morphology_revision=MORPHOLOGY_REVISION,
         spec=spec,
     )
+    joint_bounds = morphology.joint_ranges[0]
     root = EmbodimentPhysicalState(
         world_id=WORLD_ID,
         causal_tick=0,
@@ -315,8 +319,8 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert isinstance(outcome.record, CausalRecord)
     assert runtime.causal_tick == outcome.record.causal_tick == 1
     assert outcome.body_state.causal_tick == 1
-    assert -1.0 <= outcome.body_state.joints[0].position_rad <= 1.0
-    assert abs(outcome.body_state.joints[0].velocity_rad_per_s) <= 2.0
+    assert joint_bounds.lower_rad <= outcome.body_state.joints[0].position_rad <= joint_bounds.upper_rad
+    assert abs(outcome.body_state.joints[0].velocity_rad_per_s) <= joint_bounds.max_velocity_rad_per_s
     assert body.causal_tick == 0
     assert body.joints[0] == JointKinematicState("joint.hinge", initial_position, initial_velocity)
     assert outcome.solver_evidence is not None
@@ -334,8 +338,8 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         outcome.solver_evidence["requested_torque_nm"]
     )
     assert abs(outcome.solver_evidence["applied_torque_nm"]) <= outcome.solver_evidence["effort_limit_nm"]
-    assert abs(outcome.solver_evidence["candidate_velocity_rad_per_s"]) <= outcome.solver_evidence["velocity_cap_rad_per_s"]
-    assert -1.0 <= outcome.solver_evidence["candidate_position_rad"] <= 1.0
+    assert abs(outcome.solver_evidence["candidate_velocity_rad_per_s"]) <= joint_bounds.max_velocity_rad_per_s
+    assert joint_bounds.lower_rad <= outcome.solver_evidence["candidate_position_rad"] <= joint_bounds.upper_rad
     assert outcome.solver_evidence["joint_limit_activation_margin_rad"] == pytest.approx(0.02)
     assert environment.last_adopted_tick == 0
 
@@ -370,8 +374,8 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
                 f"qvel={outcome.body_state.joints[0].velocity_rad_per_s}: {exc}"
             )
         joint = outcome.body_state.joints[0]
-        assert -1.0 <= joint.position_rad <= 1.0
-        assert abs(joint.velocity_rad_per_s) <= 2.0
+        assert joint_bounds.lower_rad <= joint.position_rad <= joint_bounds.upper_rad
+        assert abs(joint.velocity_rad_per_s) <= joint_bounds.max_velocity_rad_per_s
     assert runtime.causal_tick == 26
     assert outcome.solver_evidence["source_causal_tick"] == 25
     assert outcome.solver_evidence["target_causal_tick"] == 26
@@ -425,6 +429,11 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert runtime.status is ManifestStatus.COMMITTED
     assert runtime.causal_tick == 26
 
+    durable_before_rejection = runtime.manifest
+    journal_before_rejection = runtime.records
+    references_before_rejection = durable_before_rejection.checkpoint_references
+    journal_sequence_before_rejection = durable_before_rejection.journal_last_sequence
+    journal_prefix_before_rejection = durable_before_rejection.journal_prefix_sha256
     original_trial = articulated_adapter._mujoco_trial
 
     def out_of_range_trial(*args, **kwargs):
@@ -432,22 +441,26 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         if candidate is not None:
             # Inject a physically returned but Embodiment-invalid candidate;
             # let World selector reject it before the causal commit boundary.
-            candidate.qpos[0] = 1.01
+            if failure_kind == "position":
+                candidate.qpos[0] = 1.01
+            else:
+                candidate.qpos[0] = 0.0
+                candidate.qvel[0] = 2.01
         return candidate
 
     monkeypatch.setattr(articulated_adapter, "_mujoco_trial", out_of_range_trial)
     next_command = replace(
         command,
-        command_id="command.articulated-production-failure",
-        commitment_id="commitment.articulated-production-failure",
+        command_id=f"command.articulated-production-failure-{failure_kind}",
+        commitment_id=f"commitment.articulated-production-failure-{failure_kind}",
         issued_at_tick=runtime.causal_tick,
     )
 
     with pytest.raises(ValueError, match="no tested applied torque produces a morphology-compliant candidate"):
         advance_articulated_mujoco_step_from_motor_command(
             runtime,
-            commit_id="commit.articulated-production-failure",
-            physical_step_id="physical-step.articulated-production-failure",
+            commit_id=f"commit.articulated-production-failure-{failure_kind}",
+            physical_step_id=f"physical-step.articulated-production-failure-{failure_kind}",
             body_state=outcome.body_state,
             motor_command=next_command,
             active_morphology=morphology,
@@ -461,6 +474,10 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
     assert runtime.causal_tick == runtime.manifest.causal_tick == 26
     assert runtime.manifest.commit_id == "commit.articulated-production-repeat-24"
+    assert runtime.manifest.checkpoint_references == references_before_rejection
+    assert runtime.manifest.journal_last_sequence == journal_sequence_before_rejection
+    assert runtime.manifest.journal_prefix_sha256 == journal_prefix_before_rejection
+    assert runtime.records == journal_before_rejection
     assert written_ticks == list(range(1, 27))
 
 

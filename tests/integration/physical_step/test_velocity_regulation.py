@@ -19,7 +19,14 @@ def test_outward_request_is_regulated_when_position_would_cross_limit() -> None:
 def test_infeasible_velocity_bound_fails_closed() -> None:
     with pytest.raises(ValueError, match="no tested applied torque"):
         _select_compliant_torque(
-            0.0, 2.0, -1.0, 1.0, 2.0, lambda _torque: (1.01, 1.5)
+            0.0, 2.0, -1.0, 1.0, 2.0, lambda _torque: (0.5, 2.01)
+        )
+
+
+def test_infeasible_position_bound_fails_closed_independently() -> None:
+    with pytest.raises(ValueError, match="no tested applied torque"):
+        _select_compliant_torque(
+            0.0, 2.0, -1.0, 1.0, 2.0, lambda _torque: (1.01, 0.5)
         )
 
 
