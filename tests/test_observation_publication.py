@@ -285,6 +285,74 @@ def test_consumer_rejects_same_tick_projection_bound_to_different_commit():
     assert not verify_associated_owner_observations(association, (different,))
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["authority", "family", "contract", "contract_revision", "world", "tick"],
+)
+def test_consumer_rejects_cross_claim_or_cross_cut_observation(mutation):
+    association, projections = _associated()
+    observation = _observation()
+    if mutation == "authority":
+        observation = _observation(authority="organism")
+    elif mutation == "family":
+        observation.claim.family.qualified_name = "environment.other"
+    elif mutation == "contract":
+        observation.claim.family.contract.contract_id = "environment.other"
+    elif mutation == "contract_revision":
+        observation.claim.family.contract.revision = "stale"
+    elif mutation == "world":
+        observation = _observation(world_id="different-world")
+    elif mutation == "tick":
+        observation = _observation(tick=5)
+    tampered = replace(projections[0], observation=observation)
+
+    assert not verify_associated_owner_observations(association, (tampered,))
+
+
+def test_consumer_rejects_observation_with_wrong_checkpoint_lineage_digest():
+    association, projections = _associated()
+    observation = _observation()
+    observation = SimpleNamespace(
+        claim=observation.claim,
+        lineage=SimpleNamespace(
+            parents=(SimpleNamespace(namespace="opaque", reference="b" * 64),),
+            transformation=observation.lineage.transformation,
+        ),
+        context_time=observation.context_time,
+    )
+    assert not verify_associated_owner_observations(
+        association, (replace(projections[0], observation=observation),)
+    )
+
+
+def test_verifies_multiple_owner_members_in_the_same_committed_cut():
+    first = _reference()
+    second = _reference(owner="embodiment", identity="body-1", digest="b" * 64)
+    cut = CommittedWorldCut(
+        world_id="world-1",
+        causal_tick=4,
+        commit_id="commit-4",
+        participant_ids=(("environment", "resource-1"), ("embodiment", "body-1")),
+        presence_owner_links=(),
+        owner_checkpoint_references=(first, second),
+    )
+    items = (
+        OwnerObservation(first, _observation(first), _projection_identity(first)),
+        OwnerObservation(second, _observation(second, authority="embodiment"), _projection_identity(second)),
+    )
+    association, projections = associate_committed_owner_observations(
+        _World(cut), committed_cut=cut, owner_observations=items
+    )
+    assert len(association.members) == 2
+    assert verify_associated_owner_observations(association, projections)
+    wrong_second = replace(
+        projections[1], observation=_observation(second, authority="environment")
+    )
+    assert not verify_associated_owner_observations(
+        association, (projections[0], wrong_second)
+    )
+
+
 @pytest.mark.parametrize("mutation", ["missing_member", "wrong_checkpoint", "ambiguous_duplicate"])
 def test_consumer_rejects_missing_mismatched_or_ambiguous_references(mutation):
     association, projections = _associated()
@@ -316,6 +384,36 @@ def test_association_issuer_rejects_missing_and_duplicate_exact_projection_ident
     with pytest.raises(ManifestError, match="duplicate exact"):
         associate_committed_owner_observations(
             _World(cut), committed_cut=cut, owner_observations=(duplicate, duplicate)
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "owner_id",
+        "owner_identity",
+        "family_id",
+        "owner_contract_id",
+        "owner_contract_revision",
+        "projection_revision",
+        "claim_identity",
+    ],
+)
+def test_association_issuer_rejects_empty_projection_identity_fields(field):
+    reference = _reference()
+    cut = _cut(reference)
+    identity = replace(_projection_identity(reference), **{field: " "})
+    with pytest.raises(ManifestError, match="non-empty strings"):
+        associate_committed_owner_observations(
+            _World(cut),
+            committed_cut=cut,
+            owner_observations=(
+                OwnerObservation(
+                    reference,
+                    _observation(reference),
+                    projection_identity=identity,
+                ),
+            ),
         )
 
 

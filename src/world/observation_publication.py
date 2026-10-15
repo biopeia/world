@@ -32,6 +32,7 @@ class _Lineage(Protocol):
 
 class _Claim(Protocol):
     authority: object
+    family: object
 
 
 class OwnerObservationLike(Protocol):
@@ -138,6 +139,8 @@ def associate_committed_owner_observations(
         identity = item.projection_identity
         if identity is None:
             raise ManifestError("owner projection identity is required for cut association")
+        if not _valid_projection_identity(identity):
+            raise ManifestError("projection identity fields must be non-empty strings")
         reference = item.owner_reference
         if (
             identity.owner_id != reference.owner
@@ -192,8 +195,10 @@ def verify_associated_owner_observations(
 ) -> bool:
     """Consumer-side fail-closed verification of membership in one value.
 
-    This verifies correlation metadata and member/checkpoint matching only;
-    it does not prove completeness, source truth, or semantic compatibility.
+    This verifies generic claim/provenance fields against the bound member and
+    cut. Owner-specific projection/claim identifiers remain opaque: World can
+    require them and preserve them, but cannot verify their owner semantics.
+    This does not prove completeness, source truth, or semantic compatibility.
     """
 
     if not isinstance(association, CommittedCutAssociation):
@@ -203,11 +208,15 @@ def verify_associated_owner_observations(
         association.kind != "world.committed_cut_association"
         or association.contract_revision != "candidate-1"
         or association.issuer != "world"
-        or not association.world_id
-        or not association.commit_id
+        or not isinstance(association.world_id, str)
+        or not association.world_id.strip()
+        or not isinstance(association.commit_id, str)
+        or not association.commit_id.strip()
+        or type(association.causal_tick) is not int
         or association.causal_tick < 0
         or not association.members
         or not items
+        or any(not _valid_member(member) for member in association.members)
         or tuple(sorted(association.members)) != association.members
         or len({member.projection_identity for member in association.members})
         != len(association.members)
@@ -231,10 +240,87 @@ def verify_associated_owner_observations(
             or member.checkpoint_id != reference.checkpoint_id
             or member.checkpoint_schema_version != reference.schema_version
             or member.checkpoint_sha256 != reference.sha256
+            or not _matches_associated_observation(item.observation, association, member)
         ):
             return False
         seen.add(member.projection_identity)
     return True
+
+
+def _valid_projection_identity(identity: object) -> bool:
+    if not isinstance(identity, OwnerProjectionIdentity):
+        return False
+    return all(
+        isinstance(value, str) and bool(value.strip())
+        for value in (
+            identity.owner_id,
+            identity.owner_identity,
+            identity.family_id,
+            identity.owner_contract_id,
+            identity.owner_contract_revision,
+            identity.projection_revision,
+            identity.claim_identity,
+        )
+    )
+
+
+def _valid_member(member: object) -> bool:
+    if not isinstance(member, CommittedCutMember) or not _valid_projection_identity(
+        member.projection_identity
+    ):
+        return False
+    return (
+        isinstance(member.checkpoint_id, str)
+        and bool(member.checkpoint_id.strip())
+        and isinstance(member.checkpoint_schema_version, str)
+        and bool(member.checkpoint_schema_version.strip())
+        and isinstance(member.checkpoint_sha256, str)
+        and len(member.checkpoint_sha256) == 64
+        and all(char in "0123456789abcdef" for char in member.checkpoint_sha256)
+    )
+
+
+def _matches_associated_observation(
+    observation: OwnerObservationLike,
+    association: CommittedCutAssociation,
+    member: CommittedCutMember,
+) -> bool:
+    """Check all generic owner claim/correlation links exposed by Observation."""
+    identity = member.projection_identity
+    try:
+        claim = observation.claim
+        authority = getattr(getattr(claim, "authority", None), "value", None)
+        family = getattr(claim, "family", None)
+        contract = getattr(family, "contract", None)
+        if (
+            authority != identity.owner_id
+            or getattr(family, "qualified_name", None) != identity.family_id
+            or getattr(contract, "contract_id", None) != identity.owner_contract_id
+            or getattr(contract, "revision", None) != identity.owner_contract_revision
+        ):
+            return False
+
+        parents = getattr(observation.lineage, "parents", ())
+        if not any(
+            getattr(parent, "reference", None) == member.checkpoint_sha256
+            for parent in parents
+        ):
+            return False
+
+        if not any(
+            getattr(getattr(time_ref, "domain", None), "value", None) == "world"
+            and getattr(time_ref, "kind", None)
+            in {"world_target_causal_tick", "world_causal_tick"}
+            and getattr(time_ref, "value", None) == association.causal_tick
+            for time_ref in observation.context_time
+        ):
+            return False
+
+        transformation = getattr(observation.lineage, "transformation", None)
+        configuration = dict(getattr(transformation, "effective_configuration", ()))
+        return configuration.get("world_id") == association.world_id
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True, slots=True)
