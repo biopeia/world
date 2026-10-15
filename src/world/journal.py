@@ -112,6 +112,12 @@ class EventJournal:
         encoded = self._encode(record)
         self._append_encoded(record, encoded)
 
+    def candidate(self) -> JournalCandidate:
+        """Create an append-only transaction view without copying the prefix."""
+        if self._staged:
+            raise ValueError("cannot create a journal candidate while a batch is staged")
+        return JournalCandidate(self)
+
     def stage(self, record: CausalRecord) -> None:
         self._staged.append(record)
 
@@ -196,3 +202,50 @@ class EventJournal:
                 )
             )
         return journal
+
+
+class JournalCandidate:
+    """Small append overlay over a committed journal, used before durable commit."""
+
+    def __init__(self, base: EventJournal) -> None:
+        self._base = base
+        self._records: list[CausalRecord] = []
+        self._encoded_records: list[bytes] = []
+        self._digests: list[str] = []
+
+    def __len__(self) -> int:
+        return len(self._base) + len(self._records)
+
+    def append(self, record: CausalRecord) -> None:
+        encoded = EventJournal._encode(record)
+        previous = self._digests[-1] if self._digests else self._base.prefix_digest()
+        self._digests.append(hashlib.sha256(previous.encode("ascii") + b"\0" + encoded).hexdigest())
+        self._records.append(record)
+        self._encoded_records.append(encoded)
+
+    def replay(self) -> tuple[CausalRecord, ...]:
+        return (*self._base.replay(), *self._records)
+
+    def record_at(self, index: int) -> CausalRecord:
+        base_length = len(self._base)
+        resolved = index if index >= 0 else len(self) + index
+        if resolved < 0 or resolved >= len(self):
+            raise IndexError("journal record index out of range")
+        return self._base.record_at(resolved) if resolved < base_length else self._records[resolved - base_length]
+
+    def prefix_digest(self, count: int | None = None) -> str:
+        resolved = len(self) if count is None else int(count)
+        base_length = len(self._base)
+        if resolved < 0 or resolved > len(self):
+            raise ValueError("journal prefix count out of bounds")
+        if resolved <= base_length:
+            return self._base.prefix_digest(resolved)
+        return self._digests[resolved - base_length - 1]
+
+    def commit(self) -> EventJournal:
+        for record, encoded in zip(self._records, self._encoded_records, strict=True):
+            self._base._append_encoded(record, encoded)
+        self._records.clear()
+        self._encoded_records.clear()
+        self._digests.clear()
+        return self._base
