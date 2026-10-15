@@ -119,6 +119,49 @@ def test_sigterm_stops_after_a_verified_cycle_boundary(tmp_path: Path) -> None:
     assert terminal[0]["commit_id"] == committed[-1]["commit_id"]
 
 
+def test_signal_during_observation_bridge_teardown_does_not_interrupt_close(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    wrapper = "\n".join((
+        "import os, signal, sys",
+        "import world.m1_process as process",
+        "real_construct = process.construct_fresh_runtime",
+        "def construct(*args, **kwargs):",
+        "    runtime = real_construct(*args, **kwargs)",
+        "    real_close = runtime.observation_bridge.close",
+        "    def close():",
+        "        os.kill(os.getpid(), signal.SIGINT)",
+        "        real_close()",
+        "    runtime.observation_bridge.close = close",
+        "    return runtime",
+        "process.construct_fresh_runtime = construct",
+        "raise SystemExit(process.main(['--profile', sys.argv[1], '--state-root', sys.argv[2], '--cycles', '10000']))",
+    ))
+    process = subprocess.Popen(
+        [sys.executable, "-c", wrapper, str(PROFILE), str(state)],
+        cwd=Path(__file__).parents[2], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    lines = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        lines.append(line)
+        event = json.loads(line)
+        if event["event"] == "cycle_committed":
+            process.send_signal(signal.SIGTERM)
+            break
+    remaining, stderr = process.communicate(timeout=30)
+    lines.extend(remaining.splitlines(keepends=True))
+    assert process.returncode == 0, stderr
+    assert "KeyboardInterrupt" not in stderr
+    records = _records("".join(lines))
+    terminal = [record for record in records if record["event"] in {"completed", "stopped", "failed"}]
+    committed = [record for record in records if record["event"] == "cycle_committed"]
+    assert len(terminal) == 1 and terminal[0]["event"] == "stopped"
+    assert committed
+    assert terminal[0]["last_verified_committed_tick"] == committed[-1]["last_verified_committed_tick"]
+    assert terminal[0]["commit_id"] == committed[-1]["commit_id"]
+
+
 def test_existing_state_target_is_byte_for_byte_unchanged_on_preflight_failure(tmp_path: Path) -> None:
     state = tmp_path / "existing"
     state.mkdir()

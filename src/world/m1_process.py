@@ -220,13 +220,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     finally:
-        for signum, handler in original_handlers.items():
-            signal.signal(signum, handler)
-        if runtime is not None:
-            try:
-                runtime.observation_bridge.close()
-            except Exception:
-                pass
+        try:
+            if runtime is not None:
+                try:
+                    runtime.observation_bridge.close()
+                except Exception:
+                    pass
+        finally:
+            for signum, handler in original_handlers.items():
+                signal.signal(signum, handler)
 
 
 if __name__ == "__main__":
