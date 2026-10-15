@@ -35,7 +35,12 @@ from embodiment.physics3d.mechanics import (
     SurfaceMaterial,
 )
 from embodiment.physics3d.physical_transition import EmbodimentPhysicalState
-from environment import FrameDescriptor, StaticEnvironmentOwner, StaticPhysicalScene
+from environment import (
+    FrameDescriptor,
+    StaticEnvironmentOwner,
+    StaticPhysicalScene,
+    StaticSphere,
+)
 from organism.actuation import MotorCommand
 
 import world.adapters.articulated_mujoco as articulated_adapter
@@ -173,6 +178,18 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         # the lower-bound case mirrors the recorded upper-bound edge state.
         joints=(JointKinematicState("joint.hinge", initial_position, initial_velocity),),
     )
+    # In the recorded positive near-limit pose the arm occupies this
+    # Environment sphere's position; the negative case is the no-load
+    # baseline for the mirrored joint boundary.
+    contact_spheres = (
+        StaticSphere(
+            object_id="environment.sphere.contact-load",
+            center_m=(-0.17, 0.0, -0.31),
+            radius_m=0.08,
+            frame_id=FRAME.frame_id,
+            sliding_friction_coefficient=0.0,
+        ),
+    ) if initial_position > 0 else ()
     environment = StaticEnvironmentOwner(
         StaticPhysicalScene(
             environment_id=ENVIRONMENT_ID,
@@ -180,6 +197,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             frame=FRAME,
             gravity_m_s2=(0.0, 0.0, 0.0),
             objects=(),
+            spheres=contact_spheres,
         ),
         owner_id=ENVIRONMENT_OWNER_ID,
         world_id=WORLD_ID,
@@ -302,6 +320,31 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             ),
         )
 
+    arm_contact_count: list[int] = []
+    production_trial = articulated_adapter._mujoco_trial
+
+    def record_contact_trial(*args, **kwargs):
+        candidate = production_trial(*args, **kwargs)
+        if candidate is not None:
+            model = args[1]
+            arm_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "body.arm")
+            environment_geom = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_GEOM, "__environment_sphere_0"
+            )
+            arm_contact_count.append(
+                sum(
+                    1
+                    for contact in candidate.contact[: candidate.ncon]
+                    if environment_geom in (contact.geom1, contact.geom2)
+                    and model.geom_bodyid[
+                        contact.geom2 if contact.geom1 == environment_geom else contact.geom1
+                    ]
+                    == arm_body
+                )
+            )
+        return candidate
+
+    monkeypatch.setattr(articulated_adapter, "_mujoco_trial", record_contact_trial)
     outcome = advance_articulated_mujoco_step_from_motor_command(
         runtime,
         commit_id="commit.articulated-production-1",
@@ -342,6 +385,10 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert joint_bounds.lower_rad <= outcome.solver_evidence["candidate_position_rad"] <= joint_bounds.upper_rad
     assert outcome.solver_evidence["joint_limit_activation_margin_rad"] == pytest.approx(0.02)
     assert environment.last_adopted_tick == 0
+    if initial_position > 0:
+        assert arm_contact_count and arm_contact_count[0] > 0, (
+            "requested motor trial must contact the Environment sphere with body.arm"
+        )
 
     # Continue the real production join through repeated physical transitions
     # from the formerly failing edge state. Every candidate must satisfy the
