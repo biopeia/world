@@ -248,12 +248,20 @@ def test_committed_cut_publication_guard_is_reentrant_only_for_owner_thread(tmp_
         owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
     )
 
+    def write_owner(tick: int):
+        state = tmp_path / f"organism-{tick}.json"
+        state.write_bytes(f"organism at tick {tick}".encode())
+        return (_checkpoint(state),)
+
     with runtime.committed_cut_publication_guard():
         owner_thread_id = runtime._publication_guard_thread_id
         assert runtime._publication_guard_depth == 1
         with runtime.committed_cut_publication_guard():
             assert runtime._publication_guard_thread_id == owner_thread_id
             assert runtime._publication_guard_depth == 2
+            runtime.tick("transition-1", write_owner)
+            with pytest.raises(TickInProgressError, match="another tick"):
+                runtime.tick("transition-2", write_owner)
         assert runtime._publication_guard_depth == 1
         with ThreadPoolExecutor(max_workers=1) as pool:
             competing = pool.submit(runtime.committed_cut_publication_guard().__enter__)
