@@ -35,6 +35,7 @@ from embodiment.physics3d.mechanics import (
     SurfaceMaterial,
 )
 from embodiment.physics3d.physical_transition import EmbodimentPhysicalState
+from embodiment.physics3d.spatial_render import RenderMorphologyProjection
 from environment import (
     FrameDescriptor,
     StaticEnvironmentOwner,
@@ -55,8 +56,9 @@ from world.durable_runtime import (
     WorldGenesisSpec,
 )
 from world.journal import CausalRecord
-from world.manifest import CheckpointReference, ManifestStatus, WorldCausalManifestStore
+from world.manifest import CheckpointReference, ManifestError, ManifestStatus, WorldCausalManifestStore
 from world.runtime import PresenceId, WorldId
+from world.spatial_projection import verify_committed_render_pose_projection
 
 WORLD_ID = "world.articulated-production-join"
 PRESENCE_ID = "presence.articulated-production-join"
@@ -151,6 +153,18 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         embodiment_episode_id=EPISODE_ID,
         morphology_revision=MORPHOLOGY_REVISION,
         spec=spec,
+    )
+    render_projection = RenderMorphologyProjection.from_active_morphology(
+        morphology, geometry_revision="geometry.articulated-production-r1"
+    )
+    wrong_render_projection = RenderMorphologyProjection.from_active_morphology(
+        ActiveArticulatedMorphology.from_spec(
+            body_id=BODY_ID,
+            embodiment_episode_id=EPISODE_ID,
+            morphology_revision="morphology.stale-r0",
+            spec=spec,
+        ),
+        geometry_revision="geometry.articulated-production-r1",
     )
     joint_bounds = morphology.joint_ranges[0]
     root = EmbodimentPhysicalState(
@@ -345,6 +359,30 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         return candidate
 
     monkeypatch.setattr(articulated_adapter, "_mujoco_trial", record_contact_trial)
+    # A bad owner projection is rejected before World opens a causal
+    # transition. The authoritative manifest, journal, and checkpoint set
+    # remain exactly at the previous confirmed cut.
+    before_invalid_projection = runtime.manifest
+    before_invalid_records = runtime.records
+    with pytest.raises(ValueError, match="owner render projection identity"):
+        advance_articulated_mujoco_step_from_motor_command(
+            runtime,
+            commit_id="commit.articulated-production-invalid-render-identity",
+            physical_step_id="physical-step.articulated-production-invalid-render-identity",
+            body_state=body,
+            motor_command=command,
+            active_morphology=morphology,
+            differential_binding=motor_binding,
+            torque_binding=binding,
+            environment_owner=environment,
+            configuration=configuration,
+            render_morphology_projection=wrong_render_projection,
+            write_checkpoints=write_checkpoints,
+        )
+    assert runtime.manifest == before_invalid_projection
+    assert runtime.causal_tick == before_invalid_projection.causal_tick == 0
+    assert runtime.records == before_invalid_records
+
     outcome = advance_articulated_mujoco_step_from_motor_command(
         runtime,
         commit_id="commit.articulated-production-1",
@@ -356,12 +394,38 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         torque_binding=binding,
         environment_owner=environment,
         configuration=configuration,
+        render_morphology_projection=render_projection,
         write_checkpoints=write_checkpoints,
     )
 
     assert isinstance(outcome.record, CausalRecord)
     assert runtime.causal_tick == outcome.record.causal_tick == 1
     assert outcome.body_state.causal_tick == 1
+    assert outcome.render_pose_projection is not None
+    assert verify_committed_render_pose_projection(runtime, outcome.render_pose_projection)
+    assert outcome.render_pose_projection.committed_cut.commit_id == "commit.articulated-production-1"
+    assert outcome.render_pose_projection.owner_checkpoint_reference.owner == "embodiment"
+    assert outcome.render_pose_projection.owner_checkpoint_reference.owner_identity == BODY_ID
+    rendered = {pose.segment_id: pose for pose in outcome.render_pose_projection.candidate.poses}
+    assert set(rendered) == {"body.arm", "body.root"}
+    assert rendered["body.root"].translation_m == pytest.approx((0.0, 0.0, 0.0))
+    q = outcome.body_state.joints[0].position_rad
+    assert rendered["body.arm"].translation_m == pytest.approx(
+        (0.0, 0.0, -0.2), abs=1e-7
+    )
+    assert rendered["body.arm"].orientation_xyzw == pytest.approx(
+        (0.0, __import__("math").sin(q / 2), 0.0, __import__("math").cos(q / 2)), abs=1e-7
+    )
+    first_committed_pose_projection = outcome.render_pose_projection
+    wrong_commit_receipt = replace(
+        first_committed_pose_projection,
+        committed_cut=replace(
+            first_committed_pose_projection.committed_cut,
+            commit_id="commit.same-tick-but-different-identity",
+        ),
+    )
+    with pytest.raises(ManifestError, match="requested identity does not match"):
+        verify_committed_render_pose_projection(runtime, wrong_commit_receipt)
     assert joint_bounds.lower_rad <= outcome.body_state.joints[0].position_rad <= joint_bounds.upper_rad
     assert abs(outcome.body_state.joints[0].velocity_rad_per_s) <= joint_bounds.max_velocity_rad_per_s
     assert body.causal_tick == 0
@@ -427,6 +491,11 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert outcome.solver_evidence["source_causal_tick"] == 25
     assert outcome.solver_evidence["target_causal_tick"] == 26
     assert outcome.solver_evidence["physical_step_id"] == "physical-step.articulated-production-repeat-24"
+    # The old tick-1 snapshot must not be presented as a current-cut view once
+    # World has committed later transitions. No arrival-order semantics are
+    # inferred; stale association simply fails closed.
+    with pytest.raises(ManifestError, match="requested identity does not match"):
+        verify_committed_render_pose_projection(runtime, first_committed_pose_projection)
 
     stale_command = replace(
         command,
