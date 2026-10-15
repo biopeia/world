@@ -125,8 +125,17 @@ def _reference(directory: Path, owner: str, identity: str, schema: str, tick: in
     )
 
 
+@pytest.mark.parametrize(
+    ("initial_position", "initial_velocity", "positive", "negative", "expected_torque"),
+    [
+        (0.9876290543817445, 1.9999654107650564, 0.75, 0.25, 0.5),
+        (-0.9876290543817445, -1.9999654107650564, 0.25, 0.75, -0.5),
+    ],
+)
 def test_production_join_adopts_commits_and_rejects_solver_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    initial_position: float, initial_velocity: float,
+    positive: float, negative: float, expected_torque: float,
 ) -> None:
     spec = _body_spec()
     morphology = ActiveArticulatedMorphology.from_spec(
@@ -156,9 +165,9 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     body = ArticulatedEmbodimentPhysicalState(
         root=root,
         morphology=morphology,
-        # Start just below Embodiment's speed cap so this outward command
-        # exercises real MuJoCo torque regulation rather than the fast path.
-        joints=(JointKinematicState("joint.hinge", 0.0, 1.99),),
+        # Exercise a near-limit source state with velocity directed outward;
+        # the lower-bound case mirrors the recorded upper-bound edge state.
+        joints=(JointKinematicState("joint.hinge", initial_position, initial_velocity),),
     )
     environment = StaticEnvironmentOwner(
         StaticPhysicalScene(
@@ -185,7 +194,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         controller_id="controller.fixture",
         competence_id=None,
         surface_fingerprint=SURFACE_FINGERPRINT,
-        channels=(("actuator.hinge.positive", 0.75), ("actuator.hinge.negative", 0.25)),
+        channels=(("actuator.hinge.positive", positive), ("actuator.hinge.negative", negative)),
         issued_at_tick=0,
         embodiment_id=EPISODE_ID,
     )
@@ -210,7 +219,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         solref=(0.02, 1.0),
         solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
         contact_policy="max-sliding-body-torsion-rolling/no-self-collision-v1",
-        velocity_regulation_policy="m1-fixed-single-hinge-grid-v1",
+        velocity_regulation_policy="m1-fixed-single-hinge-grid-v2",
     )
 
     owner_directory = tmp_path / "owner-checkpoints"
@@ -267,7 +276,8 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     written_ticks: list[int] = []
 
     def write_checkpoints(context, adopted_body, adopted_environment):
-        assert adopted_body.causal_tick == context.target_causal_tick == 1
+        assert adopted_body.causal_tick == context.target_causal_tick
+        assert context.target_causal_tick == runtime.causal_tick + 1
         written_ticks.append(context.target_causal_tick)
         return (
             _reference(
@@ -305,18 +315,67 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert isinstance(outcome.record, CausalRecord)
     assert runtime.causal_tick == outcome.record.causal_tick == 1
     assert outcome.body_state.causal_tick == 1
-    assert outcome.body_state.joints[0].position_rad != 0.0
+    assert -1.0 <= outcome.body_state.joints[0].position_rad <= 1.0
+    assert abs(outcome.body_state.joints[0].velocity_rad_per_s) <= 2.0
     assert body.causal_tick == 0
-    assert body.joints[0] == JointKinematicState("joint.hinge", 0.0, 1.99)
+    assert body.joints[0] == JointKinematicState("joint.hinge", initial_position, initial_velocity)
     assert outcome.solver_evidence is not None
-    assert outcome.solver_evidence["policy"] == "m1-fixed-single-hinge-grid-v1"
-    assert outcome.solver_evidence["requested_torque_nm"] == pytest.approx(0.5)
-    assert outcome.solver_evidence["applied_torque_nm"] != pytest.approx(
+    assert outcome.solver_evidence["policy"] == "m1-fixed-single-hinge-grid-v2"
+    assert outcome.solver_evidence["world_id"] == WORLD_ID
+    assert outcome.solver_evidence["source_causal_tick"] == 0
+    assert outcome.solver_evidence["target_causal_tick"] == 1
+    assert outcome.solver_evidence["physical_step_id"] == "physical-step.articulated-production-1"
+    assert outcome.solver_evidence["body_id"] == BODY_ID
+    assert outcome.solver_evidence["morphology_revision"] == MORPHOLOGY_REVISION
+    assert outcome.solver_evidence["source_position_rad"] == pytest.approx(initial_position)
+    assert outcome.solver_evidence["source_velocity_rad_per_s"] == pytest.approx(initial_velocity)
+    assert outcome.solver_evidence["requested_torque_nm"] == pytest.approx(expected_torque)
+    assert outcome.solver_evidence["applied_torque_nm"] == pytest.approx(
         outcome.solver_evidence["requested_torque_nm"]
     )
     assert abs(outcome.solver_evidence["applied_torque_nm"]) <= outcome.solver_evidence["effort_limit_nm"]
     assert abs(outcome.solver_evidence["candidate_velocity_rad_per_s"]) <= outcome.solver_evidence["velocity_cap_rad_per_s"]
+    assert -1.0 <= outcome.solver_evidence["candidate_position_rad"] <= 1.0
+    assert outcome.solver_evidence["joint_limit_activation_margin_rad"] == pytest.approx(0.02)
     assert environment.last_adopted_tick == 0
+
+    # Continue the real production join through repeated physical transitions
+    # from the formerly failing edge state. Every candidate must satisfy the
+    # same owner morphology bounds before its World cut is committed.
+    for transition in range(25):
+        command_at_cut = replace(
+            command,
+            command_id=f"command.articulated-production-repeat-{transition}",
+            commitment_id=f"commitment.articulated-production-repeat-{transition}",
+            issued_at_tick=outcome.body_state.causal_tick,
+        )
+        try:
+            outcome = advance_articulated_mujoco_step_from_motor_command(
+                runtime,
+                commit_id=f"commit.articulated-production-repeat-{transition}",
+                physical_step_id=f"physical-step.articulated-production-repeat-{transition}",
+                body_state=outcome.body_state,
+                motor_command=command_at_cut,
+                active_morphology=morphology,
+                differential_binding=motor_binding,
+                torque_binding=binding,
+                environment_owner=environment,
+                configuration=configuration,
+                write_checkpoints=write_checkpoints,
+            )
+        except ValueError as exc:
+            pytest.fail(
+                f"transition={transition}, source_tick={runtime.causal_tick}, "
+                f"qpos={outcome.body_state.joints[0].position_rad}, "
+                f"qvel={outcome.body_state.joints[0].velocity_rad_per_s}: {exc}"
+            )
+        joint = outcome.body_state.joints[0]
+        assert -1.0 <= joint.position_rad <= 1.0
+        assert abs(joint.velocity_rad_per_s) <= 2.0
+    assert runtime.causal_tick == 26
+    assert outcome.solver_evidence["source_causal_tick"] == 25
+    assert outcome.solver_evidence["target_causal_tick"] == 26
+    assert outcome.solver_evidence["physical_step_id"] == "physical-step.articulated-production-repeat-24"
 
     stale_command = replace(
         command,
@@ -338,7 +397,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             write_checkpoints=write_checkpoints,
         )
     assert runtime.status is ManifestStatus.COMMITTED
-    assert runtime.causal_tick == 1
+    assert runtime.causal_tick == 26
 
     stale_morphology = ActiveArticulatedMorphology.from_spec(
         body_id=BODY_ID,
@@ -355,7 +414,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             commit_id="commit.articulated-production-stale-morphology",
             physical_step_id="physical-step.articulated-production-stale-morphology",
             body_state=outcome.body_state,
-            motor_command=command,
+            motor_command=replace(command, issued_at_tick=runtime.causal_tick),
             active_morphology=stale_morphology,
             differential_binding=motor_binding,
             torque_binding=binding,
@@ -364,20 +423,27 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             write_checkpoints=write_checkpoints,
         )
     assert runtime.status is ManifestStatus.COMMITTED
-    assert runtime.causal_tick == 1
+    assert runtime.causal_tick == 26
 
-    def fail_solver(*args, **kwargs):
-        raise RuntimeError("injected articulated solver failure")
+    original_trial = articulated_adapter._mujoco_trial
 
-    monkeypatch.setattr(articulated_adapter, "execute_articulated_mujoco_step", fail_solver)
+    def out_of_range_trial(*args, **kwargs):
+        candidate = original_trial(*args, **kwargs)
+        if candidate is not None:
+            # Inject a physically returned but Embodiment-invalid candidate;
+            # let World selector reject it before the causal commit boundary.
+            candidate.qpos[0] = 1.01
+        return candidate
+
+    monkeypatch.setattr(articulated_adapter, "_mujoco_trial", out_of_range_trial)
     next_command = replace(
         command,
         command_id="command.articulated-production-failure",
         commitment_id="commitment.articulated-production-failure",
-        issued_at_tick=1,
+        issued_at_tick=runtime.causal_tick,
     )
 
-    with pytest.raises(RuntimeError, match="injected articulated solver failure"):
+    with pytest.raises(ValueError, match="no tested applied torque produces a morphology-compliant candidate"):
         advance_articulated_mujoco_step_from_motor_command(
             runtime,
             commit_id="commit.articulated-production-failure",
@@ -393,9 +459,9 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         )
 
     assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
-    assert runtime.causal_tick == runtime.manifest.causal_tick == 1
-    assert runtime.manifest.commit_id == "commit.articulated-production-1"
-    assert written_ticks == [1]
+    assert runtime.causal_tick == runtime.manifest.causal_tick == 26
+    assert runtime.manifest.commit_id == "commit.articulated-production-repeat-24"
+    assert written_ticks == list(range(1, 27))
 
 
 def _valid_articulated_checkpoint(
