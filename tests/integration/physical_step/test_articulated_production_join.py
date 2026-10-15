@@ -7,6 +7,7 @@ physical behavior or crash/power-loss durability.
 from __future__ import annotations
 
 import hashlib
+from threading import Thread
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -57,7 +58,7 @@ from world.durable_runtime import (
 )
 from world.journal import CausalRecord
 from world.manifest import CheckpointReference, ManifestError, ManifestStatus, WorldCausalManifestStore
-from world.runtime import PresenceId, WorldId
+from world.runtime import PresenceId, TickInProgressError, WorldId
 from world.spatial_projection import verify_committed_render_pose_projection
 
 WORLD_ID = "world.articulated-production-join"
@@ -383,6 +384,30 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert runtime.causal_tick == before_invalid_projection.causal_tick == 0
     assert runtime.records == before_invalid_records
 
+    original_cut_lookup = runtime.committed_cut_for
+    competing_tick_errors = []
+
+    def assert_cut_lookup_is_atomic(**kwargs):
+        assert runtime._publication_guard_thread_id is not None
+        if competing_tick_errors:
+            return original_cut_lookup(**kwargs)
+        finished = []
+
+        def compete_for_next_cut():
+            try:
+                runtime.tick("commit.concurrent-during-render-enrichment", lambda _tick: ())
+            except Exception as exc:
+                finished.append(exc)
+
+        thread = Thread(target=compete_for_next_cut)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive(), "competing tick must fail promptly while cut is guarded"
+        assert len(finished) == 1
+        competing_tick_errors.extend(finished)
+        return original_cut_lookup(**kwargs)
+
+    monkeypatch.setattr(runtime, "committed_cut_for", assert_cut_lookup_is_atomic)
     outcome = advance_articulated_mujoco_step_from_motor_command(
         runtime,
         commit_id="commit.articulated-production-1",
@@ -397,11 +422,14 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         render_morphology_projection=render_projection,
         write_checkpoints=write_checkpoints,
     )
+    monkeypatch.setattr(runtime, "committed_cut_for", original_cut_lookup)
 
     assert isinstance(outcome.record, CausalRecord)
     assert runtime.causal_tick == outcome.record.causal_tick == 1
     assert outcome.body_state.causal_tick == 1
     assert outcome.render_pose_projection is not None
+    assert len(competing_tick_errors) == 1
+    assert isinstance(competing_tick_errors[0], TickInProgressError)
     assert verify_committed_render_pose_projection(runtime, outcome.render_pose_projection)
     assert outcome.render_pose_projection.committed_cut.commit_id == "commit.articulated-production-1"
     assert outcome.render_pose_projection.owner_checkpoint_reference.owner == "embodiment"
@@ -491,6 +519,40 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
     assert outcome.solver_evidence["source_causal_tick"] == 25
     assert outcome.solver_evidence["target_causal_tick"] == 26
     assert outcome.solver_evidence["physical_step_id"] == "physical-step.articulated-production-repeat-24"
+
+    # Enrichment is optional and occurs after commit. Failure to construct the
+    # transient view must not make the confirmed physical transition ambiguous.
+    original_association = articulated_adapter.associate_render_pose_candidate
+    monkeypatch.setattr(
+        articulated_adapter,
+        "associate_render_pose_candidate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("injected projection failure")),
+    )
+    enrichment_failure = advance_articulated_mujoco_step_from_motor_command(
+        runtime,
+        commit_id="commit.articulated-production-render-enrichment-failure",
+        physical_step_id="physical-step.articulated-production-render-enrichment-failure",
+        body_state=outcome.body_state,
+        motor_command=replace(
+            command,
+            command_id="command.articulated-production-render-enrichment-failure",
+            commitment_id="commitment.articulated-production-render-enrichment-failure",
+            issued_at_tick=runtime.causal_tick,
+        ),
+        active_morphology=morphology,
+        differential_binding=motor_binding,
+        torque_binding=binding,
+        environment_owner=environment,
+        configuration=configuration,
+        render_morphology_projection=render_projection,
+        write_checkpoints=write_checkpoints,
+    )
+    monkeypatch.setattr(articulated_adapter, "associate_render_pose_candidate", original_association)
+    assert runtime.manifest.commit_id == "commit.articulated-production-render-enrichment-failure"
+    assert enrichment_failure.render_pose_projection is None
+    assert enrichment_failure.render_pose_error == "ValueError: injected projection failure"
+    assert runtime.causal_tick == 27
+    outcome = enrichment_failure
     # The old tick-1 snapshot must not be presented as a current-cut view once
     # World has committed later transitions. No arrival-order semantics are
     # inferred; stale association simply fails closed.
@@ -517,7 +579,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             write_checkpoints=write_checkpoints,
         )
     assert runtime.status is ManifestStatus.COMMITTED
-    assert runtime.causal_tick == 26
+    assert runtime.causal_tick == 27
 
     stale_morphology = ActiveArticulatedMorphology.from_spec(
         body_id=BODY_ID,
@@ -543,7 +605,7 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
             write_checkpoints=write_checkpoints,
         )
     assert runtime.status is ManifestStatus.COMMITTED
-    assert runtime.causal_tick == 26
+    assert runtime.causal_tick == 27
 
     durable_before_rejection = runtime.manifest
     journal_before_rejection = runtime.records
@@ -588,13 +650,13 @@ def test_production_join_adopts_commits_and_rejects_solver_failure(
         )
 
     assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
-    assert runtime.causal_tick == runtime.manifest.causal_tick == 26
-    assert runtime.manifest.commit_id == "commit.articulated-production-repeat-24"
+    assert runtime.causal_tick == runtime.manifest.causal_tick == 27
+    assert runtime.manifest.commit_id == "commit.articulated-production-render-enrichment-failure"
     assert runtime.manifest.checkpoint_references == references_before_rejection
     assert runtime.manifest.journal_last_sequence == journal_sequence_before_rejection
     assert runtime.manifest.journal_prefix_sha256 == journal_prefix_before_rejection
     assert runtime.records == journal_before_rejection
-    assert written_ticks == list(range(1, 27))
+    assert written_ticks == list(range(1, 28))
 
 
 def _valid_articulated_checkpoint(

@@ -504,6 +504,9 @@ class ArticulatedPhysicalStepOutcome:
     body_state: ArticulatedEmbodimentPhysicalState
     solver_evidence: dict[str, object] | None = None
     render_pose_projection: CommittedRenderPoseProjection | None = None
+    # A committed physical transition remains successful if optional render
+    # enrichment cannot be completed. This field makes that limitation explicit.
+    render_pose_error: str | None = None
 
 
 def advance_articulated_mujoco_step(
@@ -580,6 +583,8 @@ def advance_articulated_mujoco_step(
             render_morphology_projection=render_morphology_projection,
             render_pose_sink=render_pose_candidates.append if render_morphology_projection is not None else None,
         )
+        if render_morphology_projection is not None and len(render_pose_candidates) != 1:
+            raise RuntimeError("physical solver must produce exactly one transient render pose candidate")
         solver_evidence.update(candidate.evidence or {})
         return candidate
 
@@ -602,45 +607,54 @@ def advance_articulated_mujoco_step(
             raise RuntimeError("Embodiment did not publish an adopted state")
         return tuple(write_checkpoints(context, adopted, environment_owner))
 
-    record = run_physical_step(
-        world,
-        commit_id=commit_id,
-        physical_step_id=physical_step_id,
-        body_id=body_state.root.body_id,
-        embodiment_episode_id=body_state.root.embodiment_episode_id,
-        morphology_revision=body_state.morphology_revision,
-        environment_revision=environment_owner.scene.environment_revision,
-        solver_config_revision=configuration.revision,
-        ports=PhysicalStepPorts(
-            project_body=project_body,
-            project_environment=project_environment,
-            execute_solver=execute_solver,
-            adopt_body=adopt_body,
-            adopt_environment=adopt_environment,
-            write_checkpoints=persist,
-        ),
-    )
+    # The committed-cut lookup and transient projection must refer to the cut
+    # this call just produced, even if another caller tries to advance World.
+    # The guard's single-tick allowance is deliberately scoped over commit and
+    # enrichment; it is not a durable publication or history mechanism.
     committed_projection = None
-    if render_morphology_projection is not None:
-        if len(render_pose_candidates) != 1:
-            raise RuntimeError("physical solver must produce exactly one transient render pose candidate")
-        cut = world.committed_cut_for(
-            world_id=record.world_id,
-            causal_tick=record.causal_tick,
+    render_pose_error = None
+    with world.committed_cut_publication_guard():
+        record = run_physical_step(
+            world,
             commit_id=commit_id,
+            physical_step_id=physical_step_id,
+            body_id=body_state.root.body_id,
+            embodiment_episode_id=body_state.root.embodiment_episode_id,
+            morphology_revision=body_state.morphology_revision,
+            environment_revision=environment_owner.scene.environment_revision,
+            solver_config_revision=configuration.revision,
+            ports=PhysicalStepPorts(
+                project_body=project_body,
+                project_environment=project_environment,
+                execute_solver=execute_solver,
+                adopt_body=adopt_body,
+                adopt_environment=adopt_environment,
+                write_checkpoints=persist,
+            ),
         )
-        references = tuple(
-            reference
-            for reference in cut.owner_checkpoint_references
-            if reference.owner == "embodiment" and reference.owner_identity == body_state.root.body_id
-        )
-        if len(references) != 1:
-            raise ValueError("committed cut must contain exactly one Embodiment checkpoint for this body")
-        committed_projection = associate_render_pose_candidate(
-            world, cut, references[0], render_pose_candidates[0]
-        )
+        if render_morphology_projection is not None:
+            try:
+                cut = world.committed_cut_for(
+                    world_id=record.world_id,
+                    causal_tick=record.causal_tick,
+                    commit_id=commit_id,
+                )
+                references = tuple(
+                    reference
+                    for reference in cut.owner_checkpoint_references
+                    if reference.owner == "embodiment" and reference.owner_identity == body_state.root.body_id
+                )
+                if len(references) != 1:
+                    raise ValueError("committed cut must contain exactly one Embodiment checkpoint for this body")
+                committed_projection = associate_render_pose_candidate(
+                    world, cut, references[0], render_pose_candidates[0]
+                )
+            except Exception as exc:
+                # Do not turn a confirmed physical commit into an ambiguous
+                # failed call merely because the optional transient view failed.
+                render_pose_error = f"{type(exc).__name__}: {exc}"
     return ArticulatedPhysicalStepOutcome(
-        record, accepted["body"], dict(solver_evidence), committed_projection
+        record, accepted["body"], dict(solver_evidence), committed_projection, render_pose_error
     )
 
 
