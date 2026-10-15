@@ -28,6 +28,7 @@ from embodiment.physics3d.differential_motor_composition import (
 )
 from embodiment.physics3d.joint_torque import EmbodimentJointTorqueBinding
 from embodiment.physics3d.physical_transition import EmbodimentPhysicalState
+from embodiment.physics3d.spatial_render import RenderMorphologyProjection
 from embodiment.physics3d.receptor import EmbodimentReceptor
 from environment import (
     EnvironmentObservationContext,
@@ -35,6 +36,7 @@ from environment import (
     IdentifiedFiniteScalarField,
     StaticEnvironmentOwner,
 )
+from environment.spatial_render import project_spatial_render_scene
 from modality import DimensionlessScalarFieldIdentityV1
 from organism.actuation import (
     ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
@@ -153,6 +155,7 @@ class ScalarSensorimotorCycleInputs:
     torque_binding: EmbodimentJointTorqueBinding
     environment_owner: StaticEnvironmentOwner
     owner_checkpoint_store: OwnerCheckpointStore
+    embodiment_geometry_revision: str
 
     def as_cycle_arguments(self) -> dict[str, object]:
         return {
@@ -175,6 +178,7 @@ class ScalarSensorimotorCycleInputs:
             "torque_binding": self.torque_binding,
             "environment_owner": self.environment_owner,
             "owner_checkpoint_store": self.owner_checkpoint_store,
+            "embodiment_geometry_revision": self.embodiment_geometry_revision,
         }
 
 
@@ -413,6 +417,8 @@ def run_scalar_sensorimotor_cycle_and_publish(
     torque_binding: EmbodimentJointTorqueBinding,
     environment_owner: StaticEnvironmentOwner,
     owner_checkpoint_store: OwnerCheckpointStore,
+    embodiment_geometry_revision: str,
+    publish_static_spatial: bool = True,
 ) -> CausalCycleResult:
     """Sense, transition, issue an Organism command, solve, adopt, commit, publish.
 
@@ -428,6 +434,10 @@ def run_scalar_sensorimotor_cycle_and_publish(
         raise TypeError("action_composer must implement the Organism action port")
     if not isinstance(owner_checkpoint_store, OwnerCheckpointStore):
         raise TypeError("owner_checkpoint_store must implement the opaque owner checkpoint store")
+    if not isinstance(embodiment_geometry_revision, str) or not embodiment_geometry_revision.strip():
+        raise ValueError("Embodiment geometry revision must be supplied by its owner")
+    if type(publish_static_spatial) is not bool:
+        raise TypeError("publish_static_spatial must be a boolean")
     source_tick = world.causal_tick
     if embodiment_state.causal_tick != source_tick:
         raise ValueError("Embodiment source state does not match the current World cut")
@@ -551,6 +561,9 @@ def run_scalar_sensorimotor_cycle_and_publish(
             )
             return written_references
 
+        render_morphology = RenderMorphologyProjection.from_active_morphology(
+            active_morphology, geometry_revision=embodiment_geometry_revision
+        )
         physical = advance_articulated_mujoco_step_from_motor_command(
             world,
             commit_id=commit_id,
@@ -562,6 +575,7 @@ def run_scalar_sensorimotor_cycle_and_publish(
             torque_binding=torque_binding,
             environment_owner=environment_owner,
             configuration=solver_configuration,
+            render_morphology_projection=render_morphology,
             write_checkpoints=lambda step_context, adopted_body, adopted_environment: persist(
                 step_context, adopted_body, adopted_environment
             ),
@@ -577,8 +591,15 @@ def run_scalar_sensorimotor_cycle_and_publish(
         action_composer.adopt_after_world_commit(candidate, committed_cut=cut)
         # This is the production domain-to-Observation binding. The test
         # supplies neither the owner checkpoint set nor claim construction.
-        from observation.embodiment import embodiment_body_pose_observation
-        from observation.environment import environment_finite_scalar_field_observation
+        from observation.embodiment import (
+            embodiment_body_pose_observation,
+            embodiment_render_link_pose_observation,
+            embodiment_render_morphology_observation,
+        )
+        from observation.environment import (
+            environment_finite_scalar_field_observation,
+            environment_render_scene_observation,
+        )
 
         body_reference = _reference_for_owner(
             cut, "embodiment", physical.body_state.root.body_id
@@ -596,16 +617,35 @@ def run_scalar_sensorimotor_cycle_and_publish(
             frame=sampling_frame,
         )
         field_claim = environment_finite_scalar_field_observation(field_projection)
-        observations = (
+        observations: list[OwnerObservation] = [
             OwnerObservation(body_reference, body_claim),
             OwnerObservation(field_reference, field_claim),
-        )
+        ]
+        if publish_static_spatial:
+            # Prepared for passive publication after the cut-bound claims.
+            # Static owner projections are not checkpoint snapshots and must
+            # not be laundered through World's committed-state association.
+            static_spatial_observations = (
+                environment_render_scene_observation(
+                    project_spatial_render_scene(environment_owner.scene)
+                ),
+                embodiment_render_morphology_observation(render_morphology.to_payload()),
+            )
+        else:
+            static_spatial_observations = ()
+        if physical.render_pose_projection is not None:
+            observations.append(OwnerObservation(
+                body_reference,
+                embodiment_render_link_pose_observation(physical.render_pose_projection),
+            ))
         publication = publish_committed_owner_observations(
             world,
             observation_plane,
             committed_cut=cut,
-            owner_observations=observations,
+            owner_observations=tuple(observations),
         )
+        for static_observation in static_spatial_observations:
+            observation_plane.publish(static_observation)
         return CausalCycleResult(
             context,
             sensed,
@@ -714,6 +754,7 @@ def run_scalar_sensorimotor_session(
                 observation_plane,
                 commit_id=f"{commit_prefix}{target_tick}",
                 physical_step_id=f"{physical_step_prefix}{target_tick}",
+                publish_static_spatial=(completed_count == 0),
                 **inputs.as_cycle_arguments(),
             )
             completed_count += 1

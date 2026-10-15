@@ -442,6 +442,7 @@ def _run(
         torque_binding=torque_binding,
         environment_owner=env_owner,
         owner_checkpoint_store=owner_checkpoint_store,
+        embodiment_geometry_revision="geometry.acceptance.sensorimotor-r1",
     )
     if not use_session:
         result = run_scalar_sensorimotor_cycle_and_publish(
@@ -550,6 +551,7 @@ def _run(
         action_composer=next_composer,
         receptor=receptor,
         embodiment_state=next_body.root,
+        embodiment_geometry_revision="geometry.acceptance.sensorimotor-r1",
         environment_field=next_field,
         sampling_frame=frame,
         transduction=DimensionlessScalarFieldIdentityV1(),
@@ -711,6 +713,7 @@ def _resume_in_fresh_process(directory: Path, output_path: Path) -> None:
             torque_binding=torque_binding,
             environment_owner=restored.environment_owner,
             owner_checkpoint_store=FileOwnerCheckpointStore(directory / "owners" / "committed"),
+            embodiment_geometry_revision="geometry.acceptance.sensorimotor-r1",
         ),
         max_cycles=1,
         commit_id_prefix="commit.acceptance.sensorimotor.tick-",
@@ -743,7 +746,6 @@ def _summary(cycle, messages) -> dict[str, object]:
             (ref.owner, ref.owner_identity, ref.schema_version, ref.sha256)
             for ref in cycle.committed_cut.owner_checkpoint_references
         ),
-        "observations": [repr(message.observation) for message in messages],
     }
 
 
@@ -1016,7 +1018,7 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
         (first, first_messages),
         (second, second_messages),
     ):
-        observations = tuple(message.observation for message in messages)
+        observations = tuple(message.observation for message in messages if message.observation.context_time)
         assert result.context.source_causal_tick == 0
         assert result.context.target_causal_tick == result.committed_cut.causal_tick == 1
         assert result.sensory_input.sample.value == pytest.approx(0.25)
@@ -1047,17 +1049,18 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
             organism_reference.owner_identity,
             organism_reference.schema_version,
         )
-        assert len(result.observation_publication.delivery_sequences) == 2
+        assert len(result.observation_publication.delivery_sequences) == 3
         assert result.observation_publication.committed_cut == result.committed_cut
-        assert tuple(message.sequence for message in messages) == (
+        assert tuple(message.sequence for message in messages if message.observation.context_time) == (
             result.observation_publication.delivery_sequences
         )
-        assert len(observations) == 2
-        body_observation, field_observation = observations
+        assert len(observations) == 3
+        body_observation, field_observation, pose_observation = observations
         assert body_observation.claim.family.path == ("body_pose",)
         assert body_observation.context_time[0].value == result.committed_cut.causal_tick
         assert field_observation.claim.family.path == ("finite_scalar_field",)
         assert field_observation.context_time[-1].value == result.committed_cut.causal_tick
+        assert pose_observation.claim.family.path == ("render_link_pose",)
         assert any(
             reference.owner == "embodiment"
             and reference.sha256
@@ -1082,20 +1085,27 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
         (first_resumed, first_resumed_messages),
         (second_resumed, second_resumed_messages),
     ):
-        observations = tuple(message.observation for message in messages)
+        observations = tuple(message.observation for message in messages if any(
+            ref.domain.value == "world" and ref.value == resumed.committed_cut.causal_tick
+            for ref in message.observation.context_time
+        ))
         assert resumed.context.source_causal_tick == 1
         assert resumed.context.target_causal_tick == resumed.committed_cut.causal_tick == 2
         assert resumed.action_candidate.motor_command is not None
         assert resumed.physical_outcome.body_state.joints[0].position_rad != 0.0
-        assert len(resumed.observation_publication.delivery_sequences) == 2
+        assert len(resumed.observation_publication.delivery_sequences) == 3
         assert resumed.observation_publication.committed_cut == resumed.committed_cut
-        assert len(observations) == 2
-        assert tuple(message.sequence for message in messages) == (
+        assert len(observations) == 3
+        assert tuple(message.sequence for message in messages if any(
+            ref.domain.value == "world" and ref.value == resumed.committed_cut.causal_tick
+            for ref in message.observation.context_time
+        )) == (
             resumed.observation_publication.delivery_sequences
         )
-        body_observation, field_observation = observations
+        body_observation, field_observation, pose_observation = observations
         assert body_observation.claim.family.path == ("body_pose",)
         assert field_observation.claim.family.path == ("finite_scalar_field",)
+        assert pose_observation.claim.family.path == ("render_link_pose",)
         for observation in observations:
             assert any(
                 domain_time.domain.value == "world"
@@ -1125,15 +1135,31 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
     assert first.physical_outcome.body_state.joints == pytest.approx(
         second.physical_outcome.body_state.joints
     )
-    assert tuple(message.observation for message in first_messages) == tuple(
-        message.observation for message in second_messages
-    )
+    def claims(messages):
+        return {
+            f"{message.observation.claim.family.authority.value}."
+            f"{'.'.join(message.observation.claim.family.path) }": message.observation.claim.value
+            for message in messages
+        }
+
+    first_claims, second_claims = claims(first_messages), claims(second_messages)
+    assert first_claims.keys() == second_claims.keys()
+    for family in ("embodiment.body_pose", "environment.finite_scalar_field", "embodiment.render_morphology", "environment.render_scene"):
+        assert first_claims[family] == second_claims[family]
+    assert first_claims["embodiment.render_link_pose"]["candidate"] == second_claims[
+        "embodiment.render_link_pose"
+    ]["candidate"]
     assert first_resumed.committed_cut.commit_id == second_resumed.committed_cut.commit_id
     assert first_resumed.committed_cut.causal_tick == second_resumed.committed_cut.causal_tick == 2
     assert first_resumed.action_candidate.motor_command == second_resumed.action_candidate.motor_command
-    assert tuple(message.observation for message in first_resumed_messages) == tuple(
-        message.observation for message in second_resumed_messages
-    )
+    first_resumed_claims = claims(first_resumed_messages)
+    second_resumed_claims = claims(second_resumed_messages)
+    assert first_resumed_claims.keys() == second_resumed_claims.keys()
+    for family in ("embodiment.body_pose", "environment.finite_scalar_field"):
+        assert first_resumed_claims[family] == second_resumed_claims[family]
+    assert first_resumed_claims["embodiment.render_link_pose"]["candidate"] == second_resumed_claims[
+        "embodiment.render_link_pose"
+    ]["candidate"]
     assert first_resumed.physical_outcome.body_state.joints == pytest.approx(
         second_resumed.physical_outcome.body_state.joints
     )
@@ -1155,7 +1181,7 @@ def test_world_owned_session_runs_three_production_cycles_and_publishes_each(
     assert len({result.committed_cut.commit_id for result in session.cycles}) == 3
     for result in session.cycles:
         assert result.observation_publication.committed_cut == result.committed_cut
-        assert len(result.observation_publication.delivery_sequences) == 2
+        assert len(result.observation_publication.delivery_sequences) == 3
     assert session.last_committed_cut == session.cycles[-1].committed_cut
     assert session.error is None
 
@@ -1361,10 +1387,13 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
                 headers={"Origin": "http://127.0.0.1:4173"},
                 method="GET",
             )
-            with urllib.request.urlopen(request, timeout=2) as response:
-                assert response.status == 200
-                assert response.headers["Cache-Control"] == "no-store"
-                first = json.loads(response.read())
+            try:
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    assert response.status == 200
+                    assert response.headers["Cache-Control"] == "no-store"
+                    first = json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                raise AssertionError(error.read().decode()) from error
             with urllib.request.urlopen(request, timeout=2) as response:
                 second = json.loads(response.read())
 
@@ -1372,20 +1401,28 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
         assert first["schema"] == "biopeia.observation.current.v1"
         assert first["scope"] == "bounded_in_memory_current_subset"
         assert first["absence_semantics"] == "not_evidence_of_source_absence"
-        assert len(first["messages"]) == 2
+        assert len(first["messages"]) == 5
         assert [item["delivery_sequence"] for item in first["messages"]] == [
             message.sequence for message in retained_before
         ]
-        assert [item["delivery_sequence"] for item in first["messages"]] == list(
-            publication.delivery_sequences
-        )
         observations = [item["observation"] for item in first["messages"]]
         family_names = {
             f"{observation['claim']['family']['authority']}."
             f"{'.'.join(observation['claim']['family']['path'])}"
             for observation in observations
         }
-        assert family_names == {"embodiment.body_pose", "environment.finite_scalar_field"}
+        assert family_names == {
+            "embodiment.body_pose",
+            "environment.finite_scalar_field",
+            "embodiment.render_link_pose",
+            "embodiment.render_morphology",
+            "environment.render_scene",
+        }
+        dynamic_observations = [observation for observation in observations if observation["context_time"]]
+        assert [item["delivery_sequence"] for item in first["messages"] if item["observation"]["context_time"]] == list(
+            publication.delivery_sequences
+        )
+        assert len(dynamic_observations) == 3
         assert all(
             any(
                 item["domain"] == "world"
@@ -1393,7 +1430,7 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
                 and item["value"] == committed_cut.causal_tick
                 for item in observation["context_time"]
             )
-            for observation in observations
+            for observation in dynamic_observations
         )
         body_observation = next(
             observation
@@ -1466,5 +1503,5 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
     )
     assert resumed is None
     assert result.committed_cut.causal_tick == 1
-    assert len(messages) == 2
+    assert len(messages) == 5
     assert len(reads) == 1

@@ -31,7 +31,10 @@ dependencies = [
 [[package]]
 name = "environment"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/environment.git?rev=main#d09e45c40633c9b2bf927c7aec3f6326318c2ea8" }
+source = { git = "https://github.com/biopeia/environment.git?rev=main#d59770c05366b24a604b220fc9f7b551b27877f7" }
+dependencies = [
+    { name = "rfc8785" },
+]
 
 [[package]]
 name = "etils"
@@ -204,7 +207,10 @@ wheels = [
 [[package]]
 name = "observation"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/observation.git?rev=main#a8b43af65b79ca4e2455bfc1ff1b55faf3d4d353" }
+source = { git = "https://github.com/biopeia/observation.git?rev=main#2c506900aa5ad0864eef7f0ce0ed70d7e8e4ea07" }
+dependencies = [
+    { name = "rfc8785" },
+]
 
 [[package]]
 name = "organism"
