@@ -57,6 +57,39 @@ from world.physical_step import (
 )
 
 
+def _select_compliant_torque(requested: float, effort: float, cap: float, trial):
+    """Choose nearest compliant value from a deterministic bounded grid."""
+    requested_velocity = trial(requested)
+    if requested_velocity is not None and abs(requested_velocity) <= cap:
+        return requested, requested_velocity
+    candidates = [requested]
+    candidates.extend(-effort + (2 * effort * i / 1000) for i in range(1001))
+    feasible = []
+    for applied in candidates:
+        velocity = trial(applied)
+        if velocity is not None and abs(velocity) <= cap:
+            feasible.append((abs(applied - requested), applied, velocity))
+    if not feasible:
+        raise ValueError("no tested applied torque produces a velocity-compliant candidate")
+    _, applied, velocity = min(feasible, key=lambda item: (item[0], item[1]))
+    return applied, velocity
+
+
+def _mujoco_trial(mujoco, model, qpos, qvel, qfrc, dof: int, applied: float):
+    """Run one trial on a fresh data object, isolated from the source state."""
+    import numpy as np
+
+    trial_data = mujoco.MjData(model)
+    trial_data.qpos[:] = qpos
+    trial_data.qvel[:] = qvel
+    trial_data.qfrc_applied[:] = qfrc
+    trial_data.qfrc_applied[dof] = applied
+    mujoco.mj_step(model, trial_data)
+    if not np.all(np.isfinite(trial_data.qpos)) or not np.all(np.isfinite(trial_data.qvel)) or any(w.number for w in trial_data.warning):
+        return None
+    return trial_data
+
+
 def advance_articulated_mujoco_step_from_motor_command(
     world: DurableWorldRuntime,
     *,
@@ -133,6 +166,7 @@ class ArticulatedMujocoConfiguration:
     solref: tuple[float, float]
     solimp: tuple[float, float, float, float, float]
     contact_policy: str
+    velocity_regulation_policy: str = "none"
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, str) or not self.revision.strip():
@@ -153,6 +187,8 @@ class ArticulatedMujocoConfiguration:
             raise ValueError("invalid explicit constraint impedance")
         if self.contact_policy != "max-sliding-body-torsion-rolling/no-self-collision-v1":
             raise ValueError("unsupported explicit contact policy")
+        if self.velocity_regulation_policy not in {"none", "m1-fixed-single-hinge-grid-v1"}:
+            raise ValueError("unsupported velocity regulation policy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,7 +353,52 @@ def execute_articulated_mujoco_step(
     for channel in torque.channels:
         native = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, channel.joint_id)
         data.qfrc_applied[model.jnt_dofadr[native]] = channel.torque_nm
-    mujoco.mj_step(model, data)
+    regulation = None
+    if configuration.velocity_regulation_policy == "none":
+        mujoco.mj_step(model, data)
+    else:
+        # M1 regulation is deliberately limited to one fixed-base hinge. MuJoCo
+        # joint ranges are positional; they do not enforce Embodiment speed caps.
+        # Search candidate applied torques by re-simulating from an identical
+        # source state. Never repair/clamp the resulting qvel.
+        if len(body.joints) != 1 or not body.fixed_base:
+            raise ValueError("M1 velocity regulation requires fixed-base single hinge")
+        joint_id = body.joints[0].joint_id
+        joint_native = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        dof = int(model.jnt_dofadr[joint_native])
+        velocity_cap = next(
+            item.max_velocity_rad_per_s for item in body.joint_ranges if item.joint_id == joint_id
+        )
+        effort_cap = float(topology[joint_id].find("limit").attrib["effort"])
+        requested_torque = float(data.qfrc_applied[dof])
+        if abs(float(data.qvel[dof])) > velocity_cap:
+            raise ValueError("source joint velocity already exceeds Embodiment maximum")
+        source_qpos = np.array(data.qpos, copy=True)
+        source_qvel = np.array(data.qvel, copy=True)
+        source_qfrc = np.array(data.qfrc_applied, copy=True)
+
+        def trial(applied: float):
+            return _mujoco_trial(mujoco, model, source_qpos, source_qvel, source_qfrc, dof, applied)
+
+        # Deterministic bounded grid is a tested-candidate search, not a proof
+        # that no feasible torque exists between samples. Preserve the requested
+        # value exactly when it is already compliant.
+        applied_torque, candidate_velocity = _select_compliant_torque(
+            requested_torque, effort_cap, velocity_cap,
+            lambda applied: (None if (result := trial(applied)) is None else float(result.qvel[dof])),
+        )
+        data = trial(applied_torque)
+        # Keep regulation evidence World-owned and inspectable without rewriting
+        # the Organism command or Embodiment's state/limits.
+        regulation = {
+            "policy": "m1-fixed-single-hinge-grid-v1",
+            "joint_id": joint_id,
+            "requested_torque_nm": requested_torque,
+            "applied_torque_nm": float(applied_torque),
+            "effort_limit_nm": effort_cap,
+            "velocity_cap_rad_per_s": velocity_cap,
+            "candidate_velocity_rad_per_s": candidate_velocity,
+        }
     if not np.all(np.isfinite(data.qpos)) or not np.all(np.isfinite(data.qvel)) or any(warning.number for warning in data.warning):
         raise ValueError("MuJoCo produced invalid/warning-reset numerical state")
     mujoco.mj_forward(model, data)
@@ -337,15 +418,21 @@ def execute_articulated_mujoco_step(
     return PhysicalStepCandidate(
         SolverArticulatedCandidate(root_candidate, tuple(joints)),
         StaticSceneCandidate(environment.correlation, scene),
+        evidence=regulation,
     )
 
 
 @dataclass(frozen=True, slots=True)
 class ArticulatedPhysicalStepOutcome:
-    """Committed World record plus the owner-returned accepted body state."""
+    """Committed record and accepted body plus transient solver evidence.
+
+    ``solver_evidence`` is returned to the caller only; it is not part of the
+    committed CausalRecord or durable journal. Do not treat it as persisted.
+    """
 
     record: CausalRecord
     body_state: ArticulatedEmbodimentPhysicalState
+    solver_evidence: dict[str, object] | None = None
 
 
 def advance_articulated_mujoco_step(
@@ -376,6 +463,7 @@ def advance_articulated_mujoco_step(
     World commits the resulting transition at the target causal tick.
     """
     accepted: dict[str, ArticulatedEmbodimentPhysicalState] = {}
+    solver_evidence: dict[str, object] = {}
 
     def project_body(context: PhysicalStepContext) -> ArticulatedPhysicalInput:
         if body_state.causal_tick != context.source_causal_tick:
@@ -404,12 +492,14 @@ def advance_articulated_mujoco_step(
         return environment_owner.project_physical_step(correlation)
 
     def execute_solver(context, body_projection, environment_projection):
-        return execute_articulated_mujoco_step(
+        candidate = execute_articulated_mujoco_step(
             context,
             body_projection,
             environment_projection,
             configuration=configuration,
         )
+        solver_evidence.update(candidate.evidence or {})
+        return candidate
 
     def adopt_body(context, candidate: SolverArticulatedCandidate) -> None:
         accepted["body"] = body_state.adopt_candidate(candidate, world_context=context)
@@ -448,4 +538,4 @@ def advance_articulated_mujoco_step(
             write_checkpoints=persist,
         ),
     )
-    return ArticulatedPhysicalStepOutcome(record, accepted["body"])
+    return ArticulatedPhysicalStepOutcome(record, accepted["body"], dict(solver_evidence))

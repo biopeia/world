@@ -23,12 +23,12 @@ wheels = [
 [[package]]
 name = "embodiment"
 version = "0.1.0a1"
-source = { git = "https://github.com/biopeia/embodiment.git?rev=a925c2f2f2694048e4ced4c00874dcfd2331bebe#a925c2f2f2694048e4ced4c00874dcfd2331bebe" }
+source = { git = "https://github.com/biopeia/embodiment.git?rev=main#5a23e1fbeaa31109647aec4d4dc36eddbe0a6321" }
 
 [[package]]
 name = "environment"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/environment.git?rev=b71d5566c3a73774a088a41a7b99a03954e43a53#b71d5566c3a73774a088a41a7b99a03954e43a53" }
+source = { git = "https://github.com/biopeia/environment.git?rev=main#d09e45c40633c9b2bf927c7aec3f6326318c2ea8" }
 
 [[package]]
 name = "etils"
@@ -83,7 +83,7 @@ wheels = [
 [[package]]
 name = "modality"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/modality.git?rev=79b779152d4bff2ab4191dc6601c8f1640e4cae3#79b779152d4bff2ab4191dc6601c8f1640e4cae3" }
+source = { git = "https://github.com/biopeia/modality.git?rev=main#93a4c3a4ea71dcf65269ce730aab736238fd3ea7" }
 
 [[package]]
 name = "mujoco"
@@ -201,12 +201,12 @@ wheels = [
 [[package]]
 name = "observation"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/observation.git?rev=a0d3f61540ba9589edfdb5b3cdd6bf3935afd7d1#a0d3f61540ba9589edfdb5b3cdd6bf3935afd7d1" }
+source = { git = "https://github.com/biopeia/observation.git?rev=main#2f4751f53678f2210930770605844cac766b1da4" }
 
 [[package]]
 name = "organism"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/organism.git?rev=3674cc787c65d7b6f68709c204c05c1e90fac70e#3674cc787c65d7b6f68709c204c05c1e90fac70e" }
+source = { git = "https://github.com/biopeia/organism.git?rev=main#7b9f738efdcd8cc27efe99c201ce3d88e487fcb2" }
 
 [[package]]
 name = "packaging"
@@ -426,18 +426,18 @@ runtime = [
 
 [package.metadata]
 requires-dist = [
-    { name = "embodiment", marker = "extra == 'integration'", git = "https://github.com/biopeia/embodiment.git?rev=a925c2f2f2694048e4ced4c00874dcfd2331bebe" },
-    { name = "embodiment", marker = "extra == 'runtime'", git = "https://github.com/biopeia/embodiment.git?rev=a925c2f2f2694048e4ced4c00874dcfd2331bebe" },
-    { name = "environment", marker = "extra == 'integration'", git = "https://github.com/biopeia/environment.git?rev=b71d5566c3a73774a088a41a7b99a03954e43a53" },
-    { name = "environment", marker = "extra == 'runtime'", git = "https://github.com/biopeia/environment.git?rev=b71d5566c3a73774a088a41a7b99a03954e43a53" },
-    { name = "modality", marker = "extra == 'integration'", git = "https://github.com/biopeia/modality.git?rev=79b779152d4bff2ab4191dc6601c8f1640e4cae3" },
-    { name = "modality", marker = "extra == 'runtime'", git = "https://github.com/biopeia/modality.git?rev=79b779152d4bff2ab4191dc6601c8f1640e4cae3" },
+    { name = "embodiment", marker = "extra == 'integration'", git = "https://github.com/biopeia/embodiment.git?rev=main" },
+    { name = "embodiment", marker = "extra == 'runtime'", git = "https://github.com/biopeia/embodiment.git?rev=main" },
+    { name = "environment", marker = "extra == 'integration'", git = "https://github.com/biopeia/environment.git?rev=main" },
+    { name = "environment", marker = "extra == 'runtime'", git = "https://github.com/biopeia/environment.git?rev=main" },
+    { name = "modality", marker = "extra == 'integration'", git = "https://github.com/biopeia/modality.git?rev=main" },
+    { name = "modality", marker = "extra == 'runtime'", git = "https://github.com/biopeia/modality.git?rev=main" },
     { name = "mujoco", marker = "extra == 'integration'", specifier = "==3.15.0" },
     { name = "mujoco", marker = "extra == 'mujoco'", specifier = "==3.15.0" },
-    { name = "observation", marker = "extra == 'integration'", git = "https://github.com/biopeia/observation.git?rev=a0d3f61540ba9589edfdb5b3cdd6bf3935afd7d1" },
-    { name = "observation", marker = "extra == 'runtime'", git = "https://github.com/biopeia/observation.git?rev=a0d3f61540ba9589edfdb5b3cdd6bf3935afd7d1" },
-    { name = "organism", marker = "extra == 'integration'", git = "https://github.com/biopeia/organism.git?rev=3674cc787c65d7b6f68709c204c05c1e90fac70e" },
-    { name = "organism", marker = "extra == 'runtime'", git = "https://github.com/biopeia/organism.git?rev=3674cc787c65d7b6f68709c204c05c1e90fac70e" },
+    { name = "observation", marker = "extra == 'integration'", git = "https://github.com/biopeia/observation.git?rev=main" },
+    { name = "observation", marker = "extra == 'runtime'", git = "https://github.com/biopeia/observation.git?rev=main" },
+    { name = "organism", marker = "extra == 'integration'", git = "https://github.com/biopeia/organism.git?rev=main" },
+    { name = "organism", marker = "extra == 'runtime'", git = "https://github.com/biopeia/organism.git?rev=main" },
     { name = "pytest", marker = "extra == 'integration'", specifier = ">=8" },
 ]
 provides-extras = ["mujoco", "runtime", "integration"]

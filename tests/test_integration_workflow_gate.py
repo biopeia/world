@@ -26,4 +26,5 @@ def test_integration_job_uses_public_dependencies_without_secrets():
     assert "secrets." not in body
     assert "vars." not in body
     assert "create-github-app-token" not in body
-    assert ".[integration]" in body
+    assert "--extra integration" in body
+    assert "--locked" in body

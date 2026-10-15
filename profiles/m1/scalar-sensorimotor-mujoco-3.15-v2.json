@@ -1,0 +1,154 @@
+{
+  "schema": "biopeia.world.m1.scalar-sensorimotor-profile",
+  "schema_version": 1,
+  "profile_id": "m1.scalar-sensorimotor.operator-r3",
+  "profile_kind": "operator_supplied_scenario",
+  "provenance": {
+    "repository": "biopeia/docs",
+    "revision": "586dcbb8376c2800fc7ea8e04ba0b486db3e87db",
+    "document": "technical/migration/MIGRATION_END_TO_END_ACCEPTANCE_REPORT.md",
+    "scenario": "Scenario configuration, lines 48-61",
+    "authorization": "World #150 user authorization, 2026-10-15",
+    "classification": "explicit configuration; not measured environmental truth or a runtime Observation"
+  },
+  "world": {
+    "id": "world.acceptance.sensorimotor-v1",
+    "presence_id": "presence.acceptance.sensorimotor-v1",
+    "initial_causal_tick": 0
+  },
+  "organism": {
+    "id": "12345678-1234-5678-1234-567812345678",
+    "step": 0,
+    "lifecycle": "ACTIVE",
+    "sense_node_id": "opaque.scalar.signal",
+    "kernel_limits": {
+      "max_nodes": 768,
+      "max_concepts": 192,
+      "max_edges": 6144,
+      "max_tentative_edges": 512,
+      "max_structural_mutations_per_consolidation": 16,
+      "consolidation_interval_ticks": 32,
+      "max_plastic_checkpoint_bytes": 8388608,
+      "max_owner_checkpoint_bytes": 16777216,
+      "max_consolidation_candidates": 1024,
+      "max_salient_event_traces": 64,
+      "consolidation_epoch_ticks": 8,
+      "slow_support_epochs": 4,
+      "fast_consolidation_threshold": 0.8,
+      "fast_min_reliability": 0.6,
+      "max_incoming_consolidated_weight_norm": 8.0,
+      "reacclimation_ticks": 32,
+      "max_episodic_episodes": 4096,
+      "max_episodic_episode_records": 32,
+      "max_episodic_retrieval_candidates": 64,
+      "max_episodic_replay_items": 16,
+      "max_episodic_interpretations_per_episode": 128,
+      "max_episodic_checkpoint_bytes": 2097152,
+      "episodic_epoch_ticks": 32,
+      "episodic_min_consolidation_epochs": 3
+    }
+  },
+  "embodiment": {
+    "body_id": "body.acceptance.sensorimotor-v1",
+    "episode_id": "episode.acceptance.sensorimotor-v1",
+    "morphology_revision": "morphology.acceptance.sensorimotor-r1",
+    "frame_id": "acceptance.world-frame",
+    "root_frame": "body.root",
+    "joints": [
+      {
+        "id": "joint.hinge",
+        "axis": [0.0, 1.0, 0.0],
+        "lower": -1.0,
+        "upper": 1.0,
+        "max_motor_torque": 2.0,
+        "passive_damping": 0.1,
+        "max_velocity": 2.0,
+        "parent_link": "body.root",
+        "child_link": "body.arm",
+        "origin": [0.0, 0.0, -0.2],
+        "initial_position": 0.0,
+        "initial_velocity": 0.0
+      }
+    ],
+    "segments": {
+      "body.root": {
+        "mass": 1.0,
+        "size": [0.2, 0.2, 0.2],
+        "origin": [0.0, 0.0, 0.0],
+        "color": [0.5, 0.5, 0.5, 1.0]
+      },
+      "body.arm": {
+        "mass": 0.5,
+        "size": [0.1, 0.4, 0.1],
+        "origin": [0.0, 0.0, -0.2],
+        "color": [0.2, 0.3, 0.4, 1.0]
+      }
+    },
+    "body_material": {
+      "lateral_friction": 0.0,
+      "spinning_friction": 0.0,
+      "rolling_friction": 0.0,
+      "restitution": 0.0,
+      "linear_damping": 0.0,
+      "angular_damping": 0.0
+    },
+    "fixed_base": true,
+    "receptor": {
+      "id": "receptor.acceptance.scalar-v1",
+      "body_frame": "body.root",
+      "position_in_body_frame_m": [0.0, 0.0, 0.0]
+    },
+    "actuator_surface": {
+      "ids": ["actuator.hinge.positive", "actuator.hinge.negative"],
+      "fingerprint_material": "sha256:acceptance-joint-surface-r1"
+    },
+    "differential_binding": {
+      "id": "binding.acceptance.differential-r1",
+      "positive_actuator_id": "actuator.hinge.positive",
+      "negative_actuator_id": "actuator.hinge.negative",
+      "scale": 0.5
+    },
+    "torque_binding": {
+      "id": "binding.acceptance.torque-r1",
+      "channel_id": "actuator.hinge",
+      "joint_id": "joint.hinge",
+      "axis": [0.0, 1.0, 0.0]
+    }
+  },
+  "environment": {
+    "id": "environment.acceptance.sensorimotor-v1",
+    "revision": "environment.acceptance.r1",
+    "owner_id": "owner.environment.acceptance.sensorimotor-v1",
+    "gravity_m_s2": [0.0, 0.0, 0.0],
+    "field": {
+      "id": "resource.acceptance.scalar-field-v1",
+      "revision": "field.acceptance.r1",
+      "position_m": [1.0, 0.0, 0.0],
+      "resource_radius_m": 0.1,
+      "field_radius_m": 2.0,
+      "remaining": 10.0,
+      "transfer_per_tick": 1.0
+    }
+  },
+  "modality": {
+    "channel_id": "channel.opaque.scalar-v1",
+    "sense_node_id": "opaque.scalar.signal",
+    "identity_transduction_revision": "dimensionless-scalar-field-identity-v1"
+  },
+  "solver": {
+    "engine": "mujoco",
+    "version": "3.15.0",
+    "revision": "mujoco-3.15.0-m1-operator-r3",
+    "timestep_s": 0.01,
+    "iterations": 50,
+    "tolerance": 1e-10,
+    "solref": [0.02, 1.0],
+    "solimp": [0.9, 0.95, 0.001, 0.5, 2.0],
+    "contact_policy": "max-sliding-body-torsion-rolling/no-self-collision-v1"
+  },
+  "observation_bridge": {
+    "host": "127.0.0.1",
+    "allowed_origin": "http://127.0.0.1:4173",
+    "max_response_bytes": 1000000
+  }
+}
