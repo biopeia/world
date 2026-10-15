@@ -172,11 +172,11 @@ def _validate_profile(value: Any) -> None:
         raise ProfileError("kernel reliability thresholds must be <= 1")
 
     embodiment = _object(profile["embodiment"], {
-        "body_id", "episode_id", "morphology_revision", "frame_id", "root_frame", "joints",
+        "body_id", "episode_id", "morphology_revision", "geometry_revision", "frame_id", "root_frame", "joints",
         "segments", "body_material", "fixed_base", "receptor", "actuator_surface",
         "differential_binding", "torque_binding",
     }, "embodiment")
-    for key in ("body_id", "episode_id", "morphology_revision", "frame_id", "root_frame"):
+    for key in ("body_id", "episode_id", "morphology_revision", "geometry_revision", "frame_id", "root_frame"):
         _identifier(embodiment[key], f"embodiment.{key}")
     if embodiment["fixed_base"] is not True or type(embodiment["joints"]) is not list or len(embodiment["joints"]) != 1:
         raise ProfileError("M1 profile requires its declared fixed-base single-hinge body")
@@ -622,6 +622,7 @@ def construct_fresh_runtime(
         ),
         kernel_limits=limits, actuator_context=actuator_context, actuator_surface=surface,
         articulated_body=articulated_body, active_morphology=morphology,
+        embodiment_geometry_revision=body_cfg["geometry_revision"],
         differential_binding=differential_binding, torque_binding=torque_binding,
         environment_owner=env_owner, owner_checkpoint_store=store,
     )

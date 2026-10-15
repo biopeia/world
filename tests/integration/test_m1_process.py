@@ -73,8 +73,12 @@ def test_fresh_world_process_runs_real_cycles_and_serves_postcommit_observations
                   *message["observation"]["claim"]["family"]["path"]))
         for message in bridge_payload["messages"]
     }
-    assert qualified_families <= {
-        "embodiment.body_pose", "environment.finite_scalar_field"
+    assert qualified_families == {
+        "embodiment.body_pose",
+        "environment.finite_scalar_field",
+        "environment.render_scene",
+        "embodiment.render_morphology",
+        "embodiment.render_link_pose",
     }
 
 

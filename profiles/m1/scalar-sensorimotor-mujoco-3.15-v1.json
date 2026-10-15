@@ -52,6 +52,7 @@
     "body_id": "body.acceptance.sensorimotor-v1",
     "episode_id": "episode.acceptance.sensorimotor-v1",
     "morphology_revision": "morphology.acceptance.sensorimotor-r1",
+    "geometry_revision": "geometry.acceptance.sensorimotor-r1",
     "frame_id": "acceptance.world-frame",
     "root_frame": "body.root",
     "joints": [
