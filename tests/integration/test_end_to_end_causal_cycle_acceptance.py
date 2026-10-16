@@ -57,6 +57,7 @@ from observation.http_bridge import LocalObservationReadBridge
 from observation.plane import ObservationPlane
 from organism.actuation import (
     ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
+    ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA,
     ActuatorEvidenceContext,
     ActuatorSurface,
     CompetenceDevelopmentEngine,
@@ -93,6 +94,8 @@ from world.durable_runtime import (
 )
 from world.manifest import CheckpointReference, ManifestError, WorldCausalManifestStore
 from world.manifest import ManifestStatus
+from organism.actuation.action_history import HistoryIndex
+from world.checkpoint_dependency import resolve_dependency
 from world.owner_checkpoint_store import FileOwnerCheckpointStore
 from world.runtime import PresenceId, WorldId
 
@@ -176,6 +179,12 @@ def _reference(directory: Path, owner: str, identity: str, schema: str, tick: in
     )
 
 
+def _committed_resolver(directory: Path):
+    """Digest-verified reads from the committed owner store (M3 dependencies)."""
+    root = directory / "owners" / "committed"
+    return lambda digest: resolve_dependency(root, digest)
+
+
 def _run(
     directory: Path,
     *,
@@ -192,6 +201,7 @@ def _run(
     actuator_surface_material: str = SURFACE_FINGERPRINT,
     initial_joint_velocity_rad_per_s: float = 0.0,
     velocity_regulation_policy: str = "none",
+    organism_v5: bool = False,
     after_first_commit: Callable[
         [DurableWorldRuntime, CausalCycleResult, ObservationPlane], None
     ]
@@ -267,7 +277,8 @@ def _run(
     )
     contracts = {
         ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(
-            kernel_limits=kernel_limits
+            kernel_limits=kernel_limits,
+            read_dependency=_committed_resolver(directory) if organism_v5 else None,
         ),
         ("embodiment", BODY_ID): _Contract(
             BODY_ID, {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
@@ -368,7 +379,10 @@ def _run(
     # differential binding defines their combined physical effect; they are
     # not declared mutually exclusive to Organism, so a complete command may
     # include both without World synthesizing an omitted channel.
-    composer = OrganismExplorationComposer(organism_id=str(ORGANISM_ID), engine=engine)
+    composer = OrganismExplorationComposer(
+        organism_id=str(ORGANISM_ID), engine=engine,
+        history=HistoryIndex() if organism_v5 else None,
+    )
     if malformed_organism_checkpoint:
         original_checkpoint_for_candidate = composer.checkpoint_for_candidate
 
@@ -580,6 +594,7 @@ def _restore_runtime_from_directory(
     kernel_limits: KernelLimits | None = KernelLimits(),
     actuator_context: ActuatorEvidenceContext | None = None,
     actuator_surface_material: str = SURFACE_FINGERPRINT,
+    organism_v5: bool = False,
 ):
     morphology = ActiveArticulatedMorphology.from_spec(
         body_id=BODY_ID,
@@ -596,7 +611,8 @@ def _restore_runtime_from_directory(
     )
     contracts = {
         ("organism", str(ORGANISM_ID)): OrganismCheckpointContract(
-            kernel_limits=kernel_limits or KernelLimits()
+            kernel_limits=kernel_limits or KernelLimits(),
+            read_dependency=_committed_resolver(directory) if organism_v5 else None,
         ),
         ("embodiment", BODY_ID): _Contract(
             BODY_ID,
@@ -649,10 +665,10 @@ def _restore_runtime_from_directory(
     return restored, morphology
 
 
-def _resume_in_fresh_process(directory: Path, output_path: Path) -> None:
+def _resume_in_fresh_process(directory: Path, output_path: Path, *, organism_v5: bool = False) -> None:
     """Child-process entrypoint: restore and continue using World production APIs."""
     frame = _frame()
-    restored, morphology = _restore_runtime_from_directory(directory)
+    restored, morphology = _restore_runtime_from_directory(directory, organism_v5=organism_v5)
     surface = ActuatorSurface.from_effector_ids(
         ("actuator.hinge.positive", "actuator.hinge.negative"),
         fingerprint_material=SURFACE_FINGERPRINT,
@@ -1004,9 +1020,9 @@ def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4 or sys.argv[1] != "--resume":
-        raise SystemExit("usage: test_end_to_end_causal_cycle_acceptance.py --resume DIR OUTPUT")
-    _resume_in_fresh_process(Path(sys.argv[2]), Path(sys.argv[3]))
+    if len(sys.argv) != 4 or sys.argv[1] not in ("--resume", "--resume-v5"):
+        raise SystemExit("usage: test_end_to_end_causal_cycle_acceptance.py --resume|--resume-v5 DIR OUTPUT")
+    _resume_in_fresh_process(Path(sys.argv[2]), Path(sys.argv[3]), organism_v5=sys.argv[1] == "--resume-v5")
 
 
 def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: Path) -> None:
@@ -1650,3 +1666,73 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
     assert result.committed_cut.causal_tick == 1
     assert len(messages) == 5
     assert len(reads) == 1
+
+
+# ---------------------------------------------------------------- M3 (v5)
+def _organism_ref(result: CausalCycleResult) -> CheckpointReference:
+    return next(ref for ref in result.committed_cut.owner_checkpoint_references if ref.owner == "organism")
+
+
+def test_m3_compact_checkpoint_session_matches_v4_cut_for_cut(tmp_path: Path) -> None:
+    """Same inputs, v4 vs v5 Organism checkpoints, through the production cycle.
+
+    Every committed cut must have identical physical/environment owner state,
+    and the v5 Organism checkpoint (with its World-verified dependency) must
+    reconstruct exactly the v4 bytes of the same cut.
+    """
+    from organism.actuation.action_history import exploration_v5_to_v4
+
+    cycles = 12
+    v4_results: list[CausalCycleResult] = []
+    v5_results: list[CausalCycleResult] = []
+    _run(tmp_path / "v4", use_session=True, session_cycles=cycles, on_cycle_result=v4_results.append)
+    _run(tmp_path / "v5", use_session=True, session_cycles=cycles, on_cycle_result=v5_results.append,
+         organism_v5=True)
+    assert len(v4_results) == len(v5_results) == cycles
+    resolve = _committed_resolver(tmp_path / "v5")
+    with_dependency = 0
+    for r4, r5 in zip(v4_results, v5_results):
+        assert r4.committed_cut.causal_tick == r5.committed_cut.causal_tick
+        others4 = {(ref.owner, ref.owner_identity): ref.sha256 for ref in r4.committed_cut.owner_checkpoint_references
+                   if ref.owner not in ("organism", "world-journal")}
+        others5 = {(ref.owner, ref.owner_identity): ref.sha256 for ref in r5.committed_cut.owner_checkpoint_references
+                   if ref.owner not in ("organism", "world-journal")}
+        assert others4 == others5                                   # same physics and environment
+        o4, o5 = _organism_ref(r4), _organism_ref(r5)
+        assert o4.schema_version == ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA
+        assert o5.schema_version == ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA
+        assert exploration_v5_to_v4(Path(o5.locator).read_bytes(), resolve=resolve) == Path(o4.locator).read_bytes()
+        with_dependency += o5.dependency_sha256 is not None
+    assert with_dependency > 0                                      # the dependency path was exercised
+
+
+def test_m3_compact_checkpoint_restores_and_continues_in_fresh_process(tmp_path: Path) -> None:
+    uninterrupted, _, uninterrupted_next, uninterrupted_messages = _run(
+        tmp_path / "uninterrupted", continue_from_live_state=True, organism_v5=True
+    )
+    persisted, _, no_resume, _ = _run(tmp_path / "fresh-process", stop_after_first=True, organism_v5=True)
+    assert persisted.committed_cut.causal_tick == 1 and no_resume is None
+    assert _organism_ref(persisted).schema_version == ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA
+
+    output_path = tmp_path / "fresh-process-result.json"
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--resume-v5", str(tmp_path / "fresh-process"),
+         str(output_path)],
+        check=False, capture_output=True, text=True, timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    fresh = json.loads(output_path.read_text())
+    expected = json.loads(json.dumps(_summary(uninterrupted_next, uninterrupted_messages), sort_keys=True))
+    assert fresh["process_id"] != os.getpid()
+    assert fresh["cycle"] == expected
+
+
+def test_m3_restore_refuses_missing_organism_history(tmp_path: Path) -> None:
+    cycles: list[CausalCycleResult] = []
+    _run(tmp_path / "v5", use_session=True, session_cycles=4, on_cycle_result=cycles.append, organism_v5=True)
+    head = _organism_ref(cycles[-1]).dependency_sha256
+    assert head is not None
+    (tmp_path / "v5" / "owners" / "committed" / head[:2] / f"{head}.blob").unlink()
+    # Refused by World's dependency check (R1), before any Organism restore.
+    with pytest.raises(ManifestError, match="dependency closure is not verified"):
+        _restore_runtime_from_directory(tmp_path / "v5", organism_v5=True)

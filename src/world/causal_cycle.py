@@ -41,6 +41,7 @@ from environment.spatial_render import project_spatial_render_scene
 from modality import DimensionlessScalarFieldIdentityV1
 from organism.actuation import (
     ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
+    ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA,
     ActuatorEvidenceContext,
     ActuatorSurface,
     OrganismExplorationComposer,
@@ -77,7 +78,9 @@ from .organism_transition import (
     ScalarFieldOrganismInput,
     advance_organism_from_scalar_field_for_physical_step,
 )
+from .checkpoint_dependency import reference_dependency_root, resolve_dependency
 from .owner_checkpoint_store import (
+    OwnerCheckpointDependency,
     OwnerCheckpointPayload,
     OwnerCheckpointStore,
 )
@@ -315,8 +318,11 @@ def restore_scalar_sensorimotor_runtime(
     )
 
     organism_reference, organism_bytes = staged[("organism", expected_organism_id)]
-    if organism_reference.schema_version != ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA:
+    if organism_reference.schema_version not in (
+        ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA, ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA
+    ):
         raise ManifestError("committed Organism checkpoint schema is not supported by this composition")
+    dependency_root = reference_dependency_root(organism_reference)
     try:
         organism = OrganismExplorationComposer.restore_from_committed_checkpoint(
             organism_bytes,
@@ -326,6 +332,8 @@ def restore_scalar_sensorimotor_runtime(
             expected_actuator_context=actuator_context,
             expected_surface=actuator_surface,
             kernel_limits=kernel_limits,
+            # Content-addressed, digest-verified; World never interprets the bytes.
+            read_dependency=lambda digest: resolve_dependency(dependency_root, digest),
         )
     except (TypeError, ValueError) as error:
         raise ManifestError("Organism checkpoint does not restore against the committed World receipt") from error
@@ -518,9 +526,24 @@ def run_scalar_sensorimotor_cycle_and_publish(
             nonlocal written_references
             if step_context != context:
                 raise ManifestError("World-issued physical context changed before commit")
-            organism_checkpoint = action_composer.checkpoint_for_candidate(
-                candidate,
-                transition_state=sensed.state,
+            if getattr(action_composer, "exports_dependencies", False):
+                organism_checkpoint, declaration = action_composer.checkpoint_with_dependency_for_candidate(
+                    candidate, transition_state=sensed.state
+                )
+            else:
+                organism_checkpoint, declaration = action_composer.checkpoint_for_candidate(
+                    candidate, transition_state=sensed.state
+                ), None
+            # A v5 composer always declares (even before any history exists);
+            # a v4 composer never does.
+            organism_schema = (
+                ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA if declaration is not None
+                else ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA
+            )
+            organism_dependency = (
+                OwnerCheckpointDependency(declaration.head, declaration.parent, declaration.new_blob)
+                if declaration is not None and declaration.head is not None
+                else None
             )
             written_references = tuple(
                 owner_checkpoint_store.write(
@@ -529,8 +552,9 @@ def run_scalar_sensorimotor_cycle_and_publish(
                         OwnerCheckpointPayload(
                             owner="organism",
                             owner_identity=str(sensed.state.identity),
-                            schema_version=ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA,
+                            schema_version=organism_schema,
                             encoded=organism_checkpoint,
+                            dependency=organism_dependency,
                         ),
                         OwnerCheckpointPayload(
                             owner="embodiment",

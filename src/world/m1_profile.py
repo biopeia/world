@@ -320,8 +320,16 @@ def construct_fresh_runtime(
     source_revisions: dict[str, str],
     *,
     observation_port: int,
+    organism_checkpoint: str = "v4",
 ) -> BuiltM1Runtime:
-    """Construct World and owner state solely from validated profile inputs."""
+    """Construct World and owner state solely from validated profile inputs.
+
+    ``organism_checkpoint="v5"`` opts into the compact Organism exploration
+    checkpoint whose action history is a World-verified dependency
+    (organism#183, world#90). ``"v4"`` keeps the existing format.
+    """
+    if organism_checkpoint not in ("v4", "v5"):
+        raise ProfileError("organism_checkpoint must be 'v4' or 'v5'")
     # Keep this boundary safe even when called directly rather than through the
     # CLI profile loader. The CLI's digest is provenance for the original JSON;
     # revalidation ensures its decoded content remains admissible.
@@ -381,7 +389,10 @@ def construct_fresh_runtime(
         OrganismCheckpointContract,
         OrganismExplorationComposer,
     )
+    from organism.actuation.action_history import HistoryIndex
     from organism.cognition import CognitiveRuntimeCheckpoint, SenseChannelBinding
+
+    from .checkpoint_dependency import resolve_dependency
     from organism.cognition.graph import CognitiveGraph, PlasticNode
     from organism.cognition.limits import KernelLimits
     from organism.cognition.transition import CognitiveTransitionState
@@ -521,7 +532,10 @@ def construct_fresh_runtime(
         organism_id=str(organism_id),
         embodiment_fingerprint=actuator_context.fingerprint,
     )
-    composer = OrganismExplorationComposer(organism_id=str(organism_id), engine=engine)
+    composer = OrganismExplorationComposer(
+        organism_id=str(organism_id), engine=engine,
+        history=HistoryIndex() if organism_checkpoint == "v5" else None,
+    )
     receptor_cfg = body_cfg["receptor"]
     receptor = EmbodimentReceptor(
         receptor_id=receptor_cfg["id"], body_id=body_cfg["body_id"],
@@ -554,7 +568,11 @@ def construct_fresh_runtime(
     )
 
     contracts: dict[tuple[str, str], Any] = {
-        ("organism", str(organism_id)): OrganismCheckpointContract(kernel_limits=limits),
+        ("organism", str(organism_id)): OrganismCheckpointContract(
+            kernel_limits=limits,
+            read_dependency=(lambda digest: resolve_dependency(state_root / "owners", digest))
+            if organism_checkpoint == "v5" else None,
+        ),
         ("embodiment", body_cfg["body_id"]): _CheckpointContract(
             body_cfg["body_id"],
             {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda encoded: _valid_body_checkpoint(encoded, morphology)},
