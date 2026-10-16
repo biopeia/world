@@ -14,8 +14,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
+from .checkpoint_dependency import is_sha256 as _is_sha256, reference_dependency_root, resolve_dependency
 from .manifest import CheckpointReference
 from .physical_step import PhysicalStepContext
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerCheckpointDependency:
+    """Owner-declared immutable dependency of one checkpoint (organism#183).
+
+    ``head`` is the content digest the checkpoint depends on, ``parent`` the
+    head of the checkpoint it extends, and ``new_blob`` the only dependency
+    bytes not yet durable. World hashes and stores these bytes; it never
+    interprets them.
+    """
+
+    head: str | None
+    parent: str | None
+    new_blob: bytes | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("head", "parent"):
+            value = getattr(self, name)
+            if value is not None and not _is_sha256(value):
+                raise ValueError(f"dependency {name} must be a sha256 hex digest or None")
+        if self.new_blob is None:
+            if self.head != self.parent:
+                raise ValueError("a dependency without new bytes must keep its parent head")
+        else:
+            if not isinstance(self.new_blob, bytes) or not self.new_blob:
+                raise ValueError("new dependency bytes must be non-empty bytes")
+            if hashlib.sha256(self.new_blob).hexdigest() != self.head:
+                raise ValueError("new dependency bytes do not match the declared head")
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +56,7 @@ class OwnerCheckpointPayload:
     owner_identity: str
     schema_version: str
     encoded: bytes
+    dependency: OwnerCheckpointDependency | None = None
 
     def __post_init__(self) -> None:
         for name in ("owner", "owner_identity", "schema_version"):
@@ -34,6 +65,8 @@ class OwnerCheckpointPayload:
                 raise ValueError(f"{name} must be a non-empty string")
         if not isinstance(self.encoded, bytes) or not self.encoded:
             raise ValueError("encoded owner checkpoint must be non-empty bytes")
+        if self.dependency is not None and not isinstance(self.dependency, OwnerCheckpointDependency):
+            raise TypeError("dependency must be an OwnerCheckpointDependency")
 
 
 @runtime_checkable
@@ -109,8 +142,14 @@ class FileOwnerCheckpointStore:
         for payload in payloads:
             if not isinstance(payload, OwnerCheckpointPayload):
                 raise TypeError("payloads must be OwnerCheckpointPayload values")
+            dependency = payload.dependency
+            if dependency is not None and dependency.head is not None:
+                # Dependency bytes are durable before the payload that needs them.
+                if dependency.new_blob is not None:
+                    self._publish_blob(self._blob_path(dependency.head), dependency.new_blob, dependency.head)
+                self.resolve(dependency.head)
             digest = hashlib.sha256(payload.encoded).hexdigest()
-            target = self.root / digest[:2] / f"{digest}.blob"
+            target = self._blob_path(digest)
             self._publish_blob(target, payload.encoded, digest)
             references.append(
                 CheckpointReference(
@@ -120,9 +159,18 @@ class FileOwnerCheckpointStore:
                     schema_version=payload.schema_version,
                     locator=str(target),
                     sha256=digest,
+                    dependency_sha256=dependency.head if dependency is not None else None,
+                    dependency_parent=dependency.parent if dependency is not None and dependency.head is not None else None,
                 )
             )
         return tuple(references)
+
+    def _blob_path(self, digest: str) -> Path:
+        return self.root / digest[:2] / f"{digest}.blob"
+
+    def resolve(self, digest: str) -> bytes:
+        """Return immutable bytes by content digest, verified; never interpreted."""
+        return resolve_dependency(self.root, digest)
 
     def _publish_blob(self, target: Path, encoded: bytes, digest: str) -> None:
         _mkdir_durable(target.parent)
@@ -168,4 +216,11 @@ def _mkdir_durable(path: Path) -> None:
         _fsync_directory(directory.parent)
 
 
-__all__ = ["FileOwnerCheckpointStore", "OwnerCheckpointPayload", "OwnerCheckpointStore"]
+__all__ = [
+    "FileOwnerCheckpointStore",
+    "OwnerCheckpointDependency",
+    "OwnerCheckpointPayload",
+    "OwnerCheckpointStore",
+    "reference_dependency_root",
+    "resolve_dependency",
+]

@@ -33,6 +33,7 @@ from .manifest import (
     WorldCausalManifest,
     WorldCausalManifestStore,
 )
+from .checkpoint_dependency import reference_dependency_root, resolve_dependency
 from .runtime import PresenceId, RecoveryRequiredError, TickInProgressError, WorldId
 
 _JOURNAL_OWNER = "world-journal"
@@ -41,8 +42,12 @@ _CAUSAL_CUT_RECORD_TYPE = "world.causal_cut.committed"
 
 
 def _reference_descriptor(reference: CheckpointReference) -> dict[str, str]:
-    """Serialize an opaque checkpoint reference without inspecting its bytes."""
-    return {
+    """Serialize an opaque checkpoint reference without inspecting its bytes.
+
+    Dependency keys appear only when the reference has a dependency, so
+    descriptors (and journal digests) of existing references are unchanged.
+    """
+    descriptor = {
         "owner_id": reference.owner,
         "owner_identity": reference.owner_identity,
         "checkpoint_id": reference.checkpoint_id,
@@ -50,6 +55,10 @@ def _reference_descriptor(reference: CheckpointReference) -> dict[str, str]:
         "locator": reference.locator,
         "sha256": reference.sha256,
     }
+    if reference.dependency_sha256 is not None:
+        descriptor["dependency_sha256"] = reference.dependency_sha256
+        descriptor["dependency_parent"] = reference.dependency_parent
+    return descriptor
 
 
 def _causal_cut_record(
@@ -118,8 +127,11 @@ def _validate_causal_cut_record(record: CausalRecord) -> None:
         "owner_id", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"
     }
     normalized_references: list[tuple[str, str]] = []
+    dependency_fields = {"dependency_sha256", "dependency_parent"}
     for reference in references:
-        if not isinstance(reference, Mapping) or set(reference) != required_reference_fields:
+        if not isinstance(reference, Mapping) or set(reference) not in (
+            required_reference_fields, required_reference_fields | dependency_fields
+        ):
             raise ManifestError("persisted causal-cut record has an invalid checkpoint reference")
         values = tuple(reference[field] for field in (
             "owner_id", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"
@@ -128,7 +140,11 @@ def _validate_causal_cut_record(record: CausalRecord) -> None:
             raise ManifestError("persisted causal-cut record has an invalid checkpoint reference")
         # Reuse the canonical descriptor validation without changing ownership.
         try:
-            CheckpointReference(*values)
+            CheckpointReference(
+                *values,
+                dependency_sha256=reference.get("dependency_sha256"),
+                dependency_parent=reference.get("dependency_parent"),
+            )
         except ValueError as exc:
             raise ManifestError("persisted causal-cut record has an invalid checkpoint reference") from exc
         normalized_references.append((values[0], values[1]))
@@ -1452,6 +1468,7 @@ class DurableWorldRuntime:
                     raise ManifestError("transition lacks an owner recoverability contract for every participant")
                 if not self._validate_owner_checkpoints(owner_references, proposed_contracts):
                     raise ManifestError("owner checkpoint validation failed for one or more checkpoint references")
+                self._verify_dependency_declarations(owner_references, current, proposed_contracts)
                 owner_records = tuple(
                     write_owner_records(proposed_tick, owner_references)
                     if write_owner_records is not None
@@ -1638,9 +1655,56 @@ class DurableWorldRuntime:
         owner_refs = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
         if len(journal_refs) != 1 or not DurableJournalSnapshotStore.verify(journal_refs[0]):
             return False
+        for ref in owner_refs:
+            if ref.dependency_sha256 is not None:
+                try:   # durable and digest-valid, at commit and on restore
+                    resolve_dependency(reference_dependency_root(ref), ref.dependency_sha256)
+                except LookupError:
+                    return False
         return bool(owner_checkpoint_verifier(owner_refs)) and DurableWorldRuntime._validate_owner_checkpoints(
             owner_refs, owner_checkpoint_contracts
         )
+
+    @staticmethod
+    def _verify_dependency_declarations(
+        references: tuple[CheckpointReference, ...],
+        base: WorldCausalManifest,
+        contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
+    ) -> None:
+        """Commit-time dependency invariants (organism#183, world#90).
+
+        * The owner contract states which dependency its checkpoint bytes
+          require; the reference must carry exactly that (no omission or
+          mismatch). Owners whose contract declares no dependencies may not
+          attach one.
+        * A dependency must extend the base cut: its parent equals the
+          dependency recorded for the same owner in the committed cut being
+          extended. The single-writer precondition fixes that base.
+        World compares digests only; dependency bytes are never interpreted.
+        """
+        base_heads = {
+            (ref.owner, ref.owner_identity): ref.dependency_sha256
+            for ref in base.checkpoint_references
+        }
+        for reference in references:
+            if reference.owner == _JOURNAL_OWNER:
+                continue
+            key = (reference.owner, reference.owner_identity)
+            declared = getattr(contracts.get(key), "declared_dependency", None)
+            if declared is None:
+                if reference.dependency_sha256 is not None:
+                    raise ManifestError("owner contract does not declare checkpoint dependencies")
+                continue
+            try:
+                expected = declared(
+                    Path(reference.locator).read_bytes(), reference.owner_identity, reference.schema_version
+                )
+            except Exception as exc:
+                raise ManifestError("owner contract could not state the checkpoint dependency") from exc
+            if expected != reference.dependency_sha256:
+                raise ManifestError("checkpoint dependency is omitted or inconsistent with its owner declaration")
+            if reference.dependency_sha256 is not None and reference.dependency_parent != base_heads.get(key):
+                raise ManifestError("checkpoint dependency does not extend the committed base cut")
 
     @staticmethod
     def _validate_owner_checkpoints(
