@@ -120,11 +120,19 @@ class _OrganismActionComposer(Protocol):
         transition_state: OrganismTransitionState,
     ) -> bytes: ...
 
+    def stage_somatic_feedback_for_candidate(
+        self,
+        candidate: _ActionCandidate,
+        *,
+        somatic_observation: Mapping[str, float] | None = None,
+    ) -> None: ...
+
     def adopt_after_world_commit(
         self,
         candidate: _ActionCandidate,
         *,
         committed_cut: CommittedWorldCut,
+        somatic_observation: Mapping[str, float] | None = None,
     ) -> None: ...
 
 
@@ -167,6 +175,7 @@ class ScalarSensorimotorCycleInputs:
     learning: tuple[EdgeLearningInstruction, ...] = ()
     experience_policy: ExperienceRecordingPolicy | None = None
     enable_somatic_feedback: bool = False
+    somatic_transduction: object | None = None
 
     def as_cycle_arguments(self) -> dict[str, object]:
         return {
@@ -193,6 +202,7 @@ class ScalarSensorimotorCycleInputs:
             "learning": self.learning,
             "experience_policy": self.experience_policy,
             "enable_somatic_feedback": self.enable_somatic_feedback,
+            "somatic_transduction": self.somatic_transduction,
         }
 
 
@@ -441,6 +451,7 @@ def run_scalar_sensorimotor_cycle_and_publish(
     learning: tuple[EdgeLearningInstruction, ...] = (),
     experience_policy: ExperienceRecordingPolicy | None = None,
     enable_somatic_feedback: bool = False,
+    somatic_transduction: object | None = None,
 ) -> CausalCycleResult:
     """Sense, transition, issue an Organism command, solve, adopt, commit, publish.
 
@@ -460,6 +471,11 @@ def run_scalar_sensorimotor_cycle_and_publish(
         raise ValueError("Embodiment geometry revision must be supplied by its owner")
     if type(publish_static_spatial) is not bool:
         raise TypeError("publish_static_spatial must be a boolean")
+    if enable_somatic_feedback:
+        if somatic_transduction is None:
+            raise ValueError("somatic_transduction is required when enable_somatic_feedback is True")
+        if not hasattr(somatic_transduction, "transduce") or not callable(getattr(somatic_transduction, "transduce")):
+            raise TypeError("somatic_transduction must provide a callable 'transduce' method")
     source_tick = world.causal_tick
     if embodiment_state.causal_tick != source_tick:
         raise ValueError("Embodiment source state does not match the current World cut")
@@ -538,6 +554,12 @@ def run_scalar_sensorimotor_cycle_and_publish(
             nonlocal written_references
             if step_context != context:
                 raise ManifestError("World-issued physical context changed before commit")
+            if enable_somatic_feedback and hasattr(adopted_body, "joints") and somatic_transduction is not None:
+                somatic_obs = somatic_transduction.transduce(adopted_body.joints)
+                if hasattr(action_composer, "stage_somatic_feedback_for_candidate"):
+                    action_composer.stage_somatic_feedback_for_candidate(
+                        candidate, somatic_observation=somatic_obs
+                    )
             if getattr(action_composer, "exports_dependencies", False):
                 organism_checkpoint, declaration = action_composer.checkpoint_with_dependency_for_candidate(
                     candidate, transition_state=sensed.state
@@ -658,11 +680,8 @@ def run_scalar_sensorimotor_cycle_and_publish(
             expected_owner_references=written_references,
         )
         somatic_observation = None
-        if enable_somatic_feedback and hasattr(physical.body_state, "joints"):
-            somatic_observation = {}
-            for j in physical.body_state.joints:
-                somatic_observation[f"{j.joint_id}:pos"] = float(j.position_rad)
-                somatic_observation[f"{j.joint_id}:vel"] = float(j.velocity_rad_per_s)
+        if enable_somatic_feedback and hasattr(physical.body_state, "joints") and somatic_transduction is not None:
+            somatic_observation = somatic_transduction.transduce(physical.body_state.joints)
         action_composer.adopt_after_world_commit(
             candidate, committed_cut=cut, somatic_observation=somatic_observation
         )
