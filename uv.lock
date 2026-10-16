@@ -23,7 +23,7 @@ wheels = [
 [[package]]
 name = "embodiment"
 version = "0.1.0a1"
-source = { git = "https://github.com/biopeia/embodiment.git?rev=main#73abbc9a639b29b6ebe04112e4b88dbb13de2ed8" }
+source = { git = "https://github.com/biopeia/embodiment.git?rev=main#957af224e4400fc30a9d8d78d987cec16a8e959e" }
 dependencies = [
     { name = "rfc8785" },
 ]
@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "organism"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/organism.git?rev=main#d8ed534d48188fb2f629faaa8dd85b95063a0c2d" }
+source = { git = "https://github.com/biopeia/organism.git?rev=main#cedce522696f7d5a0ba458018eebd61a18972a4c" }
 
 [[package]]
 name = "packaging"
