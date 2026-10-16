@@ -3206,3 +3206,42 @@ def test_durable_runtime_status_consistent_with_external_store_recovery_required
 
     assert recovered.status is ManifestStatus.COMMITTED
     assert manifest_store.read().status is ManifestStatus.COMMITTED
+
+
+def test_commit_verifies_journal_prefix_once_not_every_tick(tmp_path, monkeypatch):
+    world_id = WorldId("world-journal-verify-cache")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    state = tmp_path / "organism-0.json"
+    state.write_bytes(b"organism at tick zero")
+    runtime = _initialize(
+        world_id, "presence-a", manifest_store, journal_store,
+        initial_owner_references=(_checkpoint(state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+    scans = []
+    original = DurableJournalSnapshotStore._verify_prefix
+    monkeypatch.setattr(DurableJournalSnapshotStore, "_verify_prefix",
+                        staticmethod(lambda ref: scans.append(ref) or original(ref)))
+    for tick in range(1, 31):
+        def write(t, tick=tick):
+            path = tmp_path / f"organism-{tick}.json"
+            path.write_bytes(f"organism at tick {tick}".encode())
+            return (_checkpoint(path),)
+        runtime.tick(f"transition-{tick}", write)
+    assert runtime.causal_tick == 30
+    assert len(scans) <= 1                      # no full-prefix rescan per commit
+
+    # Tampering with the committed prefix is still detected at the next commit.
+    journal_path = Path(next(r for r in runtime.manifest.checkpoint_references if r.owner == "world-journal").locator)
+    data = bytearray(journal_path.read_bytes())
+    data[len(data) // 2] ^= 1                    # changes the file signature: cache is not trusted
+    journal_path.write_bytes(bytes(data))
+    def write31(t):
+        path = tmp_path / "organism-31.json"
+        path.write_bytes(b"organism at tick 31")
+        return (_checkpoint(path),)
+    with pytest.raises(ManifestError):
+        runtime.tick("transition-31", write31)
