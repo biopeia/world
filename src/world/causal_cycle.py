@@ -48,8 +48,9 @@ from organism.actuation import (
     ExplorationOutcome,
     RestoredOrganismExplorationCheckpoint,
 )
-from organism.cognition import SenseChannelBinding
+from organism.cognition import EdgeLearningInstruction, SenseChannelBinding
 from organism.cognition.limits import KernelLimits
+from organism.memory import ExperienceRecordingPolicy
 from organism.transition import OrganismTransitionState
 
 from .adapters.articulated_mujoco import (
@@ -163,6 +164,8 @@ class ScalarSensorimotorCycleInputs:
     environment_owner: StaticEnvironmentOwner
     owner_checkpoint_store: OwnerCheckpointStore
     embodiment_geometry_revision: str
+    learning: tuple[EdgeLearningInstruction, ...] = ()
+    experience_policy: ExperienceRecordingPolicy | None = None
 
     def as_cycle_arguments(self) -> dict[str, object]:
         return {
@@ -186,6 +189,8 @@ class ScalarSensorimotorCycleInputs:
             "environment_owner": self.environment_owner,
             "owner_checkpoint_store": self.owner_checkpoint_store,
             "embodiment_geometry_revision": self.embodiment_geometry_revision,
+            "learning": self.learning,
+            "experience_policy": self.experience_policy,
         }
 
 
@@ -431,6 +436,8 @@ def run_scalar_sensorimotor_cycle_and_publish(
     owner_checkpoint_store: OwnerCheckpointStore,
     embodiment_geometry_revision: str,
     publish_static_spatial: bool = True,
+    learning: tuple[EdgeLearningInstruction, ...] = (),
+    experience_policy: ExperienceRecordingPolicy | None = None,
 ) -> CausalCycleResult:
     """Sense, transition, issue an Organism command, solve, adopt, commit, publish.
 
@@ -485,6 +492,8 @@ def run_scalar_sensorimotor_cycle_and_publish(
             transduction=transduction,
             binding=sense_binding,
             kernel_limits=kernel_limits,
+            learning=learning,
+            experience_policy=experience_policy,
         )
         candidate = action_composer.prepare(
             sensed.state,
