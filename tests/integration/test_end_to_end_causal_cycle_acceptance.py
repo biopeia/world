@@ -1192,6 +1192,41 @@ def test_explicit_no_actuation_advances_physics_and_commits_cut(
     assert len(tuple(message for message in messages if message.observation.context_time)) == 3
 
 
+def test_articulated_solver_revalidates_no_actuation_at_physics_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The low-level physical join must not trust a forged projection object."""
+    import world.adapters.articulated_mujoco as articulated_mujoco
+    from organism.actuation import CompetenceDevelopmentEngine
+
+    original_project = articulated_mujoco.project_no_actuation
+    calls = 0
+
+    def completed_without_intents(self, tick):
+        self._last_output_source = "exploration"
+        self._last_output_primitive_id = None
+        return ()
+
+    def reject_at_solver_boundary(binding, morphology, *, issued_at_tick):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("solver-boundary no-actuation revalidation rejected")
+        return original_project(binding, morphology, issued_at_tick=issued_at_tick)
+
+    monkeypatch.setattr(articulated_mujoco, "project_no_actuation", reject_at_solver_boundary)
+    monkeypatch.setattr(CompetenceDevelopmentEngine, "motor_intents", completed_without_intents)
+    with pytest.raises(ValueError, match="solver-boundary no-actuation revalidation"):
+        _run(tmp_path / "solver-boundary-revalidation", stop_after_first=True)
+
+    assert calls == 2
+    manifest = WorldCausalManifestStore(
+        tmp_path / "solver-boundary-revalidation" / "manifest.json"
+    ).read()
+    assert manifest.status is ManifestStatus.RECOVERY_REQUIRED
+    assert manifest.causal_tick == 0
+
+
 @pytest.mark.parametrize("invalid_result", ["missing_outcome", "terminated"])
 def test_invalid_or_terminated_organism_result_preserves_last_cut(
     tmp_path: Path,
