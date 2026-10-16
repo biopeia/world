@@ -44,6 +44,7 @@ def test_m1_v5_commits_compact_checkpoints_equivalent_to_v4(tmp_path: Path) -> N
     cycles = 8
     v4 = _run(tmp_path / "v4", "v4", cycles)
     v5 = _run(tmp_path / "v5", "v5", cycles)
+    assert len(v4) == len(v5) == cycles
     assert {r.schema_version for r in v4} == {ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA}
     assert {r.schema_version for r in v5} == {ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA}
     assert any(r.dependency_sha256 for r in v5)
