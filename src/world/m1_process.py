@@ -111,6 +111,12 @@ def main(argv: list[str] | None = None) -> int:
         "--cycles", type=int,
         help=f"optional finite cycle count (1-{MAX_CYCLES}); omitted means continuous until stopped",
     )
+    parser.add_argument(
+        "--organism-checkpoint",
+        choices=("v4", "v5"),
+        default="v4",
+        help="Organism checkpoint schema version: 'v4' (default) or 'v5' (compact with action-history dependencies)",
+    )
     args = parser.parse_args(argv)
     if args.cycles is not None and not 1 <= args.cycles <= MAX_CYCLES:
         parser.error(f"--cycles must be between 1 and {MAX_CYCLES}")
@@ -153,7 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     runtime = None
     try:
         runtime = construct_fresh_runtime(
-            profile, profile_sha256, state_root, source_revisions, observation_port=0
+            profile, profile_sha256, state_root, source_revisions, observation_port=0,
+            organism_checkpoint=args.organism_checkpoint,
         )
         runtime.observation_bridge.start()
         bridge_host, bridge_port = runtime.observation_bridge.address
