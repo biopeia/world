@@ -591,7 +591,10 @@ class DurableJournalSnapshotStore:
         fsynced) or fully verified by this instance is not rescanned while
         the backing file keeps the same identity and metadata. Anything else
         gets the complete verification. Avoids an O(history) rescan on every
-        commit of a long run.
+        commit of a long run. The witness is file metadata, as on the write
+        path: a change made between verification and the signature capture,
+        or one that reproduces the exact signature, is not detected here
+        (restore always re-verifies fully).
         """
         path = Path(reference.locator)
         if self._previous_prefix_is_cached(reference, path):

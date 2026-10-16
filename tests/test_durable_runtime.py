@@ -3232,7 +3232,7 @@ def test_commit_verifies_journal_prefix_once_not_every_tick(tmp_path, monkeypatc
             return (_checkpoint(path),)
         runtime.tick(f"transition-{tick}", write)
     assert runtime.causal_tick == 30
-    assert len(scans) <= 1                      # no full-prefix rescan per commit
+    assert not scans                            # no full-prefix rescan per commit
 
     # Tampering with the committed prefix is still detected at the next commit.
     journal_path = Path(next(r for r in runtime.manifest.checkpoint_references if r.owner == "world-journal").locator)
@@ -3245,3 +3245,51 @@ def test_commit_verifies_journal_prefix_once_not_every_tick(tmp_path, monkeypatc
         return (_checkpoint(path),)
     with pytest.raises(ManifestError):
         runtime.tick("transition-31", write31)
+
+
+@pytest.mark.parametrize("restore_mtime", [False, True])
+@pytest.mark.parametrize("where", ["prefix", "new_tail"])
+def test_commit_rejects_journal_tampered_between_write_and_commit(tmp_path, restore_mtime, where):
+    """The cached commit-time verification falls back to a full scan when the
+    file signature changed after write(); tampering is refused and the cut
+    does not advance. (Independent review of the journal verification cache.)"""
+    world_id = WorldId("world-journal-tamper-before-commit")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    state = tmp_path / "o0.json"
+    state.write_bytes(b"x0")
+    runtime = _initialize(
+        world_id, "presence-a", manifest_store, journal_store,
+        initial_owner_references=(_checkpoint(state),),
+        registered_owner_ids=(("organism", "organism-identity"),),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts=_contracts(("organism", "organism-identity")),
+    )
+
+    def writer(n):
+        def write(_tick):
+            path = tmp_path / f"o{n}.json"
+            path.write_bytes(f"x{n}".encode())
+            return (_checkpoint(path),)
+        return write
+
+    for n in range(1, 4):
+        runtime.tick(f"t{n}", writer(n))
+    original = journal_store.write
+
+    def tampering_write(*args, **kwargs):
+        reference = original(*args, **kwargs)
+        path = Path(reference.locator)
+        before = path.stat()
+        data = bytearray(path.read_bytes())
+        data[len(data) // 3 if where == "prefix" else len(data) - 20] ^= 1
+        with path.open("r+b") as stream:
+            stream.write(bytes(data))
+        if restore_mtime:
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return reference
+
+    journal_store.write = tampering_write
+    with pytest.raises(ManifestError, match="dependency closure"):
+        runtime.tick("t4", writer(4))
+    assert manifest_store.read().causal_tick == 3
