@@ -24,12 +24,14 @@ from environment import (
 )
 from modality import DimensionlessScalarFieldIdentityV1
 from organism.cognition import (
+    EdgeLearningInstruction,
     OpaqueSenseSignal,
     SenseChannelBinding,
     SenseProvenance,
     advance_organism_from_sense_signals,
 )
 from organism.cognition.limits import KernelLimits
+from organism.memory import ExperienceRecordingPolicy
 from organism.transition import OrganismTransitionState, WorldCausalCorrelation
 
 from .physical_step import PhysicalStepContext
@@ -56,6 +58,8 @@ def advance_organism_from_scalar_field_for_physical_step(
     transduction: DimensionlessScalarFieldIdentityV1,
     binding: SenseChannelBinding,
     kernel_limits: KernelLimits,
+    learning: tuple[EdgeLearningInstruction, ...] = (),
+    experience_policy: ExperienceRecordingPolicy | None = None,
 ) -> ScalarFieldOrganismInput:
     """Compose the approved scalar-field sensor path for one World source cut.
 
@@ -134,6 +138,8 @@ def advance_organism_from_scalar_field_for_physical_step(
         (signal,),
         expected_provenance=provenance,
         kernel_limits=kernel_limits,
+        learning=learning,
+        experience_policy=experience_policy,
     )
     return ScalarFieldOrganismInput(
         receptor_point=receptor_point,
@@ -151,6 +157,8 @@ def advance_organism_for_physical_step(
     *,
     expected_provenance: SenseProvenance,
     kernel_limits: KernelLimits,
+    learning: tuple[EdgeLearningInstruction, ...] = (),
+    experience_policy: ExperienceRecordingPolicy | None = None,
 ) -> OrganismTransitionState:
     """Invoke the Organism-owned transition for a World-issued physical step.
 
@@ -181,6 +189,8 @@ def advance_organism_for_physical_step(
         signals,
         expected_provenance=expected_provenance,
         kernel_limits=kernel_limits,
+        learning=learning,
+        experience_policy=experience_policy,
     )
     if accepted.state.world_correlation != WorldCausalCorrelation(
         context.world_id, context.source_causal_tick
