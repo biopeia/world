@@ -795,6 +795,7 @@ class DurableWorldRuntime:
         cls._require_owner_references(owner_references, "initial causal cut")
         if cls._owner_keys(owner_references) != frozenset(registered_owner_ids):
             raise ManifestError("initial owner checkpoints must exactly match the World-registered owner roster")
+        cls._verify_dependency_declarations(owner_references, {}, contracts)
         genesis_commit_id = f"genesis:{world_id.value}"
         journal.append(
             _causal_cut_record(
@@ -1468,7 +1469,9 @@ class DurableWorldRuntime:
                     raise ManifestError("transition lacks an owner recoverability contract for every participant")
                 if not self._validate_owner_checkpoints(owner_references, proposed_contracts):
                     raise ManifestError("owner checkpoint validation failed for one or more checkpoint references")
-                self._verify_dependency_declarations(owner_references, current, proposed_contracts)
+                self._verify_dependency_declarations(
+                    owner_references, self._dependency_heads(current), proposed_contracts
+                )
                 owner_records = tuple(
                     write_owner_records(proposed_tick, owner_references)
                     if write_owner_records is not None
@@ -1666,9 +1669,13 @@ class DurableWorldRuntime:
         )
 
     @staticmethod
+    def _dependency_heads(manifest: WorldCausalManifest) -> dict[tuple[str, str], str | None]:
+        return {(ref.owner, ref.owner_identity): ref.dependency_sha256 for ref in manifest.checkpoint_references}
+
+    @staticmethod
     def _verify_dependency_declarations(
         references: tuple[CheckpointReference, ...],
-        base: WorldCausalManifest,
+        base_heads: Mapping[tuple[str, str], str | None],
         contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
     ) -> None:
         """Commit-time dependency invariants (organism#183, world#90).
@@ -1679,13 +1686,10 @@ class DurableWorldRuntime:
           attach one.
         * A dependency must extend the base cut: its parent equals the
           dependency recorded for the same owner in the committed cut being
-          extended. The single-writer precondition fixes that base.
+          extended (genesis: no parent). The single-writer precondition fixes
+          that base.
         World compares digests only; dependency bytes are never interpreted.
         """
-        base_heads = {
-            (ref.owner, ref.owner_identity): ref.dependency_sha256
-            for ref in base.checkpoint_references
-        }
         for reference in references:
             if reference.owner == _JOURNAL_OWNER:
                 continue

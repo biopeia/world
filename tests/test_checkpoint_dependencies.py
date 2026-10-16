@@ -262,3 +262,40 @@ def test_dependency_digest_is_location_independent(tmp_path):
     a, b = refs
     assert (a.dependency_sha256, a.dependency_parent, a.sha256) == (b.dependency_sha256, b.dependency_parent, b.sha256)
     assert a.locator != b.locator      # the existing locator field is unchanged (world#90)
+
+
+# ------------------------------------------------------------------ genesis
+def _genesis(tmp_path, payload):
+    store = FileOwnerCheckpointStore(tmp_path / "owners")
+    [ref] = store.write_genesis((payload,))
+    return DurableWorldRuntime.initialize(
+        WorldGenesisSpec(
+            world_id=WORLD, initial_presence_ids=("presence-a",), registered_owner_ids=(OWNER,),
+            initial_owner_references=(ref,), owner_checkpoint_contracts={OWNER: DeclaringContract()},
+            presence_owner_links=(PresenceOwnerLink(PresenceId("presence-a"), *OWNER),),
+        ),
+        "presence-a", WorldCausalManifestStore(tmp_path / "manifest.json"),
+        DurableJournalSnapshotStore(tmp_path / "journal", WORLD), owner_checkpoint_verifier=verifier,
+    )
+
+
+def test_genesis_dependency_is_verified_like_any_commit(tmp_path):
+    blob = segment(None, 1)
+    head = hashlib.sha256(blob).hexdigest()
+    with pytest.raises(ManifestError, match="omitted or inconsistent"):      # bytes need head, none attached
+        _genesis(tmp_path / "omitted", OwnerCheckpointPayload(*OWNER, "v5", owner_bytes(0, head)))
+    other = segment(None, 2)
+    other_head = hashlib.sha256(other).hexdigest()
+    with pytest.raises(ManifestError, match="does not extend"):              # genesis cannot have a parent
+        _genesis(tmp_path / "parented", _with_parent(head, blob, other_head))
+    runtime = _genesis(tmp_path / "ok", OwnerCheckpointPayload(
+        *OWNER, "v5", owner_bytes(0, head), OwnerCheckpointDependency(head, None, blob)))
+    ref = next(r for r in runtime.manifest.checkpoint_references if r.owner == OWNER[0])
+    assert ref.dependency_sha256 == head and ref.dependency_parent is None
+
+
+def _with_parent(head, blob, parent):
+    dep = OwnerCheckpointDependency.__new__(OwnerCheckpointDependency)
+    for k, v in (("head", head), ("parent", parent), ("new_blob", blob)):
+        object.__setattr__(dep, k, v)
+    return OwnerCheckpointPayload(*OWNER, "v5", owner_bytes(0, head), dep)
