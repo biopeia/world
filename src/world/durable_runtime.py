@@ -603,6 +603,26 @@ class DurableJournalSnapshotStore:
         """Verify the complete committed prefix, including its hash chain."""
         return DurableJournalSnapshotStore._verify_prefix(reference)
 
+    def verify_cached(self, reference: CheckpointReference) -> bool:
+        """Verify a prefix this store instance wrote or already verified.
+
+        Same invariant as the sequential write path: a prefix written (and
+        fsynced) or fully verified by this instance is not rescanned while
+        the backing file keeps the same identity and metadata. Anything else
+        gets the complete verification. Avoids an O(history) rescan on every
+        commit of a long run. The witness is file metadata, as on the write
+        path: a change made between verification and the signature capture,
+        or one that reproduces the exact signature, is not detected here
+        (restore always re-verifies fully).
+        """
+        path = Path(reference.locator)
+        if self._previous_prefix_is_cached(reference, path):
+            return True
+        if not self._verify_prefix(reference):
+            return False
+        self._cache_verified_prefix(reference, path)
+        return True
+
 
 OwnerCheckpointWriter = Callable[[int], Iterable[CheckpointReference]]
 OwnerCheckpointVerifier = Callable[[tuple[CheckpointReference, ...]], bool]
@@ -1615,6 +1635,7 @@ class DurableWorldRuntime:
                         refs,
                         self._owner_checkpoint_verifier,
                         proposed_contracts,
+                        journal_verifier=self._journal_store.verify_cached,
                     ),
                 )
                 self._journal = candidate_journal.commit()
@@ -1656,10 +1677,12 @@ class DurableWorldRuntime:
         references: tuple[CheckpointReference, ...],
         owner_checkpoint_verifier: OwnerCheckpointVerifier,
         owner_checkpoint_contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
+        *,
+        journal_verifier: Callable[[CheckpointReference], bool] = DurableJournalSnapshotStore.verify,
     ) -> bool:
         journal_refs = tuple(ref for ref in references if ref.owner == _JOURNAL_OWNER)
         owner_refs = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
-        if len(journal_refs) != 1 or not DurableJournalSnapshotStore.verify(journal_refs[0]):
+        if len(journal_refs) != 1 or not journal_verifier(journal_refs[0]):
             return False
         for ref in owner_refs:
             declared = getattr(owner_checkpoint_contracts.get((ref.owner, ref.owner_identity)), "declared_dependency", None)
