@@ -1240,6 +1240,7 @@ def test_no_actuation_rejects_infeasible_zero_torque_without_committing(
         )
 
     manifest = WorldCausalManifestStore(directory / "manifest.json").read()
+    assert manifest.status is ManifestStatus.RECOVERY_REQUIRED
     assert manifest.causal_tick == 0
 
 
