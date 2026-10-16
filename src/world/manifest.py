@@ -54,6 +54,11 @@ class CheckpointReference:
     schema_version: str
     locator: str
     sha256: str
+    # Optional immutable dependency declared by the owner (organism#183,
+    # world#90). Content references only: no locator; resolved through the
+    # content-addressed store layout. Absent for existing (v4) references.
+    dependency_sha256: str | None = None
+    dependency_parent: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("owner", "owner_identity", "checkpoint_id", "schema_version", "locator"):
@@ -62,6 +67,12 @@ class CheckpointReference:
                 raise ValueError(f"{name} must not be empty")
         if not _SHA256.fullmatch(self.sha256):
             raise ValueError("checkpoint sha256 must be 64 lowercase hexadecimal characters")
+        for name in ("dependency_sha256", "dependency_parent"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not _SHA256.fullmatch(value)):
+                raise ValueError(f"{name} must be 64 lowercase hexadecimal characters or None")
+        if self.dependency_sha256 is None and self.dependency_parent is not None:
+            raise ValueError("a dependency parent requires a dependency")
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,23 +544,34 @@ def _owner_keys(references: tuple[CheckpointReference, ...]) -> frozenset[tuple[
     )
 
 
+REFERENCE_KEYS = frozenset({"owner", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"})
+DEPENDENCY_KEYS = frozenset({"dependency_sha256", "dependency_parent"})
+
+
+def reference_to_data(ref: CheckpointReference) -> dict:
+    """Canonical reference data; dependency keys only when a dependency exists,
+    so references without one serialize exactly as before."""
+    data = {
+        "owner": ref.owner,
+        "owner_identity": ref.owner_identity,
+        "checkpoint_id": ref.checkpoint_id,
+        "schema_version": ref.schema_version,
+        "locator": ref.locator,
+        "sha256": ref.sha256,
+    }
+    if ref.dependency_sha256 is not None:
+        data["dependency_sha256"] = ref.dependency_sha256
+        data["dependency_parent"] = ref.dependency_parent
+    return data
+
+
 def _manifest_to_data(manifest: WorldCausalManifest) -> dict:
     return {
         "schema_version": manifest.schema_version,
         "world_id": manifest.world_id,
         "causal_tick": manifest.causal_tick,
         "presence_ids": list(manifest.presence_ids),
-        "checkpoint_references": [
-            {
-                "owner": ref.owner,
-                "owner_identity": ref.owner_identity,
-                "checkpoint_id": ref.checkpoint_id,
-                "schema_version": ref.schema_version,
-                "locator": ref.locator,
-                "sha256": ref.sha256,
-            }
-            for ref in manifest.checkpoint_references
-        ],
+        "checkpoint_references": [reference_to_data(ref) for ref in manifest.checkpoint_references],
         "journal_last_sequence": manifest.journal_last_sequence,
         "journal_prefix_sha256": manifest.journal_prefix_sha256,
         "commit_id": manifest.commit_id,
@@ -580,10 +602,11 @@ def _manifest_from_data(data: dict) -> WorldCausalManifest:
     if not isinstance(references, list):
         raise ValueError("checkpoint_references must be a list")
     refs = []
-    ref_keys = {"owner", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"}
     for ref in references:
-        if not isinstance(ref, dict) or set(ref) != ref_keys:
+        if not isinstance(ref, dict) or set(ref) not in (REFERENCE_KEYS, REFERENCE_KEYS | DEPENDENCY_KEYS):
             raise ValueError("checkpoint reference fields do not match schema")
+        if "dependency_sha256" in ref and ref["dependency_sha256"] is None:
+            raise ValueError("checkpoint reference has an empty dependency")
         refs.append(CheckpointReference(**ref))
     return WorldCausalManifest(
         world_id=data["world_id"],
