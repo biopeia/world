@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "organism"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/organism.git?rev=main#cedce522696f7d5a0ba458018eebd61a18972a4c" }
+source = { git = "https://github.com/biopeia/organism.git?rev=main#0ce7a031b6e9ee79ecbf7905c69452a5567f2dd2" }
 
 [[package]]
 name = "packaging"
