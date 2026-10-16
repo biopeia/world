@@ -501,14 +501,30 @@ def execute_articulated_mujoco_step(
         # Deterministic bounded grid is a tested-candidate search, not a proof
         # that no feasible torque exists between samples. Preserve the requested
         # value exactly when it is already compliant.
-        applied_torque, candidate_state = _select_compliant_torque(
-            requested_torque,
-            effort_cap,
-            joint_range.lower_rad,
-            joint_range.upper_rad,
-            velocity_cap,
-            trial,
-        )
+        if isinstance(torque, NoActuationProjection):
+            # No-actuation is not permission for the solver to invent a force
+            # that makes the candidate compliant. Integrate exactly the
+            # zero-torque request and reject it below if owner limits fail.
+            applied_torque = 0.0
+            candidate_state = trial(applied_torque)
+            if candidate_state is None:
+                raise ValueError("no-actuation zero-torque trial produced invalid MuJoCo state")
+            if not (
+                joint_range.lower_rad <= candidate_state[0] <= joint_range.upper_rad
+                and abs(candidate_state[1]) <= velocity_cap
+            ):
+                raise ValueError(
+                    "no-actuation zero-torque candidate violates Embodiment joint limits"
+                )
+        else:
+            applied_torque, candidate_state = _select_compliant_torque(
+                requested_torque,
+                effort_cap,
+                joint_range.lower_rad,
+                joint_range.upper_rad,
+                velocity_cap,
+                trial,
+            )
         data = _mujoco_trial(
             mujoco, model, source_qpos, source_qvel, source_qfrc, dof, applied_torque
         )

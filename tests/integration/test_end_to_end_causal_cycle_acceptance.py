@@ -191,6 +191,7 @@ def _run(
     kernel_limits: KernelLimits = KernelLimits(),
     actuator_surface_material: str = SURFACE_FINGERPRINT,
     initial_joint_velocity_rad_per_s: float = 0.0,
+    velocity_regulation_policy: str = "none",
     after_first_commit: Callable[
         [DurableWorldRuntime, CausalCycleResult, ObservationPlane], None
     ]
@@ -419,6 +420,7 @@ def _run(
         tolerance=1e-10, solref=(0.02, 1.0),
         solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
         contact_policy="max-sliding-body-torsion-rolling/no-self-collision-v1",
+        velocity_regulation_policy=velocity_regulation_policy,
     )
 
     plane = ObservationPlane()
@@ -1169,6 +1171,7 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
 def test_explicit_no_actuation_advances_physics_and_commits_cut(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import world.adapters.articulated_mujoco as articulated_mujoco
     from organism.actuation import CompetenceDevelopmentEngine, ExplorationOutcome
 
     def completed_without_intents(self, tick):
@@ -1176,11 +1179,16 @@ def test_explicit_no_actuation_advances_physics_and_commits_cut(
         self._last_output_primitive_id = None
         return ()
 
+    def reject_torque_search(*args, **kwargs):
+        raise AssertionError("no-actuation must not invoke torque search")
+
     monkeypatch.setattr(CompetenceDevelopmentEngine, "motor_intents", completed_without_intents)
+    monkeypatch.setattr(articulated_mujoco, "_select_compliant_torque", reject_torque_search)
     result, messages, _, _ = _run(
         tmp_path / "explicit-no-actuation",
         stop_after_first=True,
         initial_joint_velocity_rad_per_s=0.25,
+        velocity_regulation_policy="m1-fixed-single-hinge-grid-v2",
     )
 
     assert result.action_candidate.outcome is ExplorationOutcome.NO_ACTUATION
@@ -1188,8 +1196,52 @@ def test_explicit_no_actuation_advances_physics_and_commits_cut(
     assert result.action_candidate.motor_command is None
     assert result.committed_cut.causal_tick == result.physical_outcome.record.causal_tick == 1
     assert result.physical_outcome.body_state.joints[0].position_rad != 0.0
+    assert result.physical_outcome.solver_evidence["requested_torque_nm"] == 0.0
+    assert result.physical_outcome.solver_evidence["applied_torque_nm"] == 0.0
     assert len(result.observation_publication.delivery_sequences) == 3
     assert len(tuple(message for message in messages if message.observation.context_time)) == 3
+
+
+def test_no_actuation_rejects_infeasible_zero_torque_without_committing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    import numpy as np
+    import world.adapters.articulated_mujoco as articulated_mujoco
+    from organism.actuation import CompetenceDevelopmentEngine
+
+    directory = tmp_path / "no-actuation-infeasible"
+
+    def completed_without_intents(self, tick):
+        self._last_output_source = "exploration"
+        self._last_output_primitive_id = None
+        return ()
+
+    def out_of_range_zero_torque_trial(mujoco, model, qpos, qvel, qfrc, dof, applied):
+        assert applied == 0.0
+        return SimpleNamespace(
+            qpos=np.array((1.001,)), qvel=np.array((0.25,)), warning=()
+        )
+
+    def reject_torque_search(*args, **kwargs):
+        raise AssertionError("no-actuation must fail closed, not search for another torque")
+
+    monkeypatch.setattr(CompetenceDevelopmentEngine, "motor_intents", completed_without_intents)
+    monkeypatch.setattr(articulated_mujoco, "_mujoco_trial", out_of_range_zero_torque_trial)
+    monkeypatch.setattr(articulated_mujoco, "_select_compliant_torque", reject_torque_search)
+
+    with pytest.raises(ValueError, match="no-actuation zero-torque candidate violates"):
+        _run(
+            directory,
+            stop_after_first=True,
+            initial_joint_velocity_rad_per_s=0.25,
+            velocity_regulation_policy="m1-fixed-single-hinge-grid-v2",
+        )
+
+    manifest = WorldCausalManifestStore(directory / "manifest.json").read()
+    assert manifest.status is ManifestStatus.RECOVERY_REQUIRED
+    assert manifest.causal_tick == 0
 
 
 def test_articulated_solver_revalidates_no_actuation_at_physics_boundary(
