@@ -190,6 +190,7 @@ def _run(
     environment_revision_override: str | None = None,
     kernel_limits: KernelLimits = KernelLimits(),
     actuator_surface_material: str = SURFACE_FINGERPRINT,
+    initial_joint_velocity_rad_per_s: float = 0.0,
     after_first_commit: Callable[
         [DurableWorldRuntime, CausalCycleResult, ObservationPlane], None
     ]
@@ -225,7 +226,7 @@ def _run(
     body = ArticulatedEmbodimentPhysicalState(
         root=root,
         morphology=morphology,
-        joints=(JointKinematicState("joint.hinge", 0.0, 0.0),),
+        joints=(JointKinematicState("joint.hinge", 0.0, initial_joint_velocity_rad_per_s),),
     )
     env_owner = StaticEnvironmentOwner(
         StaticPhysicalScene(
@@ -1163,6 +1164,63 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
     assert first_resumed.physical_outcome.body_state.joints == pytest.approx(
         second_resumed.physical_outcome.body_state.joints
     )
+
+
+def test_explicit_no_actuation_advances_physics_and_commits_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from organism.actuation import CompetenceDevelopmentEngine, ExplorationOutcome
+
+    def completed_without_intents(self, tick):
+        self._last_output_source = "exploration"
+        self._last_output_primitive_id = None
+        return ()
+
+    monkeypatch.setattr(CompetenceDevelopmentEngine, "motor_intents", completed_without_intents)
+    result, messages, _, _ = _run(
+        tmp_path / "explicit-no-actuation",
+        stop_after_first=True,
+        initial_joint_velocity_rad_per_s=0.25,
+    )
+
+    assert result.action_candidate.outcome is ExplorationOutcome.NO_ACTUATION
+    assert result.action_candidate.proposal is None
+    assert result.action_candidate.motor_command is None
+    assert result.committed_cut.causal_tick == result.physical_outcome.record.causal_tick == 1
+    assert result.physical_outcome.body_state.joints[0].position_rad != 0.0
+    assert len(result.observation_publication.delivery_sequences) == 3
+    assert len(tuple(message for message in messages if message.observation.context_time)) == 3
+
+
+@pytest.mark.parametrize("invalid_result", ["missing_outcome", "terminated"])
+def test_invalid_or_terminated_organism_result_preserves_last_cut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_result: str,
+) -> None:
+    from organism.actuation import OrganismExplorationComposer
+    from organism.transition import OrganismLifecycle
+
+    original_prepare = OrganismExplorationComposer.prepare
+
+    def prepare_invalid(self, transition, **kwargs):
+        if invalid_result == "terminated":
+            transition = replace(transition, lifecycle=OrganismLifecycle.TERMINATED)
+            return original_prepare(self, transition, **kwargs)
+        candidate = original_prepare(self, transition, **kwargs)
+        # Exercise World as an adversarial structural consumer: a malformed
+        # candidate must not be reinterpreted as a valid no-actuation result.
+        object.__setattr__(candidate, "outcome", None)
+        return candidate
+
+    monkeypatch.setattr(OrganismExplorationComposer, "prepare", prepare_invalid)
+    directory = tmp_path / invalid_result
+    with pytest.raises((TypeError, ValueError)):
+        _run(directory, stop_after_first=True)
+
+    manifest = WorldCausalManifestStore(directory / "manifest.json").read()
+    assert manifest.status is ManifestStatus.COMMITTED
+    assert manifest.causal_tick == 0
 
 
 def test_world_owned_session_runs_three_production_cycles_and_publishes_each(
