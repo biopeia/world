@@ -297,6 +297,7 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
             embodiment_geometry_revision="geo.r1",
             learning=learning,
             experience_policy=ExperienceRecordingPolicy(record_reception=True, max_records=64),
+            enable_somatic_feedback=with_plasticity,
         )
         return world, cycle_inputs, manifest_store, journal_store, surface, actuator_context
 
@@ -348,6 +349,16 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
     assert len(chk_p.experience_records) == 5
     assert chk_p.experience_records[0].evidence_refs == (f"sense:{acc.WORLD_ID}:0",)
 
+    # Verify somatic feedback was received by CompetenceDevelopmentEngine from real MuJoCo physics
+    frames_p = inputs_p.action_composer.engine.checkpoint()["frame_history"]
+    assert len(frames_p) == 5
+    assert frames_p[0]["tick"] == 1
+    assert "joint.hinge:pos" in frames_p[0]["body_state"]
+    assert "joint.hinge:vel" in frames_p[0]["body_state"]
+    # Control organism had somatic feedback disabled (control invariancy)
+    frames_c = inputs_c.action_composer.engine.checkpoint()["frame_history"]
+    assert len(frames_c) == 0
+
     # 3. Stop, Interrupt, and Cold-Restore from Committed Cut
     last_cut = res_p.last_committed_cut
     assert last_cut is not None
@@ -392,9 +403,16 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
     )
     restored_w = next(e.weight for e in restored_chk.graph.edges if e.source_id == "opaque.scalar.signal")
 
-    # Invariant: Learned weight survives cold restoration bit-identically
+    # Invariant: Learned weight and ledger survive cold restoration bit-identically
     assert restored_w == w_plastic
     assert len(restored_chk.experience_records) == 5
+
+    # Invariant: Competence development frames survive cold restoration bit-identically
+    # Note: Organism checkpoint is written during cycle 5's physical step, capturing somatic
+    # feedback accumulated through cycle 4. Tick 5's feedback is post-commit.
+    restored_frames = restored.organism.action_composer.engine.checkpoint()["frame_history"]
+    assert len(restored_frames) == 4
+    assert restored_frames[0]["body_state"] == frames_p[0]["body_state"]
 
     # 4. Continuation from Restored State in Real Runtime (Cycle 6)
     resumed_inputs = ScalarSensorimotorCycleInputs(
@@ -420,6 +438,7 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
         embodiment_geometry_revision="geo.r1",
         learning=inputs_p.learning,
         experience_policy=inputs_p.experience_policy,
+        enable_somatic_feedback=True,
     )
 
     res_resumed = run_scalar_sensorimotor_session(
@@ -433,6 +452,11 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
     )
     assert res_resumed.completed_cycle_count == 1
     assert res_resumed.last_committed_cut.causal_tick == 6
+
+    # Verify frame 6 was accumulated continuously upon post-commit adoption
+    resumed_frames = restored.organism.action_composer.engine.checkpoint()["frame_history"]
+    assert len(resumed_frames) == 5
+    assert resumed_frames[-1]["tick"] == 6
 
     # 5. Demonstrable functional difference surviving cold restoration
     # Under a probe input x = 1.0 with activation threshold theta = 0.20:
