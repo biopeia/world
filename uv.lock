@@ -89,7 +89,7 @@ wheels = [
 [[package]]
 name = "modality"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/modality.git?rev=main#62af4aba07146d5dfdc978af07bb72111112d873" }
+source = { git = "https://github.com/biopeia/modality.git?rev=main#9b72e16f6bfea4b24191015177364d560f7f6715" }
 
 [[package]]
 name = "mujoco"
@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "organism"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/organism.git?rev=main#637bc21a7e2a1aa9e0870f55f134e839657687f4" }
+source = { git = "https://github.com/biopeia/organism.git?rev=main#779c097d21236cba0409f5fc52fbcd71bf2049d9" }
 
 [[package]]
 name = "packaging"

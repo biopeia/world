@@ -7,12 +7,19 @@ exact frame losses, counters, and continuity differentials upon crash recovery.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from pathlib import Path
 from types import MappingProxyType
 from uuid import UUID
 
 import pytest
+
+from modality.kinematics import (
+    JointKinematicInput,
+    KinematicSomaticTransductionV1,
+    KinematicTransductionError,
+)
 
 from world.manifest import CheckpointReference, WorldCausalManifestStore
 from world.durable_runtime import (
@@ -70,7 +77,14 @@ from organism.cognition.limits import KernelLimits
 from organism.memory import ExperienceRecordingPolicy
 from organism.cognition.types import EdgeKind, NodeKind
 from organism.cognition.graph import CognitiveGraph, PlasticNode, PlasticEdge
-import tests.integration.test_end_to_end_causal_cycle_acceptance as acc
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location(
+    "m3_acceptance_harness",
+    Path(__file__).with_name("test_end_to_end_causal_cycle_acceptance.py"),
+)
+acc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(acc)
 
 
 def _build_test_env(runtime_dir: Path, *, with_plasticity: bool = True):
@@ -300,12 +314,23 @@ def _build_test_env(runtime_dir: Path, *, with_plasticity: bool = True):
         learning=learning,
         experience_policy=ExperienceRecordingPolicy(record_reception=True, max_records=64),
         enable_somatic_feedback=with_plasticity,
+        somatic_transduction=KinematicSomaticTransductionV1() if with_plasticity else None,
     )
     return world, cycle_inputs, manifest_store, journal_store, surface, actuator_context, morphology, contracts
 
 
-def test_reproduce_interruption_atomicity_and_loss(tmp_path: Path):
-    """Reproduces an interruption after commit N and before tick N+1."""
+def test_longitudinal_atomicity_and_interruption_zero_loss(tmp_path: Path):
+    """Verifies that an interruption after commit N preserves somatic feedback across cold restore.
+
+    Run A: Uninterrupted 3 cycles.
+    Run B: 2 cycles, process termination after commit 2, cold restore from cut 2, run cycle 3.
+
+    Acceptance criteria:
+    - Restored cut 2 engine contains frames [1, 2] (zero frame loss at commit boundary).
+    - Resumed run reaches cut 3 with frame history [1, 2, 3].
+    - Bit-exact match of frame_history, _horizon_counts, and _horizon_stats between Run A and Run B.
+    - Zero frame loss, zero duplications, without synthetic or manual reconciliation.
+    """
     # Run A: Uninterrupted 3 cycles
     dir_a = tmp_path / "run_uninterrupted"
     world_a, inputs_a, _, _, _, _, _, _ = _build_test_env(dir_a, with_plasticity=True)
@@ -319,7 +344,8 @@ def test_reproduce_interruption_atomicity_and_loss(tmp_path: Path):
         retain_cycle_results=True,
     )
     assert res_a.completed_cycle_count == 3
-    frames_a = inputs_a.action_composer.engine.checkpoint()["frame_history"]
+    engine_chk_a = inputs_a.action_composer.engine.checkpoint()
+    frames_a = engine_chk_a["frame_history"]
     assert len(frames_a) == 3
     ticks_a = [f["tick"] for f in frames_a]
     assert ticks_a == [1, 2, 3]
@@ -346,7 +372,7 @@ def test_reproduce_interruption_atomicity_and_loss(tmp_path: Path):
     assert [f["tick"] for f in volatile_frames] == [1, 2]
 
     # SIMULATE CRASH:
-    # Now restore from the last confirmed cut (Cut 2) in a fresh runtime
+    # Now restore from the confirmed cut 2 in a fresh runtime
     restored_b = restore_scalar_sensorimotor_runtime(
         WorldId(acc.WORLD_ID),
         acc.PRESENCE_ID,
@@ -369,13 +395,11 @@ def test_reproduce_interruption_atomicity_and_loss(tmp_path: Path):
     assert restored_b.world.causal_tick == 2
 
     # AUDIT RESTORED STATE (Cut 2):
+    # Tick 2 somatic observation was atomically staged into the candidate prior to commit 2.
     restored_engine_chk = restored_b.organism.action_composer.engine.checkpoint()
     restored_frames = restored_engine_chk["frame_history"]
-
-    # CRITICAL OBSERVATION 1:
-    # Does the checkpoint committed for Cut 2 protect the post-commit somatic observation of tick 2?
-    print(f"\n[ATOMICITY AUDIT] Uninterrupted at tick 2: {len(volatile_frames)} frames -> {[f['tick'] for f in volatile_frames]}")
-    print(f"[ATOMICITY AUDIT] Restored from Cut 2: {len(restored_frames)} frames -> {[f['tick'] for f in restored_frames]}")
+    assert len(restored_frames) == 2
+    assert [f["tick"] for f in restored_frames] == [1, 2]
 
     # Now continue execution: run cycle 3 on the restored runtime
     inputs_b_resumed = ScalarSensorimotorCycleInputs(
@@ -402,6 +426,7 @@ def test_reproduce_interruption_atomicity_and_loss(tmp_path: Path):
         learning=inputs_b.learning,
         experience_policy=inputs_b.experience_policy,
         enable_somatic_feedback=True,
+        somatic_transduction=KinematicSomaticTransductionV1(),
     )
 
     res_b_part2 = run_scalar_sensorimotor_session(
@@ -416,142 +441,65 @@ def test_reproduce_interruption_atomicity_and_loss(tmp_path: Path):
     assert res_b_part2.completed_cycle_count == 1
     assert res_b_part2.last_committed_cut.causal_tick == 3
 
-    resumed_frames = restored_b.organism.action_composer.engine.checkpoint()["frame_history"]
+    resumed_engine_chk = restored_b.organism.action_composer.engine.checkpoint()
+    resumed_frames = resumed_engine_chk["frame_history"]
     resumed_ticks = [f["tick"] for f in resumed_frames]
-    print(f"[ATOMICITY AUDIT] Continued to tick 3: {len(resumed_frames)} frames -> {resumed_ticks}")
-    print(f"[ATOMICITY AUDIT] Expected uninterrupted: {len(frames_a)} frames -> {ticks_a}")
 
-    # Empirical finding:
-    # Tick 2 is PERMANENTLY DROPPED from the frame history of the restored organism!
-    assert resumed_ticks == [1, 3], f"Expected tick 2 to be lost, got {resumed_ticks}"
-    assert len(resumed_frames) == 2
-    assert len(frames_a) == 3
+    # Exact zero-loss equivalence with uninterrupted execution:
+    assert resumed_ticks == [1, 2, 3]
+    assert len(resumed_frames) == len(frames_a)
+    assert resumed_frames == frames_a
+    assert resumed_engine_chk["horizon_counts"] == engine_chk_a["horizon_counts"]
+    assert resumed_engine_chk["horizon_stats"] == engine_chk_a["horizon_stats"]
 
 
-def test_reconciliation_protocol_demonstration(tmp_path: Path):
-    """Demonstrates that post-restore reconciliation provides exact longitudinal atomicity."""
-    # Run A: Uninterrupted 3 cycles baseline
-    dir_a = tmp_path / "baseline_uninterrupted"
-    world_a, inputs_a, _, _, _, _, _, _ = _build_test_env(dir_a, with_plasticity=True)
-    run_scalar_sensorimotor_session(
-        world_a,
-        acc.ObservationPlane(),
-        run_id="session-a",
-        source_revisions={"world": "commit-a"},
-        cycle_inputs=inputs_a,
-        max_cycles=3,
-        retain_cycle_results=True,
-    )
-    frames_a = inputs_a.action_composer.engine.checkpoint()["frame_history"]
-    ticks_a = [f["tick"] for f in frames_a]
-    assert ticks_a == [1, 2, 3]
-
-    # Run C: Interrupted after cycle 2, then restored with reconciliation
-    dir_c = tmp_path / "run_reconciled"
-    world_c, inputs_c, manifest_c, journal_c, surface, act_ctx, morphology, contracts = _build_test_env(
-        dir_c, with_plasticity=True
-    )
-    res_c_part1 = run_scalar_sensorimotor_session(
-        world_c,
-        acc.ObservationPlane(),
-        run_id="session-c",
-        source_revisions={"world": "commit-c"},
-        cycle_inputs=inputs_c,
-        max_cycles=2,
-        retain_cycle_results=True,
-    )
-    assert res_c_part1.completed_cycle_count == 2
-    last_cut = res_c_part1.last_committed_cut
-    assert last_cut.causal_tick == 2
-
-    # Restore from Cut 2
-    restored_c = restore_scalar_sensorimotor_runtime(
-        WorldId(acc.WORLD_ID),
-        acc.PRESENCE_ID,
-        manifest_c,
-        journal_c,
-        owner_checkpoint_verifier=lambda refs: True,
-        owner_checkpoint_contracts=contracts,
-        active_morphology=morphology,
-        expected_organism_id=str(acc.ORGANISM_ID),
-        expected_physical_step_id="session-c:physical-step:2",
-        expected_environment_owner_id=acc.ENVIRONMENT_OWNER_ID,
-        expected_environment_id=acc.ENVIRONMENT_ID,
-        expected_environment_revision=acc.ENVIRONMENT_REVISION,
-        expected_field_id=acc.RESOURCE_ID,
-        expected_field_revision=acc.FIELD_REVISION,
-        kernel_limits=KernelLimits(),
-        actuator_context=act_ctx,
-        actuator_surface=surface,
-    )
-
-    # RECONCILIATION PROTOCOL:
-    # World inspects if the restored organism engine is missing the somatic observation of the committed cut.
-    engine = restored_c.organism.action_composer.engine
-    engine_frames = engine.checkpoint()["frame_history"]
-    latest_engine_tick = engine_frames[-1]["tick"] if engine_frames else 0
-
-    if latest_engine_tick < last_cut.causal_tick:
-        # Reconstruct somatic observation from the committed, restored physical body of the cut
-        reconciled_somatic = {
-            f"{j.joint_id}:pos": float(j.position_rad)
-            for j in restored_c.articulated_body.joints
-        } | {
-            f"{j.joint_id}:vel": float(j.velocity_rad_per_s)
-            for j in restored_c.articulated_body.joints
-        }
-        # In a real motor step, motor vector comes from the candidate command or committed transition
-        engine.observe(
-            tick=last_cut.causal_tick,
-            body_state=reconciled_somatic,
-            motor_vector={"actuator.hinge.negative": 0.3031768, "actuator.hinge.positive": 0.1687032},
-            discovery_eligible=True,
+def test_reject_somatic_feedback_without_transducer(tmp_path: Path):
+    """World rejects causal cycles with enable_somatic_feedback=True if somatic_transduction is missing."""
+    dir_test = tmp_path / "test_no_transducer"
+    world, inputs, _, _, _, _, _, _ = _build_test_env(dir_test, with_plasticity=False)
+    inputs_invalid = replace(inputs, enable_somatic_feedback=True, somatic_transduction=None)
+    with pytest.raises(ValueError, match="somatic_transduction is required when enable_somatic_feedback is True"):
+        run_scalar_sensorimotor_cycle_and_publish(
+            world,
+            acc.ObservationPlane(),
+            commit_id="commit-fail-1",
+            physical_step_id="step-fail-1",
+            **inputs_invalid.as_cycle_arguments(),
         )
 
-    # Now execute cycle 3
-    inputs_c_resumed = ScalarSensorimotorCycleInputs(
-        environment_revision=acc.ENVIRONMENT_REVISION,
-        solver_configuration=inputs_c.solver_configuration,
-        current_organism=restored_c.organism.transition_state,
-        action_composer=restored_c.organism.action_composer,
-        receptor=inputs_c.receptor,
-        embodiment_state=restored_c.articulated_body.root,
-        environment_field=restored_c.environment_field,
-        sampling_frame=acc._frame(),
-        transduction=acc.DimensionlessScalarFieldIdentityV1(),
-        sense_binding=inputs_c.sense_binding,
-        kernel_limits=KernelLimits(),
-        actuator_context=act_ctx,
-        actuator_surface=surface,
-        articulated_body=restored_c.articulated_body,
-        active_morphology=morphology,
-        differential_binding=inputs_c.differential_binding,
-        torque_binding=inputs_c.torque_binding,
-        environment_owner=restored_c.environment_owner,
-        owner_checkpoint_store=FileOwnerCheckpointStore(dir_c / "owners" / "committed"),
-        embodiment_geometry_revision="geo.r1",
-        learning=inputs_c.learning,
-        experience_policy=inputs_c.experience_policy,
+
+def test_reject_invalid_somatic_transducer(tmp_path: Path):
+    """World rejects causal cycles when somatic_transduction lacks a callable transduce method."""
+    dir_test = tmp_path / "test_invalid_transducer"
+    world, inputs, _, _, _, _, _, _ = _build_test_env(dir_test, with_plasticity=False)
+    inputs_invalid = replace(
+        inputs,
         enable_somatic_feedback=True,
+        somatic_transduction="not-a-transducer",
     )
+    with pytest.raises(TypeError, match="somatic_transduction must provide a callable 'transduce' method"):
+        run_scalar_sensorimotor_cycle_and_publish(
+            world,
+            acc.ObservationPlane(),
+            commit_id="commit-fail-2",
+            physical_step_id="step-fail-2",
+            **inputs_invalid.as_cycle_arguments(),
+        )
 
-    res_c_part2 = run_scalar_sensorimotor_session(
-        restored_c.world,
-        acc.ObservationPlane(),
-        run_id="session-c-resumed",
-        source_revisions={"world": "commit-c"},
-        cycle_inputs=inputs_c_resumed,
-        max_cycles=1,
-        retain_cycle_results=True,
-    )
-    assert res_c_part2.completed_cycle_count == 1
-    assert res_c_part2.last_committed_cut.causal_tick == 3
 
-    reconciled_frames = restored_c.organism.action_composer.engine.checkpoint()["frame_history"]
-    reconciled_ticks = [f["tick"] for f in reconciled_frames]
-    print(f"\n[RECONCILIATION AUDIT] Reconciled execution ticks: {reconciled_ticks}")
-    print(f"[RECONCILIATION AUDIT] Baseline execution ticks:   {ticks_a}")
+def test_reject_unratified_kinematic_transduction():
+    """Non-finite joint kinematic states cause KinematicTransductionError per Modality contract."""
+    from dataclasses import dataclass
 
-    # ZERO LOSS: Frame ticks are identical to uninterrupted execution!
-    assert reconciled_ticks == ticks_a, f"Expected {ticks_a}, got {reconciled_ticks}"
-    assert len(reconciled_frames) == 3
+    @dataclass
+    class _UncheckedJoint:
+        joint_id: str
+        position_rad: float
+        velocity_rad_per_s: float
+
+    transducer = KinematicSomaticTransductionV1()
+    with pytest.raises(KinematicTransductionError, match="position_rad for joint.hinge must be finite"):
+        transducer.transduce([_UncheckedJoint("joint.hinge", float("nan"), 0.0)])
+
+    with pytest.raises(KinematicTransductionError, match="velocity_rad_per_s for joint.hinge must be finite"):
+        transducer.transduce([_UncheckedJoint("joint.hinge", 0.0, float("inf"))])

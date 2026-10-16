@@ -15,6 +15,7 @@ import pytest
 
 pytest.importorskip("mujoco")
 
+from modality.kinematics import KinematicSomaticTransductionV1
 from organism import (
     EmbodimentContextRef,
     OrganismCheckpoint,
@@ -298,6 +299,7 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
             learning=learning,
             experience_policy=ExperienceRecordingPolicy(record_reception=True, max_records=64),
             enable_somatic_feedback=with_plasticity,
+            somatic_transduction=KinematicSomaticTransductionV1() if with_plasticity else None,
         )
         return world, cycle_inputs, manifest_store, journal_store, surface, actuator_context
 
@@ -407,11 +409,12 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
     assert restored_w == w_plastic
     assert len(restored_chk.experience_records) == 5
 
-    # Invariant: Competence development frames survive cold restoration bit-identically
-    # Note: Organism checkpoint is written during cycle 5's physical step, capturing somatic
-    # feedback accumulated through cycle 4. Tick 5's feedback is post-commit.
+    # Invariant: Competence development frames survive cold restoration bit-identically.
+    # Atomic staging ensures that cycle 5's post-physics somatic feedback is committed
+    # in the candidate checkpoint for cut 5, preventing frame loss upon cold restore.
     restored_frames = restored.organism.action_composer.engine.checkpoint()["frame_history"]
-    assert len(restored_frames) == 4
+    assert len(restored_frames) == 5
+    assert [f["tick"] for f in restored_frames] == [1, 2, 3, 4, 5]
     assert restored_frames[0]["body_state"] == frames_p[0]["body_state"]
 
     # 4. Continuation from Restored State in Real Runtime (Cycle 6)
@@ -439,6 +442,7 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
         learning=inputs_p.learning,
         experience_policy=inputs_p.experience_policy,
         enable_somatic_feedback=True,
+        somatic_transduction=KinematicSomaticTransductionV1(),
     )
 
     res_resumed = run_scalar_sensorimotor_session(
@@ -455,7 +459,8 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
 
     # Verify frame 6 was accumulated continuously upon post-commit adoption
     resumed_frames = restored.organism.action_composer.engine.checkpoint()["frame_history"]
-    assert len(resumed_frames) == 5
+    assert len(resumed_frames) == 6
+    assert [f["tick"] for f in resumed_frames] == [1, 2, 3, 4, 5, 6]
     assert resumed_frames[-1]["tick"] == 6
 
     # 5. Demonstrable functional difference surviving cold restoration
