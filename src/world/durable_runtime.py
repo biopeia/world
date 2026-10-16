@@ -133,6 +133,9 @@ def _validate_causal_cut_record(record: CausalRecord) -> None:
             required_reference_fields, required_reference_fields | dependency_fields
         ):
             raise ManifestError("persisted causal-cut record has an invalid checkpoint reference")
+        if "dependency_sha256" in reference and reference["dependency_sha256"] is None:
+            # one encoding for "no dependency": the keys are absent
+            raise ManifestError("persisted causal-cut record has an invalid checkpoint reference")
         values = tuple(reference[field] for field in (
             "owner_id", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"
         ))
@@ -1659,6 +1662,17 @@ class DurableWorldRuntime:
         if len(journal_refs) != 1 or not DurableJournalSnapshotStore.verify(journal_refs[0]):
             return False
         for ref in owner_refs:
+            declared = getattr(owner_checkpoint_contracts.get((ref.owner, ref.owner_identity)), "declared_dependency", None)
+            if declared is None:
+                if ref.dependency_sha256 is not None:
+                    return False      # owners without the hook can never carry a dependency
+            else:
+                try:                  # the owner's statement must match, at commit and on restore
+                    if declared(Path(ref.locator).read_bytes(), ref.owner_identity, ref.schema_version) \
+                            != ref.dependency_sha256:
+                        return False
+                except Exception:
+                    return False
             if ref.dependency_sha256 is not None:
                 try:   # durable and digest-valid, at commit and on restore
                     resolve_dependency(reference_dependency_root(ref), ref.dependency_sha256)

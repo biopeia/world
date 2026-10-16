@@ -299,3 +299,72 @@ def _with_parent(head, blob, parent):
     for k, v in (("head", head), ("parent", parent), ("new_blob", blob)):
         object.__setattr__(dep, k, v)
     return OwnerCheckpointPayload(*OWNER, "v5", owner_bytes(0, head), dep)
+
+
+# ------------------------------------------------ review follow-ups (BAW-004)
+def _bypass_reference(h: Harness, head: str):
+    """A writer that skips the store and points at a dependency never written."""
+    payload_bytes = owner_bytes(h.n + 1, head)
+    path = h.root / "manual" / "payload.blob"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload_bytes)
+    store_layout = h.store.root / hashlib.sha256(payload_bytes).hexdigest()[:2]
+    store_layout.mkdir(parents=True, exist_ok=True)
+    target = store_layout / f"{hashlib.sha256(payload_bytes).hexdigest()}.blob"
+    target.write_bytes(payload_bytes)
+    return CheckpointReference(*OWNER, "manual", "v5", str(target), hashlib.sha256(payload_bytes).hexdigest(),
+                               dependency_sha256=head, dependency_parent=h.head)
+
+
+def test_world_commit_check_refuses_a_dependency_that_was_never_written(tmp_path):
+    h = Harness(tmp_path)
+    h.tick(h.payload())
+    before = h.runtime.manifest
+    ghost = "9" * 64
+    with pytest.raises(ManifestError, match="dependency closure"):   # World's own check, not the store's
+        h.runtime.tick("bypass", lambda _t: (_bypass_reference(h, ghost),))
+    stored = h.manifest_store.read()
+    assert (stored.causal_tick, stored.commit_id) == (before.causal_tick, before.commit_id)
+    assert stored.status.name == "RECOVERY_REQUIRED"
+
+
+def test_recover_previous_cut_with_dependencies(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    committed = h.tick(h.payload())
+    with pytest.raises(ManifestError):
+        h.tick(h.payload(parent="e" * 64))                      # failed tick -> RECOVERY_REQUIRED
+
+    def recover():
+        return DurableWorldRuntime.recover_previous_cut(
+            WORLD, "presence-a", h.manifest_store, h.journal_store, owner_checkpoint_verifier=verifier,
+            owner_checkpoint_contracts={OWNER: h.contract}, owner_checkpoint_restorer=lambda refs: None)
+
+    blob = h.store.root / committed.dependency_sha256[:2] / f"{committed.dependency_sha256}.blob"
+    saved = blob.read_bytes()
+    blob.unlink()
+    with pytest.raises(ManifestError):                          # base dependency missing: refused
+        recover()
+    blob.write_bytes(saved)
+    h.runtime = recover()
+    assert committed_owner_ref(h).dependency_sha256 == committed.dependency_sha256
+    h.tick(h.payload())                                         # continues from the recovered cut
+
+
+@pytest.mark.parametrize("contract", [PlainContract(), type("Liar", (DeclaringContract,), {
+    "declared_dependency": lambda self, e, i, s: "a" * 64})()], ids=["no-hook", "contradicting"])
+def test_restore_rechecks_the_owner_declaration(tmp_path, contract):
+    h = Harness(tmp_path)
+    h.tick(h.payload())
+    h.contract = contract
+    with pytest.raises(ManifestError, match="dependency closure"):
+        h.restore()
+
+
+def test_null_dependency_keys_are_not_a_second_encoding(tmp_path):
+    from world.manifest import _manifest_from_data
+    h = Harness(tmp_path)
+    data = _manifest_to_data(h.runtime.manifest)
+    plain = next(r for r in data["checkpoint_references"] if "dependency_sha256" not in r)
+    plain.update(dependency_sha256=None, dependency_parent=None)
+    with pytest.raises(ValueError, match="empty dependency"):
+        _manifest_from_data(data)

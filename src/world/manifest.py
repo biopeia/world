@@ -605,6 +605,8 @@ def _manifest_from_data(data: dict) -> WorldCausalManifest:
     for ref in references:
         if not isinstance(ref, dict) or set(ref) not in (REFERENCE_KEYS, REFERENCE_KEYS | DEPENDENCY_KEYS):
             raise ValueError("checkpoint reference fields do not match schema")
+        if "dependency_sha256" in ref and ref["dependency_sha256"] is None:
+            raise ValueError("checkpoint reference has an empty dependency")
         refs.append(CheckpointReference(**ref))
     return WorldCausalManifest(
         world_id=data["world_id"],

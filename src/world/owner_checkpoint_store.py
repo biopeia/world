@@ -177,6 +177,9 @@ class FileOwnerCheckpointStore:
         if target.exists():
             if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                 raise OSError("content-addressed checkpoint path contains different bytes")
+            # A retry after a crash between link and directory fsync must not
+            # rely on an entry that may not be durable yet.
+            _fsync_directory(target.parent)
             return
 
         fd, temporary_name = tempfile.mkstemp(prefix=".checkpoint-", dir=target.parent)
