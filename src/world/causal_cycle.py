@@ -27,6 +27,7 @@ from embodiment.physics3d.differential_motor_composition import (
     EmbodimentDifferentialMotorBinding,
 )
 from embodiment.physics3d.joint_torque import EmbodimentJointTorqueBinding
+from embodiment.physics3d.joint_torque import project_no_actuation
 from embodiment.physics3d.physical_transition import EmbodimentPhysicalState
 from embodiment.physics3d.spatial_render import RenderMorphologyProjection
 from embodiment.physics3d.receptor import EmbodimentReceptor
@@ -43,6 +44,7 @@ from organism.actuation import (
     ActuatorEvidenceContext,
     ActuatorSurface,
     OrganismExplorationComposer,
+    ExplorationOutcome,
     RestoredOrganismExplorationCheckpoint,
 )
 from organism.cognition import SenseChannelBinding
@@ -53,6 +55,7 @@ from .adapters.articulated_mujoco import (
     ArticulatedMujocoConfiguration,
     ArticulatedPhysicalStepOutcome,
     advance_articulated_mujoco_step_from_motor_command,
+    advance_articulated_mujoco_step_without_actuation,
 )
 from .durable_runtime import (
     CommittedWorldCut,
@@ -87,6 +90,7 @@ class _ActionCandidate(Protocol):
 
     motor_command: object | None
     proposal: object | None
+    outcome: ExplorationOutcome
 
 
 @runtime_checkable
@@ -486,9 +490,23 @@ def run_scalar_sensorimotor_cycle_and_publish(
                 for pair in differential_binding.pairs
             ),
         )
-        command = candidate.motor_command
-        if command is None:
-            raise ValueError("Organism produced no motor command for this causal cycle")
+        # A missing/legacy outcome is an invalid Organism result, not an
+        # implicit request for no actuation. Use getattr so malformed
+        # structural candidates fail with the same explicit contract error.
+        outcome = getattr(candidate, "outcome", None)
+        command = getattr(candidate, "motor_command", None)
+        if not isinstance(outcome, ExplorationOutcome):
+            raise TypeError("Organism candidate must carry an explicit exploration outcome")
+        if outcome is ExplorationOutcome.MOTOR_COMMAND:
+            if command is None or candidate.proposal is None:
+                raise ValueError("motor-command outcome requires a complete proposal and command")
+            if command.issued_at_tick != context.source_causal_tick:
+                raise ValueError("motor command does not match the World source causal tick")
+        elif outcome is ExplorationOutcome.NO_ACTUATION:
+            if command is not None or candidate.proposal is not None:
+                raise ValueError("no-actuation outcome must not contain a proposal or motor command")
+        else:
+            raise ValueError("unsupported Organism exploration outcome")
 
         written_references: tuple[CheckpointReference, ...] = ()
 
@@ -564,14 +582,11 @@ def run_scalar_sensorimotor_cycle_and_publish(
         render_morphology = RenderMorphologyProjection.from_active_morphology(
             active_morphology, geometry_revision=embodiment_geometry_revision
         )
-        physical = advance_articulated_mujoco_step_from_motor_command(
-            world,
+        step_arguments = dict(
             commit_id=commit_id,
             physical_step_id=physical_step_id,
             body_state=articulated_body,
-            motor_command=command,
             active_morphology=active_morphology,
-            differential_binding=differential_binding,
             torque_binding=torque_binding,
             environment_owner=environment_owner,
             configuration=solver_configuration,
@@ -580,6 +595,24 @@ def run_scalar_sensorimotor_cycle_and_publish(
                 step_context, adopted_body, adopted_environment
             ),
         )
+        if outcome is ExplorationOutcome.MOTOR_COMMAND:
+            physical = advance_articulated_mujoco_step_from_motor_command(
+                world,
+                motor_command=command,
+                differential_binding=differential_binding,
+                **step_arguments,
+            )
+        else:
+            no_actuation = project_no_actuation(
+                torque_binding,
+                active_morphology,
+                issued_at_tick=context.source_causal_tick,
+            )
+            physical = advance_articulated_mujoco_step_without_actuation(
+                world,
+                no_actuation=no_actuation,
+                **step_arguments,
+            )
         if physical.record.causal_tick != context.target_causal_tick:
             raise ManifestError("physical commit does not match the prepared causal cycle")
         cut = world.committed_cut_for(

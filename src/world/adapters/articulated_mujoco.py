@@ -26,6 +26,8 @@ from embodiment.physics3d.differential_motor_composition import (
 from embodiment.physics3d.joint_torque import (
     EmbodimentJointTorqueBinding,
     JointTorqueCandidate,
+    NoActuationProjection,
+    project_no_actuation,
     project_joint_torque_command,
 )
 from embodiment.physics3d.physical_projection import (
@@ -159,6 +161,60 @@ def advance_articulated_mujoco_step_from_motor_command(
         physical_step_id=physical_step_id,
         body_state=body_state,
         torque=torque,
+        active_morphology=active_morphology,
+        torque_binding=torque_binding,
+        environment_owner=environment_owner,
+        configuration=configuration,
+        render_morphology_projection=render_morphology_projection,
+        write_checkpoints=write_checkpoints,
+    )
+
+
+def advance_articulated_mujoco_step_without_actuation(
+    world: DurableWorldRuntime,
+    *,
+    commit_id: str,
+    physical_step_id: str,
+    body_state: ArticulatedEmbodimentPhysicalState,
+    no_actuation: NoActuationProjection,
+    active_morphology: ActiveArticulatedMorphology,
+    torque_binding: EmbodimentJointTorqueBinding,
+    environment_owner: StaticEnvironmentOwner,
+    configuration: ArticulatedMujocoConfiguration,
+    render_morphology_projection: object | None = None,
+    write_checkpoints: Callable[
+        [PhysicalStepContext, ArticulatedEmbodimentPhysicalState, StaticEnvironmentOwner],
+        Iterable[CheckpointReference],
+    ],
+) -> ArticulatedPhysicalStepOutcome:
+    """Advance one authorized physical step with no motor command requested."""
+    context = (
+        body_state.root.body_id,
+        body_state.root.embodiment_episode_id,
+        body_state.morphology_revision,
+    )
+    morphology_context = (
+        active_morphology.body_id,
+        active_morphology.embodiment_episode_id,
+        active_morphology.morphology_revision,
+    )
+    if context != morphology_context:
+        raise ValueError("active morphology does not match the Embodiment body state")
+    if body_state.morphology.morphology_sha256 != active_morphology.morphology_sha256:
+        raise ValueError("active morphology content differs from the Embodiment body state")
+    expected = project_no_actuation(
+        torque_binding, active_morphology, issued_at_tick=body_state.causal_tick
+    )
+    if no_actuation != expected:
+        raise ValueError("no-actuation projection is stale or differs from active Embodiment binding")
+    return advance_articulated_mujoco_step(
+        world,
+        commit_id=commit_id,
+        physical_step_id=physical_step_id,
+        body_state=body_state,
+        torque=no_actuation,
+        active_morphology=active_morphology,
+        torque_binding=torque_binding,
         environment_owner=environment_owner,
         configuration=configuration,
         render_morphology_projection=render_morphology_projection,
@@ -216,7 +272,9 @@ class ArticulatedMujocoConfiguration:
 @dataclass(frozen=True, slots=True)
 class ArticulatedPhysicalInput:
     body: BodyPhysicalInput
-    torque: JointTorqueCandidate
+    torque: JointTorqueCandidate | NoActuationProjection
+    active_morphology: ActiveArticulatedMorphology
+    torque_binding: EmbodimentJointTorqueBinding
 
 
 def execute_articulated_mujoco_step(
@@ -260,8 +318,27 @@ def execute_articulated_mujoco_step(
         raise ValueError("friction must be non-negative")
     if (material.restitution, material.linear_damping, material.angular_damping) != (0, 0, 0):
         raise ValueError("restitution/root drag require a separately supported physical model")
-    if torque.issued_at_tick != context.source_causal_tick:
-        raise ValueError("torque is stale for the World source cut")
+    if isinstance(torque, NoActuationProjection):
+        active = body_input.active_morphology
+        binding = body_input.torque_binding
+        if (
+            (active.body_id, active.embodiment_episode_id, active.morphology_revision)
+            != (context.body_id, context.embodiment_episode_id, context.morphology_revision)
+            or body.morphology_sha256 != active.morphology_sha256
+        ):
+            raise ValueError("active Embodiment morphology differs from World source context/body")
+        expected_no_actuation = project_no_actuation(
+            binding, active, issued_at_tick=context.source_causal_tick
+        )
+        if torque != expected_no_actuation:
+            raise ValueError("no-actuation projection is stale or differs from World source context")
+        torque_channels = ()
+    elif isinstance(torque, JointTorqueCandidate):
+        if torque.issued_at_tick != context.source_causal_tick:
+            raise ValueError("torque is stale for the World source cut")
+        torque_channels = torque.channels
+    else:
+        raise TypeError("physical step requires an explicit Embodiment torque or no-actuation projection")
 
     description = ET.fromstring(body.articulated_description)
     links = {item.attrib["name"] for item in description.findall("link")}
@@ -275,7 +352,7 @@ def execute_articulated_mujoco_step(
     if joint_ids != revolute_ids or any(j.attrib["type"] not in {"revolute", "fixed"} for j in topology.values()):
         raise ValueError("only exact owner-described revolute/fixed joint topology is supported")
     seen = set()
-    for channel in torque.channels:
+    for channel in torque_channels:
         if channel.joint_id in seen or channel.joint_id not in joint_ids:
             raise ValueError("duplicate or unknown stable joint command")
         seen.add(channel.joint_id)
@@ -385,7 +462,7 @@ def execute_articulated_mujoco_step(
         native = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint.joint_id)
         data.qpos[model.jnt_qposadr[native]] = joint.position_rad
         data.qvel[model.jnt_dofadr[native]] = joint.velocity_rad_per_s
-    for channel in torque.channels:
+    for channel in torque_channels:
         native = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, channel.joint_id)
         data.qfrc_applied[model.jnt_dofadr[native]] = channel.torque_nm
     regulation = None
@@ -515,7 +592,9 @@ def advance_articulated_mujoco_step(
     commit_id: str,
     physical_step_id: str,
     body_state: ArticulatedEmbodimentPhysicalState,
-    torque: JointTorqueCandidate,
+    torque: JointTorqueCandidate | NoActuationProjection,
+    active_morphology: ActiveArticulatedMorphology,
+    torque_binding: EmbodimentJointTorqueBinding,
     environment_owner: StaticEnvironmentOwner,
     configuration: ArticulatedMujocoConfiguration,
     render_morphology_projection: object | None = None,
@@ -562,7 +641,9 @@ def advance_articulated_mujoco_step(
             context.solver_config_revision,
         )
         projection = project_body_physical_input(body_state, correlation=correlation)
-        return ArticulatedPhysicalInput(projection, torque)
+        return ArticulatedPhysicalInput(
+            projection, torque, active_morphology, torque_binding
+        )
 
     def project_environment(context: PhysicalStepContext) -> EnvironmentPhysicalProjection:
         correlation = EnvironmentStepCorrelation(
