@@ -240,3 +240,67 @@ def test_runtime_failure_reports_last_committed_cut_and_nonzero_exit(tmp_path: P
     assert terminal[0]["commit_id"] is not None
     assert terminal[0]["publication_uncertain"] is True
     assert "ObservationPublicationFailure" in terminal[0]["error"]
+
+
+def test_fresh_world_process_runs_with_organism_checkpoint_v5(tmp_path: Path) -> None:
+    import hashlib
+    import os
+    from organism.actuation import ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA
+
+    state = tmp_path / "state-v5"
+    env = {"PYTHONPATH": str(Path(__file__).parents[2] / "src"), **os.environ}
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "world.m1_process",
+            "--profile", str(PROFILE),
+            "--state-root", str(state),
+            "--cycles", "10",
+            "--organism-checkpoint", "v5",
+        ],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    records = _records(result.stdout)
+    committed = [r for r in records if r["event"] == "cycle_committed"]
+    assert len(committed) == 10
+    terminal = [r for r in records if r["event"] == "completed"]
+    assert len(terminal) == 1 and terminal[0]["last_verified_committed_tick"] == 10
+
+    # Verify manifest and owner checkpoint references
+    manifest = json.loads((state / "manifest.json").read_bytes())
+    refs = manifest["checkpoint_references"]
+    org_ref = next(r for r in refs if r["owner"] == "organism")
+    assert org_ref["schema_version"] == ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA
+    assert org_ref.get("dependency_sha256") is not None
+    dep_head = org_ref["dependency_sha256"]
+    from world.checkpoint_dependency import reference_dependency_root, resolve_dependency
+    root = reference_dependency_root(type("Ref", (), {"locator": org_ref["locator"]})())
+    dep_bytes = resolve_dependency(root, dep_head)
+    assert hashlib.sha256(dep_bytes).hexdigest() == dep_head
+
+
+def test_invalid_organism_checkpoint_fails_preflight(tmp_path: Path) -> None:
+    import os
+
+    state = tmp_path / "not-created"
+    env = {"PYTHONPATH": str(Path(__file__).parents[2] / "src"), **os.environ}
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "world.m1_process",
+            "--profile", str(PROFILE),
+            "--state-root", str(state),
+            "--cycles", "2",
+            "--organism-checkpoint", "invalid_version",
+        ],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    assert result.returncode == 2
+    assert not state.exists()
