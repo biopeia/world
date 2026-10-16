@@ -166,6 +166,7 @@ class ScalarSensorimotorCycleInputs:
     embodiment_geometry_revision: str
     learning: tuple[EdgeLearningInstruction, ...] = ()
     experience_policy: ExperienceRecordingPolicy | None = None
+    enable_somatic_feedback: bool = False
 
     def as_cycle_arguments(self) -> dict[str, object]:
         return {
@@ -191,6 +192,7 @@ class ScalarSensorimotorCycleInputs:
             "embodiment_geometry_revision": self.embodiment_geometry_revision,
             "learning": self.learning,
             "experience_policy": self.experience_policy,
+            "enable_somatic_feedback": self.enable_somatic_feedback,
         }
 
 
@@ -438,6 +440,7 @@ def run_scalar_sensorimotor_cycle_and_publish(
     publish_static_spatial: bool = True,
     learning: tuple[EdgeLearningInstruction, ...] = (),
     experience_policy: ExperienceRecordingPolicy | None = None,
+    enable_somatic_feedback: bool = False,
 ) -> CausalCycleResult:
     """Sense, transition, issue an Organism command, solve, adopt, commit, publish.
 
@@ -654,7 +657,15 @@ def run_scalar_sensorimotor_cycle_and_publish(
             commit_id=commit_id,
             expected_owner_references=written_references,
         )
-        action_composer.adopt_after_world_commit(candidate, committed_cut=cut)
+        somatic_observation = None
+        if enable_somatic_feedback and hasattr(physical.body_state, "joints"):
+            somatic_observation = {}
+            for j in physical.body_state.joints:
+                somatic_observation[f"{j.joint_id}:pos"] = float(j.position_rad)
+                somatic_observation[f"{j.joint_id}:vel"] = float(j.velocity_rad_per_s)
+        action_composer.adopt_after_world_commit(
+            candidate, committed_cut=cut, somatic_observation=somatic_observation
+        )
         # This is the production domain-to-Observation binding. The test
         # supplies neither the owner checkpoint set nor claim construction.
         from observation.embodiment import (
