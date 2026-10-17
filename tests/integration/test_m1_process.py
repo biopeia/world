@@ -78,7 +78,6 @@ def test_fresh_world_process_runs_real_cycles_and_serves_postcommit_observations
         "environment.finite_scalar_field",
         "environment.render_scene",
         "embodiment.render_morphology",
-        "embodiment.render_link_pose",
     }
 
 
@@ -341,7 +340,7 @@ def test_opt_in_observation_archive_captures_only_deliveries_during_run(tmp_path
         "environment.finite_scalar_field",
         "environment.render_scene",
         "embodiment.render_morphology",
-        "embodiment.render_link_pose",
+        "embodiment.reserve_state_snapshot",
     }
 
 

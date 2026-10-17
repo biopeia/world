@@ -578,6 +578,7 @@ def test_longitudinal_learning_and_continuity_in_real_runtime(tmp_path: Path) ->
         actuator_context=act_ctx,
         actuator_surface=surface,
         articulated_body=restored.articulated_body,
+        reserve_checkpoint=restored.reserve_checkpoint,
         active_morphology=inputs_p.active_morphology,
         differential_binding=inputs_p.differential_binding,
         torque_binding=inputs_p.torque_binding,

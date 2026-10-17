@@ -31,6 +31,11 @@ from embodiment.physics3d.joint_torque import project_no_actuation
 from embodiment.physics3d.physical_transition import EmbodimentPhysicalState
 from embodiment.physics3d.spatial_render import RenderMorphologyProjection
 from embodiment.physics3d.receptor import EmbodimentReceptor
+from embodiment.checkpoint import (
+    EmbodimentAdoptionBindingV1,
+    EmbodimentCheckpoint,
+    project_committed_reserve_state,
+)
 from environment import (
     EnvironmentObservationContext,
     FrameDescriptor,
@@ -166,6 +171,7 @@ class ScalarSensorimotorCycleInputs:
     actuator_context: object
     actuator_surface: object
     articulated_body: ArticulatedEmbodimentPhysicalState
+    reserve_checkpoint: EmbodimentCheckpoint
     active_morphology: ActiveArticulatedMorphology
     differential_binding: EmbodimentDifferentialMotorBinding
     torque_binding: EmbodimentJointTorqueBinding
@@ -193,6 +199,7 @@ class ScalarSensorimotorCycleInputs:
             "actuator_context": self.actuator_context,
             "actuator_surface": self.actuator_surface,
             "articulated_body": self.articulated_body,
+            "reserve_checkpoint": self.reserve_checkpoint,
             "active_morphology": self.active_morphology,
             "differential_binding": self.differential_binding,
             "torque_binding": self.torque_binding,
@@ -243,6 +250,7 @@ class RestoredScalarSensorimotorRuntime:
     committed_cut: CommittedWorldCut
     organism: RestoredOrganismExplorationCheckpoint
     articulated_body: ArticulatedEmbodimentPhysicalState
+    reserve_checkpoint: EmbodimentCheckpoint
     environment_owner: StaticEnvironmentOwner
     environment_field: IdentifiedFiniteScalarField
 
@@ -292,20 +300,21 @@ def restore_scalar_sensorimotor_runtime(
         or actuator_context.surface_fingerprint != actuator_surface.contract_fingerprint
     ):
         raise ValueError("actuator applicability must match the active Embodiment morphology and surface")
-    expected_owners = {
-        ("organism", expected_organism_id),
-        ("embodiment", active_morphology.body_id),
-        ("environment", expected_environment_owner_id),
-        ("environment", expected_field_id),
+    expected_checkpoint_keys = {
+        ("organism", expected_organism_id, ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA),
+        ("organism", expected_organism_id, ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA),
+        ("embodiment", active_morphology.body_id, ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA),
+        ("embodiment", active_morphology.body_id, EmbodimentCheckpoint.OWNER_SCHEMA),
+        ("embodiment", active_morphology.body_id, EmbodimentAdoptionBindingV1.OWNER_SCHEMA),
+        ("environment", expected_environment_owner_id, StaticEnvironmentOwner.CHECKPOINT_SCHEMA),
+        ("environment", expected_field_id, IdentifiedFiniteScalarField.OWNER_SCHEMA),
     }
-    staged: dict[tuple[str, str], tuple[CheckpointReference, bytes]] = {}
+    staged: dict[tuple[str, str, str], tuple[CheckpointReference, bytes]] = {}
 
     def stage_owner_checkpoints(references: tuple[CheckpointReference, ...]) -> None:
-        if len(references) != len(expected_owners):
-            raise ManifestError("committed cut does not contain the required scalar-cycle owner set")
         for reference in references:
-            key = (reference.owner, reference.owner_identity)
-            if key not in expected_owners or key in staged:
+            key = (reference.owner, reference.owner_identity, reference.schema_version)
+            if key not in expected_checkpoint_keys or key in staged:
                 raise ManifestError("committed cut has an unexpected or duplicate scalar-cycle owner")
             try:
                 encoded = Path(reference.locator).read_bytes()
@@ -314,7 +323,11 @@ def restore_scalar_sensorimotor_runtime(
             if sha256(encoded).hexdigest() != reference.sha256:
                 raise ManifestError("committed owner checkpoint digest does not match its World reference")
             staged[key] = (reference, encoded)
-        if set(staged) != expected_owners:
+        accepted_sets = (
+            expected_checkpoint_keys - {("organism", expected_organism_id, ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA)},
+            expected_checkpoint_keys - {("organism", expected_organism_id, ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA)},
+        )
+        if set(staged) not in accepted_sets:
             raise ManifestError("committed cut is missing a required scalar-cycle owner")
 
     restored_world = DurableWorldRuntime.restore(
@@ -334,7 +347,8 @@ def restore_scalar_sensorimotor_runtime(
         expected_owner_references=tuple(value[0] for value in staged.values()),
     )
 
-    organism_reference, organism_bytes = staged[("organism", expected_organism_id)]
+    organism_key = next(key for key in staged if key[0] == "organism")
+    organism_reference, organism_bytes = staged[organism_key]
     if organism_reference.schema_version not in (
         ORGANISM_EXPLORATION_CHECKPOINT_SCHEMA, ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA
     ):
@@ -355,17 +369,29 @@ def restore_scalar_sensorimotor_runtime(
     except (TypeError, ValueError) as error:
         raise ManifestError("Organism checkpoint does not restore against the committed World receipt") from error
 
-    body_reference, body_bytes = staged[("embodiment", active_morphology.body_id)]
-    if body_reference.schema_version != ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA:
-        raise ManifestError("committed Embodiment checkpoint schema is not supported by this composition")
+    body_reference, body_bytes = staged[("embodiment", active_morphology.body_id, ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA)]
+    reserve_reference, reserve_bytes = staged[("embodiment", active_morphology.body_id, EmbodimentCheckpoint.OWNER_SCHEMA)]
+    binding_reference, _binding_bytes = staged[("embodiment", active_morphology.body_id, EmbodimentAdoptionBindingV1.OWNER_SCHEMA)]
+    if not EmbodimentAdoptionBindingV1.verify_checkpoint_set(
+        (body_reference, reserve_reference, binding_reference),
+        world_id=cut.world_id,
+        source_causal_tick=cut.causal_tick - 1,
+        target_causal_tick=cut.causal_tick,
+        commit_id=cut.commit_id,
+    ):
+        raise ManifestError("restored Embodiment adoption binding is not valid for the committed cut")
     try:
         articulated_body = ArticulatedEmbodimentPhysicalState.restore_checkpoint(
             body_bytes, active_morphology=active_morphology
         )
     except (TypeError, ValueError) as error:
         raise ManifestError("Embodiment checkpoint is incompatible with the active morphology") from error
+    try:
+        reserve_checkpoint = EmbodimentCheckpoint.from_bytes(reserve_bytes)
+    except (TypeError, ValueError) as error:
+        raise ManifestError("Embodiment reserve checkpoint cannot be restored") from error
 
-    environment_reference, environment_bytes = staged[("environment", expected_environment_owner_id)]
+    environment_reference, environment_bytes = staged[("environment", expected_environment_owner_id, StaticEnvironmentOwner.CHECKPOINT_SCHEMA)]
     if environment_reference.schema_version != StaticEnvironmentOwner.CHECKPOINT_SCHEMA:
         raise ManifestError("committed Environment checkpoint schema is not supported by this composition")
     try:
@@ -373,7 +399,7 @@ def restore_scalar_sensorimotor_runtime(
     except (TypeError, ValueError) as error:
         raise ManifestError("Environment owner checkpoint cannot be restored") from error
 
-    field_reference, field_bytes = staged[("environment", expected_field_id)]
+    field_reference, field_bytes = staged[("environment", expected_field_id, IdentifiedFiniteScalarField.OWNER_SCHEMA)]
     if field_reference.schema_version != IdentifiedFiniteScalarField.OWNER_SCHEMA:
         raise ManifestError("committed scalar-field checkpoint schema is not supported by this composition")
     try:
@@ -416,6 +442,7 @@ def restore_scalar_sensorimotor_runtime(
         committed_cut=cut,
         organism=organism,
         articulated_body=articulated_body,
+        reserve_checkpoint=reserve_checkpoint,
         environment_owner=environment_owner,
         environment_field=environment_field,
     )
@@ -441,6 +468,7 @@ def run_scalar_sensorimotor_cycle_and_publish(
     actuator_context: object,
     actuator_surface: object,
     articulated_body: ArticulatedEmbodimentPhysicalState,
+    reserve_checkpoint: EmbodimentCheckpoint,
     active_morphology: ActiveArticulatedMorphology,
     differential_binding: EmbodimentDifferentialMotorBinding,
     torque_binding: EmbodimentJointTorqueBinding,
@@ -463,6 +491,8 @@ def run_scalar_sensorimotor_cycle_and_publish(
         raise TypeError("world must be a DurableWorldRuntime")
     if not isinstance(current_organism, OrganismTransitionState):
         raise TypeError("current_organism must be an OrganismTransitionState")
+    if not isinstance(reserve_checkpoint, EmbodimentCheckpoint):
+        raise TypeError("reserve_checkpoint must be an EmbodimentCheckpoint")
     if not isinstance(action_composer, _OrganismActionComposer):
         raise TypeError("action_composer must implement the Organism action port")
     if not isinstance(owner_checkpoint_store, OwnerCheckpointStore):
@@ -554,6 +584,20 @@ def run_scalar_sensorimotor_cycle_and_publish(
             nonlocal written_references
             if step_context != context:
                 raise ManifestError("World-issued physical context changed before commit")
+            # Episode identity is derived from the owner-returned adopted state;
+            # the input reserve checkpoint is accepted only if it identifies
+            # that exact body and episode.
+            binding = EmbodimentAdoptionBindingV1.from_adopted_state(
+                adopted_body,
+                reserve_checkpoint,
+                world_id=step_context.world_id,
+                source_causal_tick=step_context.source_causal_tick,
+                target_causal_tick=step_context.target_causal_tick,
+                commit_id=commit_id,
+                physical_step_id=step_context.physical_step_id,
+            )
+            reserve_bytes = reserve_checkpoint.to_bytes()
+            binding_bytes = binding.to_bytes()
             if enable_somatic_feedback and hasattr(adopted_body, "joints") and somatic_transduction is not None:
                 somatic_obs = somatic_transduction.transduce(adopted_body.joints)
                 if hasattr(action_composer, "stage_somatic_feedback_for_candidate"):
@@ -597,6 +641,18 @@ def run_scalar_sensorimotor_cycle_and_publish(
                             encoded=adopted_body.checkpoint_bytes(),
                         ),
                         OwnerCheckpointPayload(
+                            owner="embodiment",
+                            owner_identity=adopted_body.root.body_id,
+                            schema_version=EmbodimentCheckpoint.OWNER_SCHEMA,
+                            encoded=reserve_bytes,
+                        ),
+                        OwnerCheckpointPayload(
+                            owner="embodiment",
+                            owner_identity=adopted_body.root.body_id,
+                            schema_version=EmbodimentAdoptionBindingV1.OWNER_SCHEMA,
+                            encoded=binding_bytes,
+                        ),
+                        OwnerCheckpointPayload(
                             owner="environment",
                             owner_identity=adopted_environment.owner_id,
                             schema_version=StaticEnvironmentOwner.CHECKPOINT_SCHEMA,
@@ -622,6 +678,21 @@ def run_scalar_sensorimotor_cycle_and_publish(
                 owner="embodiment",
                 owner_identity=adopted_body.root.body_id,
                 encoded=adopted_body.checkpoint_bytes(),
+                schema_version=ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
+            )
+            _require_checkpoint(
+                written_references,
+                owner="embodiment",
+                owner_identity=adopted_body.root.body_id,
+                encoded=reserve_bytes,
+                schema_version=EmbodimentCheckpoint.OWNER_SCHEMA,
+            )
+            _require_checkpoint(
+                written_references,
+                owner="embodiment",
+                owner_identity=adopted_body.root.body_id,
+                encoded=binding_bytes,
+                schema_version=EmbodimentAdoptionBindingV1.OWNER_SCHEMA,
             )
             _require_checkpoint(
                 written_references,
@@ -698,10 +769,16 @@ def run_scalar_sensorimotor_cycle_and_publish(
         )
 
         body_reference = _reference_for_owner(
-            cut, "embodiment", physical.body_state.root.body_id
+            cut, "embodiment", physical.body_state.root.body_id,
+            ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
+        )
+        reserve_reference = _reference_for_owner(
+            cut, "embodiment", physical.body_state.root.body_id,
+            EmbodimentCheckpoint.OWNER_SCHEMA,
         )
         field_reference = _reference_for_owner(
-            cut, "environment", environment_field.resource_id
+            cut, "environment", environment_field.resource_id,
+            environment_field.OWNER_SCHEMA,
         )
         body_claim = embodiment_body_pose_observation(
             physical.body_state.body_pose_observation_projection()
@@ -717,6 +794,15 @@ def run_scalar_sensorimotor_cycle_and_publish(
             OwnerObservation(body_reference, body_claim),
             OwnerObservation(field_reference, field_claim),
         ]
+        verified_reserve = project_committed_reserve_state(
+            reserve_checkpoint.to_bytes(),
+            committed_cut=cut,
+            owner_reference=reserve_reference,
+        )
+        from observation.embodiment import embodiment_reserve_state_observation
+        observations.append(OwnerObservation(
+            reserve_reference, embodiment_reserve_state_observation(verified_reserve)
+        ))
         if publish_static_spatial:
             # Prepared for passive publication after the cut-bound claims.
             # Static owner projections are not checkpoint snapshots and must
@@ -930,12 +1016,14 @@ def _require_checkpoint(
     owner: str,
     owner_identity: str,
     encoded: bytes,
+    schema_version: str | None = None,
 ) -> None:
     digest = sha256(encoded).hexdigest()
     if not any(
         reference.owner == owner
         and reference.owner_identity == owner_identity
         and reference.sha256 == digest
+        and (schema_version is None or reference.schema_version == schema_version)
         for reference in references
     ):
         raise ManifestError(
@@ -944,16 +1032,17 @@ def _require_checkpoint(
 
 
 def _reference_for_owner(
-    cut: CommittedWorldCut, owner: str, owner_identity: str
+    cut: CommittedWorldCut, owner: str, owner_identity: str, schema_version: str
 ) -> CheckpointReference:
     matches = tuple(
         reference
         for reference in cut.owner_checkpoint_references
         if reference.owner == owner and reference.owner_identity == owner_identity
+        and reference.schema_version == schema_version
     )
     if len(matches) != 1:
         raise ManifestError(
-            f"committed cut must contain exactly one {owner} checkpoint for {owner_identity}"
+            f"committed cut must contain exactly one {owner}/{schema_version} checkpoint for {owner_identity}"
         )
     return matches[0]
 

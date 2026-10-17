@@ -116,6 +116,23 @@ def test_publishes_only_after_receipt_and_owner_provenance_match():
     assert plane.observations == [observation]
 
 
+def test_rejects_caller_fabricated_structural_cut_receipt_before_publication():
+    reference = _reference()
+    actual_cut = _cut(reference)
+    forged_cut = replace(actual_cut, commit_id="caller-invented-commit")
+    plane = _Plane()
+
+    with pytest.raises(ManifestError, match="cut identity or references"):
+        publish_committed_owner_observations(
+            _World(actual_cut),  # type: ignore[arg-type]
+            plane,
+            committed_cut=forged_cut,
+            owner_observations=(OwnerObservation(reference, _observation(reference)),),
+        )
+
+    assert plane.observations == []
+
+
 def test_preserves_owner_specific_lineage_namespace_when_digest_matches_cut():
     reference = _reference(owner="embodiment", identity="body-1")
     cut = _cut(reference)

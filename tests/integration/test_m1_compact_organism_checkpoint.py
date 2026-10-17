@@ -19,6 +19,7 @@ from organism.actuation import (  # noqa: E402
 )
 from organism.actuation.action_history import exploration_v5_to_v4  # noqa: E402
 
+from embodiment.physics3d.articulated_state import ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA
 from world.causal_cycle import run_scalar_sensorimotor_session  # noqa: E402
 from world.checkpoint_dependency import resolve_dependency  # noqa: E402
 from world.m1_profile import construct_fresh_runtime, load_operator_profile  # noqa: E402
@@ -31,9 +32,31 @@ def _run(state_root: Path, organism_checkpoint: str, cycles: int):
     runtime = construct_fresh_runtime(profile, digest, state_root, {"world": "test"}, observation_port=0,
                                       organism_checkpoint=organism_checkpoint)
     results = []
+    def record(result):
+        from embodiment.checkpoint import EmbodimentAdoptionBindingV1, EmbodimentCheckpoint
+        references = result.committed_cut.owner_checkpoint_references
+        trio = tuple(
+            reference for reference in references
+            if reference.owner == "embodiment" and reference.owner_identity == runtime.cycle_inputs.active_morphology.body_id
+        )
+        assert {reference.schema_version for reference in trio} == {
+            ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
+            EmbodimentCheckpoint.OWNER_SCHEMA,
+            EmbodimentAdoptionBindingV1.OWNER_SCHEMA,
+        }
+        assert EmbodimentAdoptionBindingV1.verify_checkpoint_set(
+            trio,
+            world_id=result.committed_cut.world_id,
+            source_causal_tick=result.context.source_causal_tick,
+            target_causal_tick=result.context.target_causal_tick,
+            commit_id=result.committed_cut.commit_id,
+        )
+        assert result.observation_publication.committed_cut == result.committed_cut
+        results.append(result)
+
     try:
         run_scalar_sensorimotor_session(runtime.world, runtime.observation_plane, run_id="m3", max_cycles=cycles,
-                                        cycle_inputs=runtime.cycle_inputs, on_cycle_result=results.append,
+                                        cycle_inputs=runtime.cycle_inputs, on_cycle_result=record,
                                         source_revisions=runtime.source_revisions)
     finally:
         runtime.observation_bridge.close()

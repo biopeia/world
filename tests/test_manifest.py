@@ -32,12 +32,12 @@ def manifest(*, tick=0, refs=None, last_sequence=None, digest="", **overrides):
     return WorldCausalManifest(**values)
 
 
-def checkpoint(owner="organism", identity="organism-a", locator="sha256:abc"):
+def checkpoint(owner="organism", identity="organism-a", locator="sha256:abc", schema="1"):
     return CheckpointReference(
         owner=owner,
         owner_identity=identity,
         checkpoint_id=f"{owner}-checkpoint-1",
-        schema_version="1",
+        schema_version=schema,
         locator=locator,
         sha256=hashlib.sha256(locator.encode()).hexdigest(),
     )
@@ -54,8 +54,17 @@ def test_manifest_requires_inclusive_durable_journal_boundary():
 
 def test_manifest_rejects_duplicate_owner_identity_reference():
     ref = checkpoint()
-    with pytest.raises(ValueError, match="duplicate owner identity"):
+    with pytest.raises(ValueError, match="duplicate owner identity/schema"):
         manifest(refs=(ref, ref))
+
+
+def test_manifest_allows_distinct_checkpoint_schemas_for_one_owner_identity():
+    refs = (
+        checkpoint("embodiment", "body-1", "physical", "physical-v2"),
+        checkpoint("embodiment", "body-1", "reserve", "reserve-v2"),
+        checkpoint("embodiment", "body-1", "binding", "binding-v1"),
+    )
+    assert manifest(refs=refs, registered_owner_ids=(("embodiment", "body-1"),)).checkpoint_references == refs
 
 
 def test_manifest_rejects_duplicate_active_presence_ids():

@@ -22,6 +22,9 @@ from pathlib import Path
 import mujoco
 import pytest
 from embodiment.observation import BodyPoseSample
+from embodiment.checkpoint import EmbodimentAdoptionBindingV1, EmbodimentCheckpoint
+from embodiment.metabolism import MetabolicLedger
+from embodiment.physiology import LivingBodyState
 from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
 from embodiment.physics3d.articulated_state import (
     ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
@@ -131,6 +134,18 @@ class _Contract:
         return path.is_file() and self.validate_checkpoint(
             path.read_bytes(), reference.owner_identity, reference.schema_version
         )
+
+    def verify_checkpoint_set(self, references, *, world_id, source_causal_tick, target_causal_tick, commit_id):
+        return EmbodimentAdoptionBindingV1.verify_checkpoint_set(
+            tuple(references), world_id=world_id,
+            source_causal_tick=source_causal_tick,
+            target_causal_tick=target_causal_tick, commit_id=commit_id,
+        )
+
+
+def _reserve_checkpoint(body_id: str, episode_id: str) -> EmbodimentCheckpoint:
+    body = LivingBodyState(energy_reserve=1.2, max_energy=2.0)
+    return EmbodimentCheckpoint(body_id, episode_id, body, MetabolicLedger(body_state=body))
 
 
 def _frame() -> FrameDescriptor:
@@ -281,7 +296,15 @@ def _run(
             read_dependency=_committed_resolver(directory) if organism_v5 else None,
         ),
         ("embodiment", BODY_ID): _Contract(
-            BODY_ID, {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
+            BODY_ID, {
+                ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology),
+                EmbodimentCheckpoint.OWNER_SCHEMA: lambda data: EmbodimentCheckpoint.validate_checkpoint(
+                    data, BODY_ID, EmbodimentCheckpoint.OWNER_SCHEMA
+                ),
+                EmbodimentAdoptionBindingV1.OWNER_SCHEMA: lambda data: EmbodimentAdoptionBindingV1.validate_checkpoint(
+                    data, BODY_ID, EmbodimentAdoptionBindingV1.OWNER_SCHEMA
+                ),
+            },
         ),
         ("environment", ENVIRONMENT_OWNER_ID): _Contract(
             ENVIRONMENT_OWNER_ID, {StaticEnvironmentOwner.CHECKPOINT_SCHEMA: lambda data: StaticEnvironmentOwner.validate_checkpoint(
@@ -454,6 +477,7 @@ def _run(
         actuator_context=actuator_context,
         actuator_surface=surface,
         articulated_body=body,
+        reserve_checkpoint=_reserve_checkpoint(BODY_ID, EPISODE_ID),
         active_morphology=morphology,
         differential_binding=motor_binding,
         torque_binding=torque_binding,
@@ -505,6 +529,7 @@ def _run(
         next_body = result.physical_outcome.body_state
         next_environment = env_owner
         next_field = field
+        next_reserve_checkpoint = cycle_inputs.reserve_checkpoint
         assert next_world.causal_tick == result.committed_cut.causal_tick == 1
         assert next_body.checkpoint_bytes() == Path(
             next(
@@ -545,6 +570,7 @@ def _run(
         next_body = restored_runtime.articulated_body
         next_environment = restored_runtime.environment_owner
         next_field = restored_runtime.environment_field
+        next_reserve_checkpoint = restored_runtime.reserve_checkpoint
         assert next_world.causal_tick == result.committed_cut.causal_tick == 1
         assert next_body.checkpoint_bytes() == Path(
             next(ref.locator for ref in result.committed_cut.owner_checkpoint_references if ref.owner == "embodiment")
@@ -568,6 +594,7 @@ def _run(
         action_composer=next_composer,
         receptor=receptor,
         embodiment_state=next_body.root,
+        reserve_checkpoint=next_reserve_checkpoint,
         embodiment_geometry_revision="geometry.acceptance.sensorimotor-r1",
         environment_field=next_field,
         sampling_frame=frame,
@@ -618,7 +645,15 @@ def _restore_runtime_from_directory(
         ),
         ("embodiment", BODY_ID): _Contract(
             BODY_ID,
-            {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology)},
+            {
+                ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: _valid_body_checkpoint(data, morphology),
+                EmbodimentCheckpoint.OWNER_SCHEMA: lambda data: EmbodimentCheckpoint.validate_checkpoint(
+                    data, BODY_ID, EmbodimentCheckpoint.OWNER_SCHEMA
+                ),
+                EmbodimentAdoptionBindingV1.OWNER_SCHEMA: lambda data: EmbodimentAdoptionBindingV1.validate_checkpoint(
+                    data, BODY_ID, EmbodimentAdoptionBindingV1.OWNER_SCHEMA
+                ),
+            },
         ),
         ("environment", ENVIRONMENT_OWNER_ID): _Contract(
             ENVIRONMENT_OWNER_ID,
@@ -752,6 +787,10 @@ def _resume_in_fresh_process(
             actuator_context=actuator_context,
             actuator_surface=surface,
             articulated_body=restored.articulated_body,
+            reserve_checkpoint=_reserve_checkpoint(
+                restored.articulated_body.root.body_id,
+                restored.articulated_body.root.embodiment_episode_id,
+            ),
             active_morphology=morphology,
             differential_binding=motor_binding,
             torque_binding=torque_binding,
@@ -839,6 +878,126 @@ def test_committed_cycle_restores_and_continues_in_fresh_process(tmp_path: Path)
     assert fresh_process_result["cycle"] == uninterrupted_summary
     assert fresh_process_result["cycle"]["causal_tick"] == 2
     assert fresh_process_result["cycle"]["commit_id"] == "commit.acceptance.sensorimotor.tick-2"
+
+
+def test_adoption_binding_verifier_rejects_incomplete_corrupt_and_cross_cut_sets(
+    tmp_path: Path,
+) -> None:
+    result, _, no_resume, _ = _run(tmp_path / "binding-negative", stop_after_first=True)
+    assert no_resume is None
+    references = tuple(
+        reference for reference in result.committed_cut.owner_checkpoint_references
+        if reference.owner == "embodiment" and reference.owner_identity == BODY_ID
+    )
+    context = dict(
+        world_id=result.context.world_id,
+        source_causal_tick=result.context.source_causal_tick,
+        target_causal_tick=result.context.target_causal_tick,
+        commit_id=result.committed_cut.commit_id,
+    )
+    verify = EmbodimentAdoptionBindingV1.verify_checkpoint_set
+    assert verify(references, **context)
+
+    # Missing references (including an unbound historical cut) and duplicate
+    # references cannot be promoted to an adoption assertion.
+    for index in range(len(references)):
+        assert not verify(references[:index] + references[index + 1 :], **context)
+    binding_reference = next(
+        ref for ref in references if ref.schema_version == EmbodimentAdoptionBindingV1.OWNER_SCHEMA
+    )
+    assert not verify(references + (binding_reference,), **context)
+
+    # A valid-looking owner set still cannot be replayed under another World,
+    # transition tick, or commit identity.
+    for field, wrong in (
+        ("world_id", "world.other"),
+        ("source_causal_tick", context["source_causal_tick"] + 1),
+        ("target_causal_tick", context["target_causal_tick"] + 1),
+        ("commit_id", "commit.other"),
+    ):
+        assert not verify(references, **(context | {field: wrong}))
+
+    # Mix real persisted references from two distinct committed cuts of the
+    # same body. The second cut's binding must not authenticate the first
+    # cut's physical bytes, even when checked against the second cut context.
+    _, _, second_cut, _ = _run(
+        tmp_path / "binding-cross-cut", continue_from_live_state=True
+    )
+    assert second_cut is not None
+    second_references = tuple(
+        reference
+        for reference in second_cut.committed_cut.owner_checkpoint_references
+        if reference.owner == "embodiment" and reference.owner_identity == BODY_ID
+    )
+    physical_schema = next(
+        ref.schema_version
+        for ref in references
+        if ref.schema_version
+        not in (EmbodimentCheckpoint.OWNER_SCHEMA, EmbodimentAdoptionBindingV1.OWNER_SCHEMA)
+    )
+    first_physical = next(ref for ref in references if ref.schema_version == physical_schema)
+    mixed_cut_references = tuple(
+        first_physical if ref.schema_version == physical_schema else ref
+        for ref in second_references
+    )
+    assert not verify(
+        mixed_cut_references,
+        world_id=second_cut.context.world_id,
+        source_causal_tick=second_cut.context.source_causal_tick,
+        target_causal_tick=second_cut.context.target_causal_tick,
+        commit_id=second_cut.committed_cut.commit_id,
+    )
+
+    # Every persisted member is independently integrity checked.
+    for reference in references:
+        path = Path(reference.locator)
+        original = path.read_bytes()
+        path.write_bytes(original + b"corrupt")
+        assert not verify(references, **context)
+        path.write_bytes(original)
+
+    # Recompute a structurally valid binding with another episode; the owner
+    # digest is valid, but it cannot agree with the adopted physical/reserve state.
+    encoded_binding = Path(binding_reference.locator).read_bytes()
+    wrong_episode = replace(
+        EmbodimentAdoptionBindingV1.from_bytes(encoded_binding), episode_id="episode.other"
+    ).to_bytes()
+    wrong_binding_path = tmp_path / "wrong-episode-binding.json"
+    wrong_binding_path.write_bytes(wrong_episode)
+    wrong_binding_reference = replace(
+        binding_reference,
+        locator=str(wrong_binding_path),
+        sha256=hashlib.sha256(wrong_episode).hexdigest(),
+    )
+    wrong_episode_references = tuple(
+        wrong_binding_reference if ref == binding_reference else ref for ref in references
+    )
+    assert not verify(wrong_episode_references, **context)
+
+    # A caller cannot make mismatched identities look like one owner set by
+    # supplying the expected body id separately.
+    wrong_identity_references = tuple(
+        replace(ref, owner_identity="body.other") for ref in references
+    )
+    assert not verify(wrong_identity_references, **context)
+
+    # A binding from another morphology or physical step is rejected even if
+    # serialized canonically and its own digest is updated.
+    valid_binding = EmbodimentAdoptionBindingV1.from_bytes(encoded_binding)
+    for changes in ({"morphology_revision": "morphology.other"},
+                    {"physical_step_id": "physical-step.other"}):
+        changed_bytes = replace(valid_binding, **changes).to_bytes()
+        changed_path = tmp_path / f"wrong-{next(iter(changes))}.json"
+        changed_path.write_bytes(changed_bytes)
+        changed_reference = replace(
+            binding_reference,
+            locator=str(changed_path),
+            sha256=hashlib.sha256(changed_bytes).hexdigest(),
+        )
+        changed_references = tuple(
+            changed_reference if ref == binding_reference else ref for ref in references
+        )
+        assert not verify(changed_references, **context)
 
 
 def test_non_default_kernel_limits_restore_and_continue_fail_closed(tmp_path: Path) -> None:
@@ -1097,7 +1256,16 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
             "actuator.hinge.negative",
         }
         assert result.physical_outcome.body_state.joints[0].position_rad != 0.0
-        assert len(result.committed_cut.owner_checkpoint_references) == 4
+        assert len(result.committed_cut.owner_checkpoint_references) == 6
+        embodiment_references = tuple(
+            reference for reference in result.committed_cut.owner_checkpoint_references
+            if reference.owner == "embodiment" and reference.owner_identity == BODY_ID
+        )
+        assert {reference.schema_version for reference in embodiment_references} == {
+            ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA,
+            EmbodimentCheckpoint.OWNER_SCHEMA,
+            EmbodimentAdoptionBindingV1.OWNER_SCHEMA,
+        }
         organism_references = tuple(
             reference
             for reference in result.committed_cut.owner_checkpoint_references
@@ -1119,12 +1287,12 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
             result.observation_publication.delivery_sequences
         )
         assert len(observations) == 3
-        body_observation, field_observation, pose_observation = observations
+        body_observation, field_observation, reserve_observation = observations
         assert body_observation.claim.family.path == ("body_pose",)
         assert body_observation.context_time[0].value == result.committed_cut.causal_tick
         assert field_observation.claim.family.path == ("finite_scalar_field",)
         assert field_observation.context_time[-1].value == result.committed_cut.causal_tick
-        assert pose_observation.claim.family.path == ("render_link_pose",)
+        assert reserve_observation.claim.family.path == ("reserve_state_snapshot",)
         assert any(
             reference.owner == "embodiment"
             and reference.sha256
@@ -1166,10 +1334,10 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
         )) == (
             resumed.observation_publication.delivery_sequences
         )
-        body_observation, field_observation, pose_observation = observations
+        body_observation, field_observation, reserve_observation = observations
         assert body_observation.claim.family.path == ("body_pose",)
         assert field_observation.claim.family.path == ("finite_scalar_field",)
-        assert pose_observation.claim.family.path == ("render_link_pose",)
+        assert reserve_observation.claim.family.path == ("reserve_state_snapshot",)
         for observation in observations:
             assert any(
                 domain_time.domain.value == "world"
@@ -1208,11 +1376,11 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
 
     first_claims, second_claims = claims(first_messages), claims(second_messages)
     assert first_claims.keys() == second_claims.keys()
-    for family in ("embodiment.body_pose", "environment.finite_scalar_field", "embodiment.render_morphology", "environment.render_scene"):
+    for family in ("embodiment.body_pose", "environment.finite_scalar_field", "embodiment.reserve_state_snapshot", "embodiment.render_morphology", "environment.render_scene"):
         assert first_claims[family] == second_claims[family]
-    assert first_claims["embodiment.render_link_pose"]["candidate"] == second_claims[
-        "embodiment.render_link_pose"
-    ]["candidate"]
+    assert first_claims["embodiment.reserve_state_snapshot"] == second_claims[
+        "embodiment.reserve_state_snapshot"
+    ]
     assert first_resumed.committed_cut.commit_id == second_resumed.committed_cut.commit_id
     assert first_resumed.committed_cut.causal_tick == second_resumed.committed_cut.causal_tick == 2
     assert first_resumed.action_candidate.motor_command == second_resumed.action_candidate.motor_command
@@ -1221,9 +1389,9 @@ def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: 
     assert first_resumed_claims.keys() == second_resumed_claims.keys()
     for family in ("embodiment.body_pose", "environment.finite_scalar_field"):
         assert first_resumed_claims[family] == second_resumed_claims[family]
-    assert first_resumed_claims["embodiment.render_link_pose"]["candidate"] == second_resumed_claims[
-        "embodiment.render_link_pose"
-    ]["candidate"]
+    assert first_resumed_claims["embodiment.reserve_state_snapshot"] == second_resumed_claims[
+        "embodiment.reserve_state_snapshot"
+    ]
     assert first_resumed.physical_outcome.body_state.joints == pytest.approx(
         second_resumed.physical_outcome.body_state.joints
     )
@@ -1303,6 +1471,10 @@ def test_no_actuation_rejects_infeasible_zero_torque_without_committing(
     manifest = WorldCausalManifestStore(directory / "manifest.json").read()
     assert manifest.status is ManifestStatus.RECOVERY_REQUIRED
     assert manifest.causal_tick == 0
+    assert not any(
+        reference.schema_version == EmbodimentAdoptionBindingV1.OWNER_SCHEMA
+        for reference in manifest.checkpoint_references
+    )
 
 
 def test_articulated_solver_revalidates_no_actuation_at_physics_boundary(
@@ -1586,6 +1758,7 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
             host="127.0.0.1",
             port=0,
             allowed_origin="http://127.0.0.1:4173",
+            max_response_bytes=65536,
         ) as bridge:
             host, port = bridge.address
             request = urllib.request.Request(
@@ -1607,9 +1780,15 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
         assert first["schema"] == "biopeia.observation.current.v1"
         assert first["scope"] == "bounded_in_memory_current_subset"
         assert first["absence_semantics"] == "not_evidence_of_source_absence"
-        assert len(first["messages"]) == 5
+        assert len(first["messages"]) == 4
         assert [item["delivery_sequence"] for item in first["messages"]] == [
             message.sequence for message in retained_before
+            if f"{message.observation.claim.family.authority.value}."
+            f"{'.'.join(message.observation.claim.family.path)}"
+            in {
+                "embodiment.body_pose", "environment.finite_scalar_field",
+                "embodiment.render_morphology", "environment.render_scene",
+            }
         ]
         observations = [item["observation"] for item in first["messages"]]
         family_names = {
@@ -1620,15 +1799,20 @@ def test_committed_world_publications_are_readable_through_local_observation_bri
         assert family_names == {
             "embodiment.body_pose",
             "environment.finite_scalar_field",
-            "embodiment.render_link_pose",
             "embodiment.render_morphology",
             "environment.render_scene",
         }
         dynamic_observations = [observation for observation in observations if observation["context_time"]]
-        assert [item["delivery_sequence"] for item in first["messages"] if item["observation"]["context_time"]] == list(
-            publication.delivery_sequences
-        )
-        assert len(dynamic_observations) == 3
+        assert [item["delivery_sequence"] for item in first["messages"] if item["observation"]["context_time"]] == [
+            sequence for sequence, observation in zip(
+                publication.delivery_sequences,
+                (message.observation for message in retained_before if message.sequence in publication.delivery_sequences),
+            )
+            if observation.claim.family.qualified_name in {
+                "embodiment.body_pose", "environment.finite_scalar_field"
+            }
+        ]
+        assert len(dynamic_observations) == 2
         assert all(
             any(
                 item["domain"] == "world"

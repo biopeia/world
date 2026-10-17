@@ -59,13 +59,9 @@ def test_file_store_returns_exact_immutable_owner_checkpoint_reference(
     "payloads",
     [
         (),
-        (
-            OwnerCheckpointPayload("organism", "same", "v1", b"one"),
-            OwnerCheckpointPayload("organism", "same", "v2", b"two"),
-        ),
     ],
 )
-def test_file_store_rejects_empty_or_ambiguous_checkpoint_sets(tmp_path, payloads) -> None:
+def test_file_store_rejects_empty_checkpoint_sets(tmp_path, payloads) -> None:
     store = FileOwnerCheckpointStore(tmp_path)
     with pytest.raises(ValueError):
         store.write(_context(), payloads)
@@ -151,3 +147,16 @@ os._exit(74)
     assert reference.sha256 == digest
     assert Path(reference.locator) == target
     assert target.read_bytes() == encoded
+
+
+def test_file_store_preserves_multiple_schemas_for_contract_verified_owner(tmp_path: Path) -> None:
+    store = FileOwnerCheckpointStore(tmp_path)
+    payloads = (
+        OwnerCheckpointPayload("embodiment", "body-1", "physical-v1", b"physical"),
+        OwnerCheckpointPayload("embodiment", "body-1", "reserve-v1", b"reserve"),
+        OwnerCheckpointPayload("embodiment", "body-1", "binding-v1", b"binding"),
+    )
+    references = store.write(_context(), payloads)
+    assert tuple(reference.schema_version for reference in references) == tuple(
+        payload.schema_version for payload in payloads
+    )
