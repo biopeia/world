@@ -20,8 +20,8 @@ En respuesta a la revisión técnica sobre PR #188 ([World PR #188 comment](http
    - Se ejecutó TLC real (TLC2 Version 2026.10.15.145915, rev `932d35e` con OpenJDK 21) directamente contra `specs/WorldCommitRecovery.tla`.
    - Para `MaxTick = 2`: **205 estados generados, 142 estados distintos, profundidad 30, 0 violaciones de invariantes**.
    - Para `MaxTick = 3`: **477 estados generados, 330 estados distintos, profundidad 43, 0 violaciones de invariantes**.
-   - Se demostró la equivalencia exacta entre el explorador diferencial en Python (`specs/verify_model.py`) y la salida de TLC (exactamente 142 estados / 204 transiciones para `MaxTick=2`; 330 estados / 476 transiciones para `MaxTick=3`).
-   - Se integró la ejecución de TLC directamente en la suite de pruebas automatizadas (`tests/test_formal_model_verification.py::test_tlc_model_checker_execution`).
+   - Se comprobó la concordancia a nivel de conteo de estados y transiciones exploradas entre el explorador diferencial en Python (`specs/verify_model.py`) y la salida del comprobador formal TLC (exactamente 142 estados / 204 transiciones para `MaxTick=2`; 330 estados / 476 transiciones para `MaxTick=3`). Esta concordancia empírica sirve como comprobación cruzada acotada y rápida en entornos de desarrollo sin JVM, reconociendo explícitamente que la autoridad formal normativa reside en la especificación TLA+ (`specs/WorldCommitRecovery.tla`) verificada por TLC y no en una prueba formal de bisimulación matemática del código Python.
+   - Se integró la verificación con TLC con validación criptográfica estricta de digest de artefacto (`tests/test_formal_model_verification.py::test_tlc_model_checker_execution`), eliminando cualquier paso silencioso y requiriendo skip explícito o verificación exhaustiva.
 
 ---
 
