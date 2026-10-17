@@ -886,6 +886,37 @@ def test_adoption_binding_verifier_rejects_incomplete_corrupt_and_cross_cut_sets
     ):
         assert not verify(references, **(context | {field: wrong}))
 
+    # Mix real persisted references from two distinct committed cuts of the
+    # same body. The second cut's binding must not authenticate the first
+    # cut's physical bytes, even when checked against the second cut context.
+    _, _, second_cut, _ = _run(
+        tmp_path / "binding-cross-cut", continue_from_live_state=True
+    )
+    assert second_cut is not None
+    second_references = tuple(
+        reference
+        for reference in second_cut.committed_cut.owner_checkpoint_references
+        if reference.owner == "embodiment" and reference.owner_identity == BODY_ID
+    )
+    physical_schema = next(
+        ref.schema_version
+        for ref in references
+        if ref.schema_version
+        not in (EmbodimentCheckpoint.OWNER_SCHEMA, EmbodimentAdoptionBindingV1.OWNER_SCHEMA)
+    )
+    first_physical = next(ref for ref in references if ref.schema_version == physical_schema)
+    mixed_cut_references = tuple(
+        first_physical if ref.schema_version == physical_schema else ref
+        for ref in second_references
+    )
+    assert not verify(
+        mixed_cut_references,
+        world_id=second_cut.context.world_id,
+        source_causal_tick=second_cut.context.source_causal_tick,
+        target_causal_tick=second_cut.context.target_causal_tick,
+        commit_id=second_cut.committed_cut.commit_id,
+    )
+
     # Every persisted member is independently integrity checked.
     for reference in references:
         path = Path(reference.locator)
