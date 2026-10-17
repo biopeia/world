@@ -617,6 +617,8 @@ def _run(
 def _restore_runtime_from_directory(
     directory: Path,
     *,
+    expected_cut_tick: int = 1,
+    expected_physical_step_id: str | None = None,
     expected_field_revision: str = FIELD_REVISION,
     kernel_limits: KernelLimits | None = KernelLimits(),
     actuator_context: ActuatorEvidenceContext | None = None,
@@ -687,7 +689,10 @@ def _restore_runtime_from_directory(
         owner_checkpoint_contracts=contracts,
         active_morphology=morphology,
         expected_organism_id=str(ORGANISM_ID),
-        expected_physical_step_id="physical-step.acceptance.sensorimotor.tick-1",
+        expected_physical_step_id=(
+            expected_physical_step_id
+            or f"physical-step.acceptance.sensorimotor.tick-{expected_cut_tick}"
+        ),
         expected_environment_owner_id=ENVIRONMENT_OWNER_ID,
         expected_environment_id=ENVIRONMENT_ID,
         expected_environment_revision=ENVIRONMENT_REVISION,
@@ -697,13 +702,32 @@ def _restore_runtime_from_directory(
         actuator_context=current_actuator_context,
         actuator_surface=surface,
     )
+    if restored.committed_cut.causal_tick != expected_cut_tick:
+        raise ManifestError(
+            "restored committed World cut does not match the expected causal tick"
+        )
     return restored, morphology
 
 
-def _resume_in_fresh_process(directory: Path, output_path: Path, *, organism_v5: bool = False) -> None:
+def _resume_in_fresh_process(
+    directory: Path,
+    output_path: Path,
+    *,
+    organism_v5: bool = False,
+    expected_cut_tick: int = 1,
+    expected_physical_step_id: str | None = None,
+    kernel_limits: KernelLimits = KernelLimits(),
+    max_cycles: int = 1,
+) -> None:
     """Child-process entrypoint: restore and continue using World production APIs."""
     frame = _frame()
-    restored, morphology = _restore_runtime_from_directory(directory, organism_v5=organism_v5)
+    restored, morphology = _restore_runtime_from_directory(
+        directory,
+        organism_v5=organism_v5,
+        expected_cut_tick=expected_cut_tick,
+        expected_physical_step_id=expected_physical_step_id,
+        kernel_limits=kernel_limits,
+    )
     surface = ActuatorSurface.from_effector_ids(
         ("actuator.hinge.positive", "actuator.hinge.negative"),
         fingerprint_material=SURFACE_FINGERPRINT,
@@ -742,10 +766,11 @@ def _resume_in_fresh_process(directory: Path, output_path: Path, *, organism_v5:
         contact_policy="max-sliding-body-torsion-rolling/no-self-collision-v1",
     )
     plane = ObservationPlane()
+    resumes_same_session = expected_physical_step_id is not None
     session = run_scalar_sensorimotor_session(
         restored.world,
         plane,
-        run_id="acceptance-restored-run",
+        run_id="acceptance-run" if resumes_same_session else "acceptance-restored-run",
         source_revisions={"world": "test-commit"},
         cycle_inputs=ScalarSensorimotorCycleInputs(
             environment_revision=ENVIRONMENT_REVISION,
@@ -758,7 +783,7 @@ def _resume_in_fresh_process(directory: Path, output_path: Path, *, organism_v5:
             sampling_frame=frame,
             transduction=DimensionlessScalarFieldIdentityV1(),
             sense_binding=SenseChannelBinding(CHANNEL_ID, RECEPTOR_ID, "opaque.scalar.signal"),
-            kernel_limits=KernelLimits(),
+            kernel_limits=kernel_limits,
             actuator_context=actuator_context,
             actuator_surface=surface,
             articulated_body=restored.articulated_body,
@@ -773,16 +798,22 @@ def _resume_in_fresh_process(directory: Path, output_path: Path, *, organism_v5:
             owner_checkpoint_store=FileOwnerCheckpointStore(directory / "owners" / "committed"),
             embodiment_geometry_revision="geometry.acceptance.sensorimotor-r1",
         ),
-        max_cycles=1,
-        commit_id_prefix="commit.acceptance.sensorimotor.tick-",
-        physical_step_id_prefix="physical-step.acceptance.sensorimotor.tick-",
+        max_cycles=max_cycles,
+        commit_id_prefix=(None if resumes_same_session else "commit.acceptance.sensorimotor.tick-"),
+        physical_step_id_prefix=(
+            None if resumes_same_session else "physical-step.acceptance.sensorimotor.tick-"
+        ),
     )
     assert session.status is ScalarSensorimotorSessionStatus.COMPLETED
-    cycle = session.cycles[0]
+    cycles = session.cycles
     messages = plane.current_messages()
     output_path.write_text(
         json.dumps(
-            {"process_id": os.getpid(), "cycle": _summary(cycle, messages)},
+            {
+                "process_id": os.getpid(),
+                "cycle": _summary(cycles[0], messages),
+                "cycles": [_summary(cycle, messages) for cycle in cycles],
+            },
             sort_keys=True,
         )
     )
@@ -1179,9 +1210,23 @@ def _valid_body_checkpoint(data: bytes, morphology: ActiveArticulatedMorphology)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4 or sys.argv[1] not in ("--resume", "--resume-v5"):
-        raise SystemExit("usage: test_end_to_end_causal_cycle_acceptance.py --resume|--resume-v5 DIR OUTPUT")
-    _resume_in_fresh_process(Path(sys.argv[2]), Path(sys.argv[3]), organism_v5=sys.argv[1] == "--resume-v5")
+    if len(sys.argv) not in (4, 5, 6, 7, 8) or sys.argv[1] not in ("--resume", "--resume-v5", "--resume-v5-at"):
+        raise SystemExit(
+            "usage: test_end_to_end_causal_cycle_acceptance.py "
+            "--resume|--resume-v5|--resume-v5-at DIR OUTPUT [CUT_TICK [PHYSICAL_STEP_ID [CONSOLIDATION_INTERVAL_TICKS [MAX_CYCLES]]]]"
+        )
+    _resume_in_fresh_process(
+        Path(sys.argv[2]), Path(sys.argv[3]),
+        organism_v5=sys.argv[1] in ("--resume-v5", "--resume-v5-at"),
+        expected_cut_tick=int(sys.argv[4]) if len(sys.argv) >= 5 else 1,
+        expected_physical_step_id=sys.argv[5] if len(sys.argv) >= 6 else None,
+        kernel_limits=(
+            replace(KernelLimits(), consolidation_interval_ticks=int(sys.argv[6]))
+            if len(sys.argv) >= 7
+            else KernelLimits()
+        ),
+        max_cycles=int(sys.argv[7]) if len(sys.argv) == 8 else 1,
+    )
 
 
 def test_real_target_sensorimotor_cycle_commits_publishes_and_repeats(tmp_path: Path) -> None:
@@ -1909,6 +1954,104 @@ def test_m3_compact_checkpoint_restores_and_continues_in_fresh_process(tmp_path:
     expected = json.loads(json.dumps(_summary(uninterrupted_next, uninterrupted_messages), sort_keys=True))
     assert fresh["process_id"] != os.getpid()
     assert fresh["cycle"] == expected
+
+
+def test_m3_compact_checkpoint_restores_midrun_and_matches_fresh_process_continuation(
+    tmp_path: Path,
+) -> None:
+    """A committed v5 cut resumes equivalently in a child with non-default limits."""
+    configured_limits = replace(KernelLimits(), consolidation_interval_ticks=31)
+    uninterrupted_cycles: list[CausalCycleResult] = []
+    _run(
+        tmp_path / "uninterrupted-midrun",
+        use_session=True,
+        session_cycles=8,
+        on_cycle_result=uninterrupted_cycles.append,
+        organism_v5=True,
+        kernel_limits=configured_limits,
+    )
+    assert [cycle.committed_cut.causal_tick for cycle in uninterrupted_cycles] == list(range(1, 9))
+
+    persisted_cycles: list[CausalCycleResult] = []
+    _run(
+        tmp_path / "midrun-checkpoint",
+        use_session=True,
+        session_cycles=8,
+        session_stop_after=4,
+        on_cycle_result=persisted_cycles.append,
+        organism_v5=True,
+        kernel_limits=configured_limits,
+    )
+    assert [cycle.committed_cut.causal_tick for cycle in persisted_cycles] == [1, 2, 3, 4]
+    persisted_cut = persisted_cycles[-1].committed_cut
+    assert persisted_cut.causal_tick == 4
+    assert _organism_ref(persisted_cycles[-1]).schema_version == ORGANISM_EXPLORATION_CHECKPOINT_V5_SCHEMA
+
+    restored_at_cut, _ = _restore_runtime_from_directory(
+        tmp_path / "midrun-checkpoint",
+        expected_cut_tick=4,
+        expected_physical_step_id="acceptance-run:physical-step:4",
+        kernel_limits=configured_limits,
+        organism_v5=True,
+    )
+    assert restored_at_cut.committed_cut.causal_tick == 4
+    assert restored_at_cut.committed_cut.commit_id == persisted_cut.commit_id
+
+    with pytest.raises(ManifestError):
+        _restore_runtime_from_directory(
+            tmp_path / "midrun-checkpoint",
+            expected_cut_tick=4,
+            expected_physical_step_id="acceptance-run:physical-step:3",
+            organism_v5=True,
+        )
+    with pytest.raises(ManifestError):
+        _restore_runtime_from_directory(
+            tmp_path / "midrun-checkpoint",
+            expected_cut_tick=4,
+            expected_physical_step_id="acceptance-run:physical-step:4",
+            kernel_limits=replace(configured_limits, consolidation_interval_ticks=32),
+            organism_v5=True,
+        )
+    # A rejected restore is read-only: the same committed cut remains restorable.
+    restored_after_rejection, _ = _restore_runtime_from_directory(
+        tmp_path / "midrun-checkpoint",
+        expected_cut_tick=4,
+        expected_physical_step_id="acceptance-run:physical-step:4",
+        kernel_limits=configured_limits,
+        organism_v5=True,
+    )
+    assert restored_after_rejection.committed_cut.commit_id == persisted_cut.commit_id
+
+    output_path = tmp_path / "midrun-child-result.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--resume-v5-at",
+            str(tmp_path / "midrun-checkpoint"),
+            str(output_path),
+            "4",
+            "acceptance-run:physical-step:4",
+            "31",
+            "4",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, (
+        f"midrun fresh-process restore failed ({completed.returncode})\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    resumed = json.loads(output_path.read_text())
+    expected = [
+        json.loads(json.dumps(_summary(cycle, ()), sort_keys=True))
+        for cycle in uninterrupted_cycles[4:8]
+    ]
+    assert resumed["process_id"] != os.getpid()
+    assert resumed["cycles"] == expected
+    assert [cycle["causal_tick"] for cycle in resumed["cycles"]] == [5, 6, 7, 8]
 
 
 def test_m3_restore_refuses_missing_organism_history(tmp_path: Path) -> None:
