@@ -1,14 +1,31 @@
-# World V-03: Mapeo Formal del Protocolo de Commit y Recuperación
+# World V-03: Mapeo Formal del Protocolo de Commit y Recuperación y Evidencia TLC
 
-**Especificación TLA+:** `specs/WorldCommitRecovery.tla`  
-**Configuración:** `specs/WorldCommitRecovery.cfg`  
-**Implementación Python:** `src/world/manifest.py`, `src/world/durable_runtime.py`, `src/world/owner_checkpoint_store.py`  
-**Suite de pruebas:** `tests/test_systematic_fault_injection.py`  
+**Especificación TLA+:** `specs/WorldCommitRecovery.tla`
+**Configuración TLC:** `specs/WorldCommitRecovery.cfg`
+**Script ejecutor TLC:** `specs/run_tlc.sh`
+**Implementación Python:** `src/world/manifest.py`, `src/world/durable_runtime.py`, `src/world/owner_checkpoint_store.py`
+**Suite de pruebas:** `tests/test_systematic_fault_injection.py`, `tests/test_formal_model_verification.py`
 **Autoridades normativas:** ADR-0083 (Single-Writer Durability), ADR-0093 (Fail-Closed Recovery), Docs #234, #236.
 
 ---
 
-## 1. Correspondencia de Variables de Estado
+## 1. Resolución de Hallazgos de Revisión (Rework V-03)
+
+En respuesta a la revisión técnica sobre PR #188 ([World PR #188 comment](https://github.com/biopeia/world/pull/188#issuecomment-6232950702)):
+
+1. **Corrección de la configuración TLA+ (Hallazgo F2):**
+   - Se corrigió `specs/WorldCommitRecovery.cfg` para sustituir `SPECIFICATION Init` por la fórmula temporal válida `SPECIFICATION Spec` (`Spec == Init /\ [][Next]_vars`), incorporando `CHECK_DEADLOCK FALSE` para permitir el límite finito `MaxTick`.
+   - Se tiparon fuertemente los estados del manifiesto temporal (`temp_manifest_status \in {"NONE", "PREPARING", "COMMITTED"}`) para eliminar comparaciones de registros con valores escalares en el motor semántico de TLC.
+2. **Ejecución real y comprobada con TLC (Hallazgo F1):**
+   - Se ejecutó TLC real (TLC2 Version 2026.10.15.145915, rev `932d35e` con OpenJDK 21) directamente contra `specs/WorldCommitRecovery.tla`.
+   - Para `MaxTick = 2`: **205 estados generados, 142 estados distintos, profundidad 30, 0 violaciones de invariantes**.
+   - Para `MaxTick = 3`: **477 estados generados, 330 estados distintos, profundidad 43, 0 violaciones de invariantes**.
+   - Se demostró la equivalencia exacta entre el explorador diferencial en Python (`specs/verify_model.py`) y la salida de TLC (exactamente 142 estados / 204 transiciones para `MaxTick=2`; 330 estados / 476 transiciones para `MaxTick=3`).
+   - Se integró la ejecución de TLC directamente en la suite de pruebas automatizadas (`tests/test_formal_model_verification.py::test_tlc_model_checker_execution`).
+
+---
+
+## 2. Correspondencia de Variables de Estado
 
 | Variable TLA+ | Tipo formal | Equivalente en código Python / Sistema de archivos |
 |---|---|---|
@@ -16,8 +33,8 @@
 | `manifest_tick` | `Nat` | `WorldCausalManifest.causal_tick` (entero no negativo en `manifest.py:46`). Representa el último corte causal confirmado. |
 | `manifest_pending_tick` | `Nat` | `WorldCausalManifest.pending_tick` (entero o `None` en `manifest.py:58`). Solo presente durante `PREPARING` o `RECOVERY_REQUIRED`. |
 | `manifest_refs` | `Set(CheckpointReference)` | `WorldCausalManifest.checkpoint_references` (tupla inmutable de referencias en `manifest.py:48`). |
-| `temp_manifest` | `Record \/ NULL` | Archivo temporal `.manifest.json.XXXXXX` creado por `tempfile.mkstemp` en `WorldCausalManifestStore._write` (`manifest.py:492`). Desaparece tras `os.replace` o tras caída del proceso. |
-| `journal_committed_len` | `Nat` | Longitud en bytes / registros confirmados apuntada por la referencia `CheckpointReference` con dueño `world-journal` (`durable_runtime.py:597`). |
+| `temp_manifest_status` | `{"NONE", "PREPARING", "COMMITTED"}` | Presencia de archivo temporal `.manifest.json.XXXXXX` creado por `tempfile.mkstemp` en `WorldCausalManifestStore._write` (`manifest.py:492`). Desaparece tras `os.replace` o tras caída del proceso. |
+| `journal_committed_len` | `Nat` | Longitud en registros confirmados apuntada por la referencia `CheckpointReference` con dueño `world-journal` (`durable_runtime.py:597`). |
 | `journal_file_len` | `Nat` | Tamaño real del archivo `world-causal-journal-v3.jsonl` en disco. Puede exceder a `journal_committed_len` si un proceso murió tras escribir bytes no confirmados. |
 | `owner_blobs` | `Set(Blob)` | Archivos inmutables direccionados por contenido en el directorio del almacén de checkpoints (`xx/<sha256>.blob` en `FileOwnerCheckpointStore`, `owner_checkpoint_store.py:83-140`). |
 | `recovery_receipts` | `Set(Receipt)` | Archivos JSON inmutables en `recoveries/receipt-<world>-<transition>-<tick>.json` generados por `WorldCausalManifestStore._complete_recovery_locked` (`manifest.py:458-477`). |
@@ -25,7 +42,7 @@
 
 ---
 
-## 2. Correspondencia de Acciones Abstractas a Operaciones Concretas
+## 3. Correspondencia de Acciones Abstractas a Operaciones Concretas
 
 | Acción TLA+ | Código Python invocado | Efectos concretos en disco / llamada atómica |
 |---|---|---|
@@ -43,7 +60,35 @@
 
 ---
 
-## 3. Demostración y Verificación de Invariantes
+## 4. Evidencia TLC y Reproducción
+
+### Comando de ejecución reproducible
+```bash
+# Mediante el script oficial del repositorio:
+./specs/run_tlc.sh
+
+# O invocando directamente la JVM con tla2tools:
+java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers 1 specs/WorldCommitRecovery.tla
+```
+
+### Transcripción de salida de TLC
+```text
+TLC2 Version 2026.10.15.145915 (rev: 932d35e)
+Running breadth-first search Model-Checking with fp 15 and seed 8537363786278514981 with 1 worker on 8 cores...
+Parsing file specs/WorldCommitRecovery.tla
+Semantic processing of module WorldCommitRecovery
+Starting... (2026-10-17 12:46:03)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated.
+Model checking completed. No error has been found.
+205 states generated, 142 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 30.
+Finished in 00s at (2026-10-17 12:46:03)
+```
+
+---
+
+## 5. Demostración y Verificación de Invariantes
 
 La correspondencia entre las invariantes formales del modelo y las suites de pruebas es biunívoca:
 
