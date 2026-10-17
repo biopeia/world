@@ -16,6 +16,7 @@ from .m1_profile import construct_fresh_runtime, load_operator_profile
 
 PROTOCOL_VERSION = 1
 MAX_CYCLES = 10_000
+MAX_ARCHIVE_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 
 def verified_revisions() -> dict[str, str]:
@@ -117,9 +118,19 @@ def main(argv: list[str] | None = None) -> int:
         default="v4",
         help="Organism checkpoint schema version: 'v4' (default) or 'v5' (compact with action-history dependencies)",
     )
+    parser.add_argument(
+        "--archive-observations", action="store_true",
+        help="enable passive local observation archive capture",
+    )
+    parser.add_argument(
+        "--archive-max-payload-bytes", type=int, default=MAX_ARCHIVE_MAX_PAYLOAD_BYTES,
+        help="maximum per-observation payload bytes",
+    )
     args = parser.parse_args(argv)
     if args.cycles is not None and not 1 <= args.cycles <= MAX_CYCLES:
         parser.error(f"--cycles must be between 1 and {MAX_CYCLES}")
+    if not 1 <= args.archive_max_payload_bytes <= MAX_ARCHIVE_MAX_PAYLOAD_BYTES:
+        parser.error(f"--archive-max-payload-bytes must be between 1 and {MAX_ARCHIVE_MAX_PAYLOAD_BYTES}")
 
     run_id = str(uuid.uuid4())
     world_id: str | None = None
@@ -157,11 +168,50 @@ def main(argv: list[str] | None = None) -> int:
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
     runtime = None
+    archive_capture = None
+    archive_shutdown_error: str | None = None
+    archive_path = state_root / "observations.sqlite"
+
+    def archive_summary() -> dict[str, object] | None:
+        if archive_capture is None:
+            return None
+        status = archive_capture.status()
+        return {
+            "path": "observations.sqlite",
+            "capture_id": archive_capture.capture_id,
+            "source_sequence_kind": "observation_plane_delivery_not_world_causal_tick",
+            "last_plane_sequence": status.last_plane_sequence,
+            "gap_sequence": status.gap_sequence,
+            "gap_reason": status.gap_reason,
+            "error": status.error,
+            "shutdown_error": archive_shutdown_error,
+        }
+
+    def stop_archive_capture() -> None:
+        nonlocal archive_shutdown_error
+        if archive_capture is not None:
+            try:
+                archive_capture.stop()
+            except Exception as exc:
+                # Archive teardown is diagnostic only; never rewrite a
+                # committed World outcome as failed because local capture
+                # could not shut down cleanly.
+                archive_shutdown_error = f"{type(exc).__name__}: {exc}"
+
     try:
         runtime = construct_fresh_runtime(
             profile, profile_sha256, state_root, source_revisions, observation_port=0,
             organism_checkpoint=args.organism_checkpoint,
         )
+        if args.archive_observations:
+            from observation import LocalObservationArchiveCapture
+
+            archive_capture = LocalObservationArchiveCapture(
+                runtime.observation_plane,
+                archive_path,
+                max_payload_bytes=args.archive_max_payload_bytes,
+            )
+            archive_capture.start()
         runtime.observation_bridge.start()
         bridge_host, bridge_port = runtime.observation_bridge.address
         emit(
@@ -204,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         cut = result.last_committed_cut
         event = result.status.value
+        stop_archive_capture()
         emit(
             event, world_id, run_id, source_revisions,
             tick=cut.causal_tick if cut else None,
@@ -212,10 +263,15 @@ def main(argv: list[str] | None = None) -> int:
             error=result.error,
             publication_uncertain=result.publication_delivery_status_uncertain,
             completed_cycle_count=result.completed_cycle_count,
+            **({"observation_archive": archive_summary()} if archive_capture is not None else {}),
         )
         return 1 if event == "failed" else 0
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        try:
+            stop_archive_capture()
+        except Exception as stop_exc:
+            print(f"Observation archive shutdown: {type(stop_exc).__name__}: {stop_exc}", file=sys.stderr)
         tick = commit_id = None
         try:
             if runtime is not None:
@@ -236,10 +292,15 @@ def main(argv: list[str] | None = None) -> int:
             "failed", world_id, run_id, source_revisions,
             tick=tick, commit_id=commit_id, outcome="recovery_required",
             profile_id=profile_id, profile_sha256=profile_sha256, error=str(exc),
+            **({"observation_archive": archive_summary()} if archive_capture is not None else {}),
         )
         return 1
     finally:
         try:
+            try:
+                stop_archive_capture()
+            except Exception:
+                pass
             if runtime is not None:
                 try:
                     runtime.observation_bridge.close()

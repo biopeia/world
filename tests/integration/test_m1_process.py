@@ -304,3 +304,59 @@ def test_invalid_organism_checkpoint_fails_preflight(tmp_path: Path) -> None:
     )
     assert result.returncode == 2
     assert not state.exists()
+
+
+def test_opt_in_observation_archive_captures_only_deliveries_during_run(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    result = subprocess.run(
+        [sys.executable, "-m", "world.m1_process", "--profile", str(PROFILE),
+         "--state-root", str(state), "--cycles", "2", "--archive-observations"],
+        cwd=Path(__file__).parents[2], capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    records = _records(result.stdout)
+    commits = [record for record in records if record["event"] == "cycle_committed"]
+    terminal = next(record for record in records if record["event"] == "completed")
+    assert len(commits) == 2
+    assert terminal["last_verified_committed_tick"] == 2
+    capture = terminal["observation_archive"]
+    assert capture["path"] == "observations.sqlite"
+    assert capture["source_sequence_kind"] == "observation_plane_delivery_not_world_causal_tick"
+    assert capture["error"] is None
+    assert capture["gap_sequence"] is None
+    assert (state / capture["path"]).is_file()
+
+    from observation import SQLiteObservationArchive
+
+    with SQLiteObservationArchive(state / capture["path"], max_payload_bytes=64 * 1024 * 1024) as archive:
+        status = archive.status()
+        captured = archive.query(limit=100)
+    # The plane archives accepted publications, not a synthetic snapshot per
+    # World cut; unchanged owner claims need not be republished every cycle.
+    assert 0 < status.record_count <= 10
+    assert len({record.capture_id for record in captured}) == 1
+    assert all(record.source_sequence is not None for record in captured)
+    assert {record.observation.family.qualified_name for record in captured} <= {
+        "embodiment.body_pose",
+        "environment.finite_scalar_field",
+        "environment.render_scene",
+        "embodiment.render_morphology",
+        "embodiment.render_link_pose",
+    }
+
+
+def test_archive_capacity_gap_does_not_fail_world_or_uncommit_cycles(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    result = subprocess.run(
+        [sys.executable, "-m", "world.m1_process", "--profile", str(PROFILE),
+         "--state-root", str(state), "--cycles", "2", "--archive-observations",
+         "--archive-max-payload-bytes", "1"],
+        cwd=Path(__file__).parents[2], capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    records = _records(result.stdout)
+    assert len([record for record in records if record["event"] == "cycle_committed"]) == 2
+    terminal = next(record for record in records if record["event"] == "completed")
+    assert terminal["last_verified_committed_tick"] == 2
+    capture = terminal["observation_archive"]
+    assert capture["gap_reason"] == "archive_capacity_reached"

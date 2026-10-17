@@ -207,7 +207,7 @@ wheels = [
 [[package]]
 name = "observation"
 version = "0.1.0"
-source = { git = "https://github.com/biopeia/observation.git?rev=main#2c506900aa5ad0864eef7f0ce0ed70d7e8e4ea07" }
+source = { git = "https://github.com/biopeia/observation.git?rev=main#14bfce4ef1b7b3ac39358606f42db18683fcfc9e" }
 dependencies = [
     { name = "rfc8785" },
 ]
