@@ -426,8 +426,6 @@ class DurableJournalSnapshotStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         target = self.directory / "world-causal-journal-v3.jsonl"
         if previous_reference is None:
-            if target.exists():
-                raise ManifestError("World journal already exists without its committed reference")
             previous_count = 0
             previous_offset = 0
             previous_digest = ""
@@ -476,22 +474,37 @@ class DurableJournalSnapshotStore:
             digest = hashlib.sha256(b"").hexdigest() if not record_count else journal.prefix_digest()
         encoded_delta = prefix + b"".join(appended)
         if previous_reference is None:
-            fd, temporary_name = tempfile.mkstemp(prefix=".journal-", dir=self.directory)
-            try:
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(encoded_delta)
-                    stream.flush()
+            if target.exists():
+                # Initialization may be retried after process termination
+                # between publishing the first journal and publishing its
+                # manifest. Reuse only the exact genesis bytes being proposed;
+                # any partial, altered, or unrelated file remains a hard error.
+                try:
+                    existing = target.read_bytes()
+                except OSError as exc:
+                    raise ManifestError("World journal exists but cannot be verified for initialization") from exc
+                if existing != encoded_delta:
+                    raise ManifestError("World journal already exists without its committed reference")
+                with target.open("rb") as stream:
                     os.fsync(stream.fileno())
-                try:
-                    os.link(temporary_name, target)
-                except FileExistsError as exc:
-                    raise ManifestError("World journal was concurrently initialized") from exc
                 _fsync_directory(self.directory)
-            finally:
+            else:
+                fd, temporary_name = tempfile.mkstemp(prefix=".journal-", dir=self.directory)
                 try:
-                    os.unlink(temporary_name)
-                except FileNotFoundError:
-                    pass
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(encoded_delta)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    try:
+                        os.link(temporary_name, target)
+                    except FileExistsError as exc:
+                        raise ManifestError("World journal was concurrently initialized") from exc
+                    _fsync_directory(self.directory)
+                finally:
+                    try:
+                        os.unlink(temporary_name)
+                    except FileNotFoundError:
+                        pass
             previous_offset = 0
         else:
             with target.open("r+b") as stream:
