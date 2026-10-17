@@ -129,9 +129,9 @@ class WorldCausalManifest:
             if not self.pending_transition_id or self.pending_tick != self.causal_tick + 1:
                 raise ValueError("pending manifest must identify the next causal tick")
         refs = tuple(self.checkpoint_references)
-        keys = [(ref.owner, ref.owner_identity) for ref in refs]
+        keys = [(ref.owner, ref.owner_identity, ref.schema_version) for ref in refs]
         if len(keys) != len(set(keys)):
-            raise ValueError("manifest cannot contain duplicate owner identity references")
+            raise ValueError("manifest cannot contain duplicate owner identity/schema references")
         registered = tuple(tuple(pair) for pair in self.registered_owner_ids)
         presence_links = tuple(tuple(link) for link in self.presence_owner_links)
         step = tuple(tuple(pair) for pair in self.step_participant_ids)
