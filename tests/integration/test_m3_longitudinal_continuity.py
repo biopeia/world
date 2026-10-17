@@ -45,7 +45,13 @@ def _restore(directory: Path, physical_step_id: str):
 
     acc.restore_scalar_sensorimotor_runtime = restore
     try:
-        return acc._restore_runtime_from_directory(directory, organism_v5=True)
+        # Restore validation is bound to the actual committed interruption cut,
+        # not the helper's single-cycle default.
+        return acc._restore_runtime_from_directory(
+            directory,
+            expected_cut_tick=int(physical_step_id.rsplit(":", 1)[-1]),
+            organism_v5=True,
+        )
     finally:
         acc.restore_scalar_sensorimotor_runtime = original
 
