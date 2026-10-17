@@ -71,12 +71,10 @@ def _causal_cut_record(
     owner_references = tuple(
         sorted(
             (ref for ref in references if ref.owner != _JOURNAL_OWNER),
-            key=lambda ref: (ref.owner, ref.owner_identity),
+            key=lambda ref: (ref.owner, ref.owner_identity, ref.schema_version, ref.checkpoint_id),
         )
     )
-    participants = tuple(sorted((ref.owner, ref.owner_identity) for ref in owner_references))
-    if len(participants) != len(set(participants)):
-        raise ManifestError("causal-cut checkpoint references contain duplicate participants")
+    participants = tuple(sorted({(ref.owner, ref.owner_identity) for ref in owner_references}))
     return CausalRecord(
         record_id=f"{world_id}:causal-cut:{causal_tick}",
         world_id=world_id,
@@ -127,6 +125,7 @@ def _validate_causal_cut_record(record: CausalRecord) -> None:
         "owner_id", "owner_identity", "checkpoint_id", "schema_version", "locator", "sha256"
     }
     normalized_references: list[tuple[str, str]] = []
+    normalized_reference_keys: list[tuple[str, str, str, str]] = []
     dependency_fields = {"dependency_sha256", "dependency_parent"}
     for reference in references:
         if not isinstance(reference, Mapping) or set(reference) not in (
@@ -151,9 +150,11 @@ def _validate_causal_cut_record(record: CausalRecord) -> None:
         except ValueError as exc:
             raise ManifestError("persisted causal-cut record has an invalid checkpoint reference") from exc
         normalized_references.append((values[0], values[1]))
+        normalized_reference_keys.append((values[0], values[1], values[3], values[2]))
     if (
-        normalized_references != sorted(set(normalized_references))
-        or tuple(normalized_references) != tuple(normalized_participants)
+        normalized_reference_keys != sorted(set(normalized_reference_keys))
+        or normalized_references != sorted(normalized_references)
+        or tuple(sorted(set(normalized_references))) != tuple(normalized_participants)
     ):
         raise ManifestError("causal-cut participants and checkpoint references do not match exactly")
 
@@ -745,6 +746,26 @@ class OwnerCheckpointContract(Protocol):
 
     def verify_restoration(self, reference: CheckpointReference) -> bool: ...
 
+    def verify_checkpoint_set(
+        self,
+        references: tuple[CheckpointReference, ...],
+        *,
+        world_id: str,
+        source_causal_tick: int,
+        target_causal_tick: int,
+        commit_id: str,
+    ) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerCheckpointSetContext:
+    """World-authored transition identity supplied to owner set validators."""
+
+    world_id: str
+    source_causal_tick: int
+    target_causal_tick: int
+    commit_id: str
+
 
 class DurableWorldRuntime:
     """Publish each World tick only after its journal and owner refs are durable.
@@ -845,6 +866,12 @@ class DurableWorldRuntime:
         references = (*owner_references, journal_reference)
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("initial causal cut checkpoint dependency closure is not verified")
+        if not cls._verify_owner_checkpoint_sets(
+            owner_references,
+            contracts,
+            OwnerCheckpointSetContext(world_id.value, 0, 0, genesis_commit_id),
+        ):
+            raise ManifestError("initial owner checkpoint set validation failed")
         manifest = WorldCausalManifest(
             world_id=world_id.value,
             causal_tick=0,
@@ -904,6 +931,17 @@ class DurableWorldRuntime:
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("causal cut checkpoint dependency closure is not verified")
         owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
+        if not cls._verify_owner_checkpoint_sets(
+            owner_references,
+            contracts,
+            OwnerCheckpointSetContext(
+                manifest.world_id,
+                max(0, manifest.causal_tick - 1),
+                manifest.causal_tick,
+                manifest.commit_id,
+            ),
+        ):
+            raise ManifestError("owner checkpoint set validation failed during restore")
         owner_checkpoint_restorer(owner_references)
         if not cls._validate_owner_checkpoints(
             owner_references,
@@ -913,6 +951,17 @@ class DurableWorldRuntime:
             raise ManifestError("owner restoration validation failed for one or more checkpoint references")
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("causal cut checkpoint dependency closure changed during restore")
+        if not cls._verify_owner_checkpoint_sets(
+            owner_references,
+            contracts,
+            OwnerCheckpointSetContext(
+                manifest.world_id,
+                max(0, manifest.causal_tick - 1),
+                manifest.causal_tick,
+                manifest.commit_id,
+            ),
+        ):
+            raise ManifestError("owner checkpoint set changed during restore")
         return cls(
             world_id,
             presence_id,
@@ -972,11 +1021,33 @@ class DurableWorldRuntime:
             raise ManifestError("previous causal cut dependency closure is not verified")
 
         owner_references = tuple(ref for ref in references if ref.owner != _JOURNAL_OWNER)
+        if not cls._verify_owner_checkpoint_sets(
+            owner_references,
+            contracts,
+            OwnerCheckpointSetContext(
+                pending.world_id,
+                max(0, pending.causal_tick - 1),
+                pending.causal_tick,
+                pending.commit_id,
+            ),
+        ):
+            raise ManifestError("previous owner checkpoint set validation failed during recovery")
         owner_checkpoint_restorer(owner_references)
         if not cls._validate_owner_checkpoints(owner_references, contracts, method="verify_restoration"):
             raise ManifestError("owner restoration validation failed for one or more checkpoint references")
         if not cls._verify_references(references, owner_checkpoint_verifier, contracts):
             raise ManifestError("previous causal cut dependency closure changed during recovery")
+        if not cls._verify_owner_checkpoint_sets(
+            owner_references,
+            contracts,
+            OwnerCheckpointSetContext(
+                pending.world_id,
+                max(0, pending.causal_tick - 1),
+                pending.causal_tick,
+                pending.commit_id,
+            ),
+        ):
+            raise ManifestError("previous owner checkpoint set changed during recovery")
 
         # Finalization and tail cleanup are serialized under the manifest
         # writer lock. A stale concurrent recovery must not truncate journal
@@ -1505,6 +1576,16 @@ class DurableWorldRuntime:
                     raise ManifestError("transition lacks an owner recoverability contract for every participant")
                 if not self._validate_owner_checkpoints(owner_references, proposed_contracts):
                     raise ManifestError("owner checkpoint validation failed for one or more checkpoint references")
+                checkpoint_set_context = OwnerCheckpointSetContext(
+                    self.world_id.value,
+                    current.causal_tick,
+                    proposed_tick,
+                    transition_id,
+                )
+                if not self._verify_owner_checkpoint_sets(
+                    owner_references, proposed_contracts, checkpoint_set_context
+                ):
+                    raise ManifestError("owner checkpoint set validation failed")
                 self._verify_dependency_declarations(
                     owner_references, self._dependency_heads(current), proposed_contracts
                 )
@@ -1644,11 +1725,18 @@ class DurableWorldRuntime:
                 )
                 self._manifest_store._commit_transition(
                     candidate,
-                    dependency_verifier=lambda refs: self._verify_references(
-                        refs,
-                        self._owner_checkpoint_verifier,
-                        proposed_contracts,
-                        journal_verifier=self._journal_store.verify_cached,
+                    dependency_verifier=lambda refs: (
+                        self._verify_references(
+                            refs,
+                            self._owner_checkpoint_verifier,
+                            proposed_contracts,
+                            journal_verifier=self._journal_store.verify_cached,
+                        )
+                        and self._verify_owner_checkpoint_sets(
+                            tuple(ref for ref in refs if ref.owner != _JOURNAL_OWNER),
+                            proposed_contracts,
+                            checkpoint_set_context,
+                        )
                     ),
                 )
                 self._journal = candidate_journal.commit()
@@ -1717,6 +1805,42 @@ class DurableWorldRuntime:
         return bool(owner_checkpoint_verifier(owner_refs)) and DurableWorldRuntime._validate_owner_checkpoints(
             owner_refs, owner_checkpoint_contracts
         )
+
+    @staticmethod
+    def _verify_owner_checkpoint_sets(
+        references: tuple[CheckpointReference, ...],
+        contracts: Mapping[tuple[str, str], OwnerCheckpointContract],
+        context: OwnerCheckpointSetContext,
+    ) -> bool:
+        """Invoke semantic-owner validation for multiple refs to one identity.
+
+        World supplies only the complete references in this exact proposed or
+        restored cut and its authoritative transition identity. The owner
+        contract validates cross-artifact semantics; World still owns cut
+        membership and publication.
+        """
+        grouped: dict[tuple[str, str], list[CheckpointReference]] = {}
+        for reference in references:
+            grouped.setdefault((reference.owner, reference.owner_identity), []).append(reference)
+        for key, group in grouped.items():
+            if len(group) < 2:
+                continue
+            verifier = getattr(contracts.get(key), "verify_checkpoint_set", None)
+            if verifier is None or not callable(verifier):
+                return False
+            try:
+                valid = verifier(
+                    tuple(group),
+                    world_id=context.world_id,
+                    source_causal_tick=context.source_causal_tick,
+                    target_causal_tick=context.target_causal_tick,
+                    commit_id=context.commit_id,
+                )
+            except Exception:
+                return False
+            if valid is not True:
+                return False
+        return True
 
     @staticmethod
     def _dependency_heads(manifest: WorldCausalManifest) -> dict[tuple[str, str], str | None]:
@@ -1831,7 +1955,7 @@ class DurableWorldRuntime:
             _reference_descriptor(ref)
             for ref in sorted(
                 (ref for ref in manifest.checkpoint_references if ref.owner != _JOURNAL_OWNER),
-                key=lambda ref: (ref.owner, ref.owner_identity),
+                key=lambda ref: (ref.owner, ref.owner_identity, ref.schema_version, ref.checkpoint_id),
             )
         )
         current_payload = current_cut.payload

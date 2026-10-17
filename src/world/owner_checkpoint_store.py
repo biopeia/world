@@ -100,7 +100,7 @@ class FileOwnerCheckpointStore:
         if not isinstance(context, PhysicalStepContext):
             raise TypeError("context must be a World-issued PhysicalStepContext")
         payloads = tuple(payloads)
-        keys = tuple((item.owner, item.owner_identity) for item in payloads)
+        keys = tuple((item.owner, item.owner_identity, item.schema_version) for item in payloads)
         if not payloads or len(keys) != len(set(keys)):
             raise ValueError("checkpoint payloads must be non-empty and uniquely identified")
 
@@ -122,7 +122,7 @@ class FileOwnerCheckpointStore:
         a transition identity; World genesis names them as initial references.
         """
         payloads = tuple(payloads)
-        keys = tuple((item.owner, item.owner_identity) for item in payloads)
+        keys = tuple((item.owner, item.owner_identity, item.schema_version) for item in payloads)
         if not payloads or len(keys) != len(set(keys)):
             raise ValueError("genesis checkpoint payloads must be non-empty and uniquely identified")
         if any(not isinstance(item, OwnerCheckpointPayload) for item in payloads):

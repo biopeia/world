@@ -81,6 +81,7 @@ def _resume(directory: Path, restored, morphology, cycles: int, collect) -> None
             sense_binding=acc.SenseChannelBinding(acc.CHANNEL_ID, acc.RECEPTOR_ID, "opaque.scalar.signal"),
             kernel_limits=acc.KernelLimits(), actuator_context=context, actuator_surface=surface,
             articulated_body=restored.articulated_body, active_morphology=morphology, differential_binding=motor,
+            reserve_checkpoint=restored.reserve_checkpoint,
             torque_binding=torque, environment_owner=restored.environment_owner,
             owner_checkpoint_store=acc.FileOwnerCheckpointStore(directory / "owners" / "committed"),
             embodiment_geometry_revision="geometry.acceptance.sensorimotor-r1"),

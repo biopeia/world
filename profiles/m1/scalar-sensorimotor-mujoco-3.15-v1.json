@@ -58,7 +58,11 @@
     "joints": [
       {
         "id": "joint.hinge",
-        "axis": [0.0, 1.0, 0.0],
+        "axis": [
+          0.0,
+          1.0,
+          0.0
+        ],
         "lower": -1.0,
         "upper": 1.0,
         "max_motor_torque": 2.0,
@@ -66,7 +70,11 @@
         "max_velocity": 2.0,
         "parent_link": "body.root",
         "child_link": "body.arm",
-        "origin": [0.0, 0.0, -0.2],
+        "origin": [
+          0.0,
+          0.0,
+          -0.2
+        ],
         "initial_position": 0.0,
         "initial_velocity": 0.0
       }
@@ -74,15 +82,41 @@
     "segments": {
       "body.root": {
         "mass": 1.0,
-        "size": [0.2, 0.2, 0.2],
-        "origin": [0.0, 0.0, 0.0],
-        "color": [0.5, 0.5, 0.5, 1.0]
+        "size": [
+          0.2,
+          0.2,
+          0.2
+        ],
+        "origin": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "color": [
+          0.5,
+          0.5,
+          0.5,
+          1.0
+        ]
       },
       "body.arm": {
         "mass": 0.5,
-        "size": [0.1, 0.4, 0.1],
-        "origin": [0.0, 0.0, -0.2],
-        "color": [0.2, 0.3, 0.4, 1.0]
+        "size": [
+          0.1,
+          0.4,
+          0.1
+        ],
+        "origin": [
+          0.0,
+          0.0,
+          -0.2
+        ],
+        "color": [
+          0.2,
+          0.3,
+          0.4,
+          1.0
+        ]
       }
     },
     "body_material": {
@@ -97,10 +131,17 @@
     "receptor": {
       "id": "receptor.acceptance.scalar-v1",
       "body_frame": "body.root",
-      "position_in_body_frame_m": [0.0, 0.0, 0.0]
+      "position_in_body_frame_m": [
+        0.0,
+        0.0,
+        0.0
+      ]
     },
     "actuator_surface": {
-      "ids": ["actuator.hinge.positive", "actuator.hinge.negative"],
+      "ids": [
+        "actuator.hinge.positive",
+        "actuator.hinge.negative"
+      ],
       "fingerprint_material": "sha256:acceptance-joint-surface-r1"
     },
     "differential_binding": {
@@ -113,18 +154,32 @@
       "id": "binding.acceptance.torque-r1",
       "channel_id": "actuator.hinge",
       "joint_id": "joint.hinge",
-      "axis": [0.0, 1.0, 0.0]
-    }
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    "initial_reserve_amount": 1.2,
+    "initial_reserve_capacity": 2.0
   },
   "environment": {
     "id": "environment.acceptance.sensorimotor-v1",
     "revision": "environment.acceptance.r1",
     "owner_id": "owner.environment.acceptance.sensorimotor-v1",
-    "gravity_m_s2": [0.0, 0.0, 0.0],
+    "gravity_m_s2": [
+      0.0,
+      0.0,
+      0.0
+    ],
     "field": {
       "id": "resource.acceptance.scalar-field-v1",
       "revision": "field.acceptance.r1",
-      "position_m": [1.0, 0.0, 0.0],
+      "position_m": [
+        1.0,
+        0.0,
+        0.0
+      ],
       "resource_radius_m": 0.1,
       "field_radius_m": 2.0,
       "remaining": 10.0,
@@ -143,8 +198,17 @@
     "timestep_s": 0.01,
     "iterations": 50,
     "tolerance": 1e-10,
-    "solref": [0.02, 1.0],
-    "solimp": [0.9, 0.95, 0.001, 0.5, 2.0],
+    "solref": [
+      0.02,
+      1.0
+    ],
+    "solimp": [
+      0.9,
+      0.95,
+      0.001,
+      0.5,
+      2.0
+    ],
     "contact_policy": "max-sliding-body-torsion-rolling/no-self-collision-v1"
   },
   "observation_bridge": {

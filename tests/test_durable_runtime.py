@@ -367,6 +367,34 @@ def _contracts(*keys):
     return {key: _OwnerContract() for key in keys}
 
 
+def test_world_requires_owner_contract_to_verify_multiple_checkpoint_refs_as_one_cut(tmp_path):
+    payloads = (b"physical", b"reserve", b"binding")
+    references = []
+    for schema, payload in zip(("physical-v2", "reserve-v2", "binding-v1"), payloads):
+        path = tmp_path / schema
+        path.write_bytes(payload)
+        references.append(CheckpointReference(
+            "embodiment", "body-1", schema, schema, str(path), hashlib.sha256(payload).hexdigest()
+        ))
+    references = tuple(references)
+    key = ("embodiment", "body-1")
+    context = durable_runtime_module.OwnerCheckpointSetContext("world-1", 3, 4, "commit-4")
+    assert not DurableWorldRuntime._verify_owner_checkpoint_sets(references, _contracts(key), context)
+
+    class SetContract(_OwnerContract):
+        def __init__(self):
+            super().__init__()
+            self.seen = None
+
+        def verify_checkpoint_set(self, refs, *, world_id, source_causal_tick, target_causal_tick, commit_id):
+            self.seen = (refs, world_id, source_causal_tick, target_causal_tick, commit_id)
+            return len(refs) == 3 and target_causal_tick == source_causal_tick + 1
+
+    contract = SetContract()
+    assert DurableWorldRuntime._verify_owner_checkpoint_sets(references, {key: contract}, context)
+    assert contract.seen == (references, "world-1", 3, 4, "commit-4")
+
+
 def _presence_lifecycle(transition_type, presence_id):
     return PresenceLifecycleTransition(
         transition_type,

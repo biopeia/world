@@ -172,12 +172,16 @@ def _validate_profile(value: Any) -> None:
         raise ProfileError("kernel reliability thresholds must be <= 1")
 
     embodiment = _object(profile["embodiment"], {
-        "body_id", "episode_id", "morphology_revision", "geometry_revision", "frame_id", "root_frame", "joints",
-        "segments", "body_material", "fixed_base", "receptor", "actuator_surface",
+        "body_id", "episode_id", "morphology_revision", "geometry_revision", "frame_id", "root_frame",
+        "initial_reserve_amount", "initial_reserve_capacity", "joints", "segments", "body_material", "fixed_base", "receptor", "actuator_surface",
         "differential_binding", "torque_binding",
     }, "embodiment")
     for key in ("body_id", "episode_id", "morphology_revision", "geometry_revision", "frame_id", "root_frame"):
         _identifier(embodiment[key], f"embodiment.{key}")
+    reserve_amount = _number(embodiment["initial_reserve_amount"], "embodiment.initial_reserve_amount", minimum=0)
+    reserve_capacity = _number(embodiment["initial_reserve_capacity"], "embodiment.initial_reserve_capacity", minimum=0.000001)
+    if reserve_amount > reserve_capacity:
+        raise ProfileError("initial reserve amount must not exceed capacity")
     if embodiment["fixed_base"] is not True or type(embodiment["joints"]) is not list or len(embodiment["joints"]) != 1:
         raise ProfileError("M1 profile requires its declared fixed-base single-hinge body")
     joint = _object(embodiment["joints"][0], {
@@ -343,6 +347,7 @@ def construct_fresh_runtime(
         raise ProfileError("source revisions must be a non-empty mapping")
     try:
         import mujoco
+        from embodiment.checkpoint import EmbodimentAdoptionBindingV1, EmbodimentCheckpoint, LivingBodyState, MetabolicLedger
         from embodiment.observation import BodyPoseSample
         from embodiment.physics3d.articulated_spec import ArticulatedBodySpec
         from embodiment.physics3d.articulated_state import (
@@ -425,6 +430,8 @@ def construct_fresh_runtime(
     world_cfg = profile["world"]
     org_cfg = profile["organism"]
     body_cfg = profile["embodiment"]
+    reserve_amount = body_cfg["initial_reserve_amount"]
+    reserve_capacity = body_cfg["initial_reserve_capacity"]
     env_cfg = profile["environment"]
     field_cfg = env_cfg["field"]
     world_id = world_cfg["id"]
@@ -575,7 +582,15 @@ def construct_fresh_runtime(
         ),
         ("embodiment", body_cfg["body_id"]): _CheckpointContract(
             body_cfg["body_id"],
-            {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda encoded: _valid_body_checkpoint(encoded, morphology)},
+            {
+                ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda encoded: _valid_body_checkpoint(encoded, morphology),
+                EmbodimentCheckpoint.OWNER_SCHEMA: lambda encoded: EmbodimentCheckpoint.validate_checkpoint(
+                    encoded, body_cfg["body_id"], EmbodimentCheckpoint.OWNER_SCHEMA
+                ),
+                EmbodimentAdoptionBindingV1.OWNER_SCHEMA: lambda encoded: EmbodimentAdoptionBindingV1.validate_checkpoint(
+                    encoded, body_cfg["body_id"], EmbodimentAdoptionBindingV1.OWNER_SCHEMA
+                ),
+            },
         ),
         ("environment", env_cfg["owner_id"]): _CheckpointContract(
             env_cfg["owner_id"],
@@ -630,8 +645,13 @@ def construct_fresh_runtime(
         owner_checkpoint_verifier=verify_owner_checkpoints,
     )
 
+    reserve_body = LivingBodyState(energy_reserve=reserve_amount, max_energy=reserve_capacity)
     cycle_inputs = ScalarSensorimotorCycleInputs(
         environment_revision=env_cfg["revision"], solver_configuration=solver,
+        reserve_checkpoint=EmbodimentCheckpoint(
+            body_cfg["body_id"], body_cfg["episode_id"], reserve_body,
+            MetabolicLedger(body_state=reserve_body),
+        ),
         current_organism=organism_state, action_composer=composer, receptor=receptor,
         embodiment_state=root, environment_field=environment_field, sampling_frame=frame,
         transduction=DimensionlessScalarFieldIdentityV1(),
@@ -664,6 +684,13 @@ class _CheckpointContract:
     def validate_checkpoint(self, encoded: bytes, owner_identity: str, schema_version: str) -> bool:
         validator = self.validators.get(schema_version)
         return owner_identity == self.identity and validator is not None and validator(encoded)
+
+    def verify_checkpoint_set(self, references, *, world_id, source_causal_tick, target_causal_tick, commit_id):
+        from embodiment.checkpoint import EmbodimentAdoptionBindingV1
+        return EmbodimentAdoptionBindingV1.verify_checkpoint_set(
+            tuple(references), world_id=world_id, source_causal_tick=source_causal_tick,
+            target_causal_tick=target_causal_tick, commit_id=commit_id,
+        )
 
     def verify_restoration(self, reference: Any) -> bool:
         try:

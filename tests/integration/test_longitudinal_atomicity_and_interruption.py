@@ -193,7 +193,11 @@ def _build_test_env(runtime_dir: Path, *, with_plasticity: bool = True):
     contracts = {
         ("organism", str(acc.ORGANISM_ID)): acc.OrganismCheckpointContract(kernel_limits=kernel_limits),
         ("embodiment", acc.BODY_ID): acc._Contract(
-            acc.BODY_ID, {ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: acc._valid_body_checkpoint(data, morphology)},
+            acc.BODY_ID, {
+                ARTICULATED_PHYSICAL_CHECKPOINT_SCHEMA: lambda data: acc._valid_body_checkpoint(data, morphology),
+                acc.EmbodimentCheckpoint.OWNER_SCHEMA: lambda data: acc.EmbodimentCheckpoint.validate_checkpoint(data, acc.BODY_ID, acc.EmbodimentCheckpoint.OWNER_SCHEMA),
+                acc.EmbodimentAdoptionBindingV1.OWNER_SCHEMA: lambda data: acc.EmbodimentAdoptionBindingV1.validate_checkpoint(data, acc.BODY_ID, acc.EmbodimentAdoptionBindingV1.OWNER_SCHEMA),
+            },
         ),
         ("environment", acc.ENVIRONMENT_OWNER_ID): acc._Contract(
             acc.ENVIRONMENT_OWNER_ID, {acc.StaticEnvironmentOwner.CHECKPOINT_SCHEMA: lambda data: acc.StaticEnvironmentOwner.validate_checkpoint(
@@ -305,6 +309,9 @@ def _build_test_env(runtime_dir: Path, *, with_plasticity: bool = True):
         actuator_context=actuator_context,
         actuator_surface=surface,
         articulated_body=body,
+        reserve_checkpoint=acc._reserve_checkpoint(
+            body.root.body_id, body.root.embodiment_episode_id
+        ),
         active_morphology=morphology,
         differential_binding=differential_binding,
         torque_binding=torque_binding,
@@ -417,6 +424,7 @@ def test_longitudinal_atomicity_and_interruption_zero_loss(tmp_path: Path):
         actuator_context=act_ctx,
         actuator_surface=surface,
         articulated_body=restored_b.articulated_body,
+        reserve_checkpoint=restored_b.reserve_checkpoint,
         active_morphology=morphology,
         differential_binding=inputs_b.differential_binding,
         torque_binding=inputs_b.torque_binding,
