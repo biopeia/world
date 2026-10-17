@@ -299,6 +299,7 @@ def _build_runtime_environment(
     cycle_inputs = ScalarSensorimotorCycleInputs(
         environment_revision=acc.ENVIRONMENT_REVISION,
         solver_configuration=solver,
+        reserve_checkpoint=acc._reserve_checkpoint(acc.BODY_ID, acc.EPISODE_ID),
         current_organism=organism,
         action_composer=composer,
         receptor=receptor,
