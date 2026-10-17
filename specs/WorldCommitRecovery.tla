@@ -255,7 +255,8 @@ I2_ReferenceCoherence ==
 
 \* I3: Journal prefix matches committed length
 I3_JournalConsistency ==
-    journal_committed_len <= journal_file_len
+    /\ journal_committed_len <= journal_file_len
+    /\ (manifest_status = "COMMITTED" => journal_committed_len = manifest_tick + 1)
 
 \* I4: Fail-closed on interrupted preparation
 I4_FailClosed ==
