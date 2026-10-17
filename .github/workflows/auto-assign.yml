@@ -1,0 +1,16 @@
+name: Auto assign owner
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  assign:
+    uses: biopeia/.github/.github/workflows/auto-assign-owner.yml@4533563fd1da72727b394a642bcc029cfbdfaf01

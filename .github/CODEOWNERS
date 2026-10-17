@@ -1,0 +1,3 @@
+# Review routing for the Biopeia world repository.
+# This file routes review; technical enforcement is configured in GitHub branch/ruleset settings.
+* @alessbarb
