@@ -37,3 +37,26 @@ jobs:
           uv sync --locked --extra integration
       - run: uv run --no-sync python -m pytest tests/integration
 
+
+  # Mandatory independent model-checker gate for World V-03.
+  formal-tlc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download and verify pinned TLC
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --output "${RUNNER_TEMP}/tla2tools.jar" https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "15d103b7e5617780bcc904c0af12f1ad242e2b345c0301136c5be4588f17edac  ${RUNNER_TEMP}/tla2tools.jar" | sha256sum --check
+      - name: Verify TLA+ with TLC (required; no skip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TLA2TOOLS_JAR="${RUNNER_TEMP}/tla2tools.jar" bash specs/run_tlc.sh | tee "${RUNNER_TEMP}/tlc.log"
+          grep -F 'Model checking completed. No error has been found.' "${RUNNER_TEMP}/tlc.log"
+          grep -F '205 states generated, 142 distinct states found' "${RUNNER_TEMP}/tlc.log"
