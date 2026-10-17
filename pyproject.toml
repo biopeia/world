@@ -18,7 +18,7 @@ mujoco = ["mujoco==3.15.0"]
 # This remains optional so World causal primitives can be installed alone.
 runtime = [
     "organism @ git+https://github.com/biopeia/organism.git@main",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@78d8bf2a0b2d0a6d04358ad046821821de20bcc8",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@15347cf5522e92e49cb8b1fa4cba28235032e053",
     "environment @ git+https://github.com/biopeia/environment.git@main",
     "modality @ git+https://github.com/biopeia/modality.git@main",
     "observation @ git+https://github.com/biopeia/observation.git@main",
@@ -29,7 +29,7 @@ integration = [
     "pytest>=8",
     "mujoco==3.15.0",
     "organism @ git+https://github.com/biopeia/organism.git@main",
-    "embodiment @ git+https://github.com/biopeia/embodiment.git@78d8bf2a0b2d0a6d04358ad046821821de20bcc8",
+    "embodiment @ git+https://github.com/biopeia/embodiment.git@15347cf5522e92e49cb8b1fa4cba28235032e053",
     "environment @ git+https://github.com/biopeia/environment.git@main",
     "modality @ git+https://github.com/biopeia/modality.git@main",
     "observation @ git+https://github.com/biopeia/observation.git@main",

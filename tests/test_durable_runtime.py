@@ -395,6 +395,57 @@ def test_world_requires_owner_contract_to_verify_multiple_checkpoint_refs_as_one
     assert contract.seen == (references, "world-1", 3, 4, "commit-4")
 
 
+def test_rejected_checkpoint_set_never_acquires_world_cut_authority(tmp_path):
+    world_id = WorldId("world-reject-checkpoint-set")
+    manifest_store = WorldCausalManifestStore(tmp_path / "manifest.json")
+    journal_store = DurableJournalSnapshotStore(tmp_path / "journal", world_id)
+    initial = tmp_path / "initial-owner.bin"
+    initial.write_bytes(b"initial")
+    key = ("embodiment", "body-1")
+    runtime = _initialize(
+        world_id,
+        "presence-a",
+        manifest_store,
+        journal_store,
+        initial_owner_references=(CheckpointReference(
+            "embodiment", "body-1", "initial", "single-v1", str(initial),
+            hashlib.sha256(b"initial").hexdigest(),
+        ),),
+        registered_owner_ids=(key,),
+        owner_checkpoint_verifier=_verifier,
+        owner_checkpoint_contracts={key: _OwnerContract()},
+    )
+    before = manifest_store.read()
+    staged = []
+
+    def write_unverified_set(tick):
+        refs = []
+        for schema, payload in (
+            ("physical-v1", b"physical"),
+            ("reserve-v1", b"reserve"),
+            ("binding-v1", b"binding"),
+        ):
+            path = tmp_path / f"{tick}-{schema}.bin"
+            path.write_bytes(payload)
+            staged.append(path)
+            refs.append(CheckpointReference(
+                "embodiment", "body-1", schema, schema, str(path),
+                hashlib.sha256(payload).hexdigest(),
+            ))
+        return tuple(refs)
+
+    with pytest.raises(ManifestError, match="owner checkpoint set validation failed"):
+        runtime.tick("commit-1", write_unverified_set)
+
+    after = manifest_store.read()
+    assert after.causal_tick == before.causal_tick == 0
+    assert after.commit_id == before.commit_id
+    assert after.checkpoint_references == before.checkpoint_references
+    assert runtime.status is ManifestStatus.RECOVERY_REQUIRED
+    # Blob writes can remain staged; none is a committed adoption or cut member.
+    assert len(staged) == 3 and all(path.is_file() for path in staged)
+
+
 def _presence_lifecycle(transition_type, presence_id):
     return PresenceLifecycleTransition(
         transition_type,

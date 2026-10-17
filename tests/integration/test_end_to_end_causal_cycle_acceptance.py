@@ -849,6 +849,126 @@ def test_committed_cycle_restores_and_continues_in_fresh_process(tmp_path: Path)
     assert fresh_process_result["cycle"]["commit_id"] == "commit.acceptance.sensorimotor.tick-2"
 
 
+def test_adoption_binding_verifier_rejects_incomplete_corrupt_and_cross_cut_sets(
+    tmp_path: Path,
+) -> None:
+    result, _, no_resume, _ = _run(tmp_path / "binding-negative", stop_after_first=True)
+    assert no_resume is None
+    references = tuple(
+        reference for reference in result.committed_cut.owner_checkpoint_references
+        if reference.owner == "embodiment" and reference.owner_identity == BODY_ID
+    )
+    context = dict(
+        world_id=result.context.world_id,
+        source_causal_tick=result.context.source_causal_tick,
+        target_causal_tick=result.context.target_causal_tick,
+        commit_id=result.committed_cut.commit_id,
+    )
+    verify = EmbodimentAdoptionBindingV1.verify_checkpoint_set
+    assert verify(references, **context)
+
+    # Missing references (including an unbound historical cut) and duplicate
+    # references cannot be promoted to an adoption assertion.
+    for index in range(len(references)):
+        assert not verify(references[:index] + references[index + 1 :], **context)
+    binding_reference = next(
+        ref for ref in references if ref.schema_version == EmbodimentAdoptionBindingV1.OWNER_SCHEMA
+    )
+    assert not verify(references + (binding_reference,), **context)
+
+    # A valid-looking owner set still cannot be replayed under another World,
+    # transition tick, or commit identity.
+    for field, wrong in (
+        ("world_id", "world.other"),
+        ("source_causal_tick", context["source_causal_tick"] + 1),
+        ("target_causal_tick", context["target_causal_tick"] + 1),
+        ("commit_id", "commit.other"),
+    ):
+        assert not verify(references, **(context | {field: wrong}))
+
+    # Mix real persisted references from two distinct committed cuts of the
+    # same body. The second cut's binding must not authenticate the first
+    # cut's physical bytes, even when checked against the second cut context.
+    _, _, second_cut, _ = _run(
+        tmp_path / "binding-cross-cut", continue_from_live_state=True
+    )
+    assert second_cut is not None
+    second_references = tuple(
+        reference
+        for reference in second_cut.committed_cut.owner_checkpoint_references
+        if reference.owner == "embodiment" and reference.owner_identity == BODY_ID
+    )
+    physical_schema = next(
+        ref.schema_version
+        for ref in references
+        if ref.schema_version
+        not in (EmbodimentCheckpoint.OWNER_SCHEMA, EmbodimentAdoptionBindingV1.OWNER_SCHEMA)
+    )
+    first_physical = next(ref for ref in references if ref.schema_version == physical_schema)
+    mixed_cut_references = tuple(
+        first_physical if ref.schema_version == physical_schema else ref
+        for ref in second_references
+    )
+    assert not verify(
+        mixed_cut_references,
+        world_id=second_cut.context.world_id,
+        source_causal_tick=second_cut.context.source_causal_tick,
+        target_causal_tick=second_cut.context.target_causal_tick,
+        commit_id=second_cut.committed_cut.commit_id,
+    )
+
+    # Every persisted member is independently integrity checked.
+    for reference in references:
+        path = Path(reference.locator)
+        original = path.read_bytes()
+        path.write_bytes(original + b"corrupt")
+        assert not verify(references, **context)
+        path.write_bytes(original)
+
+    # Recompute a structurally valid binding with another episode; the owner
+    # digest is valid, but it cannot agree with the adopted physical/reserve state.
+    encoded_binding = Path(binding_reference.locator).read_bytes()
+    wrong_episode = replace(
+        EmbodimentAdoptionBindingV1.from_bytes(encoded_binding), episode_id="episode.other"
+    ).to_bytes()
+    wrong_binding_path = tmp_path / "wrong-episode-binding.json"
+    wrong_binding_path.write_bytes(wrong_episode)
+    wrong_binding_reference = replace(
+        binding_reference,
+        locator=str(wrong_binding_path),
+        sha256=hashlib.sha256(wrong_episode).hexdigest(),
+    )
+    wrong_episode_references = tuple(
+        wrong_binding_reference if ref == binding_reference else ref for ref in references
+    )
+    assert not verify(wrong_episode_references, **context)
+
+    # A caller cannot make mismatched identities look like one owner set by
+    # supplying the expected body id separately.
+    wrong_identity_references = tuple(
+        replace(ref, owner_identity="body.other") for ref in references
+    )
+    assert not verify(wrong_identity_references, **context)
+
+    # A binding from another morphology or physical step is rejected even if
+    # serialized canonically and its own digest is updated.
+    valid_binding = EmbodimentAdoptionBindingV1.from_bytes(encoded_binding)
+    for changes in ({"morphology_revision": "morphology.other"},
+                    {"physical_step_id": "physical-step.other"}):
+        changed_bytes = replace(valid_binding, **changes).to_bytes()
+        changed_path = tmp_path / f"wrong-{next(iter(changes))}.json"
+        changed_path.write_bytes(changed_bytes)
+        changed_reference = replace(
+            binding_reference,
+            locator=str(changed_path),
+            sha256=hashlib.sha256(changed_bytes).hexdigest(),
+        )
+        changed_references = tuple(
+            changed_reference if ref == binding_reference else ref for ref in references
+        )
+        assert not verify(changed_references, **context)
+
+
 def test_non_default_kernel_limits_restore_and_continue_fail_closed(tmp_path: Path) -> None:
     configured_limits = replace(KernelLimits(), consolidation_interval_ticks=31)
     uninterrupted, _, uninterrupted_next, uninterrupted_messages = _run(
@@ -1306,6 +1426,10 @@ def test_no_actuation_rejects_infeasible_zero_torque_without_committing(
     manifest = WorldCausalManifestStore(directory / "manifest.json").read()
     assert manifest.status is ManifestStatus.RECOVERY_REQUIRED
     assert manifest.causal_tick == 0
+    assert not any(
+        reference.schema_version == EmbodimentAdoptionBindingV1.OWNER_SCHEMA
+        for reference in manifest.checkpoint_references
+    )
 
 
 def test_articulated_solver_revalidates_no_actuation_at_physics_boundary(

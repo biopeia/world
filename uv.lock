@@ -23,7 +23,7 @@ wheels = [
 [[package]]
 name = "embodiment"
 version = "0.1.0a1"
-source = { git = "https://github.com/biopeia/embodiment.git?rev=78d8bf2a0b2d0a6d04358ad046821821de20bcc8#78d8bf2a0b2d0a6d04358ad046821821de20bcc8" }
+source = { git = "https://github.com/biopeia/embodiment.git?rev=15347cf5522e92e49cb8b1fa4cba28235032e053#15347cf5522e92e49cb8b1fa4cba28235032e053" }
 dependencies = [
     { name = "rfc8785" },
 ]
@@ -444,8 +444,8 @@ runtime = [
 
 [package.metadata]
 requires-dist = [
-    { name = "embodiment", marker = "extra == 'integration'", git = "https://github.com/biopeia/embodiment.git?rev=78d8bf2a0b2d0a6d04358ad046821821de20bcc8" },
-    { name = "embodiment", marker = "extra == 'runtime'", git = "https://github.com/biopeia/embodiment.git?rev=78d8bf2a0b2d0a6d04358ad046821821de20bcc8" },
+    { name = "embodiment", marker = "extra == 'integration'", git = "https://github.com/biopeia/embodiment.git?rev=15347cf5522e92e49cb8b1fa4cba28235032e053" },
+    { name = "embodiment", marker = "extra == 'runtime'", git = "https://github.com/biopeia/embodiment.git?rev=15347cf5522e92e49cb8b1fa4cba28235032e053" },
     { name = "environment", marker = "extra == 'integration'", git = "https://github.com/biopeia/environment.git?rev=main" },
     { name = "environment", marker = "extra == 'runtime'", git = "https://github.com/biopeia/environment.git?rev=main" },
     { name = "modality", marker = "extra == 'integration'", git = "https://github.com/biopeia/modality.git?rev=main" },
